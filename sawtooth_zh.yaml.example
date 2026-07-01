@@ -1,0 +1,52 @@
+# Sawtooth Proxy 配置文件
+# 所有字段均有内置默认值，仅需覆盖非默认值即可
+
+server:
+  # 监听端口，默认值: 9099（可省略）
+  port: 9099
+  # 监听地址，默认值: localhost（可省略）
+  host: localhost
+
+proxy:
+  # Anthropic API 目标地址，默认值: https://api.anthropic.com（可省略）
+  target: https://api.anthropic.com
+  # Usage 衰减系数（0.0-1.0），默认值: 0.7（可省略）
+  deflation: 0.7
+
+debug:
+  # 是否启用调试模式，默认值: false（可省略）
+  enabled: false
+  # 调试数据落盘目录，默认值: ./data/（可省略）
+  data_dir: ./data/
+
+stubify:
+  # 触发衰减的总 token 上限，默认值: 100000（可省略）
+  token_threshold: 200000
+  # 尾部不桩化的最近消息数，默认值: 8（可省略）
+  keep_recent: 8
+  # 是否保留 thinking blocks，默认值: false（可省略）
+  # thinking 里的推理过程可能对连续性有价值，但锯齿折叠的目标是取结果而不是过程
+  keep_thinking: false
+
+collapse:
+  # 是否启用折叠，默认值: true（可省略）
+  enabled: true
+  # [DEPRECATED] Phase F collapse-first 架构中不再读取此值。
+  # collapse 由 CalcCollapseCutoff 的 token 预算逻辑直接决定，不再使用 threshold * multiplier。
+  # 保留此 key 以避免旧配置文件报错，但不影响行为。
+  threshold_multiplier: 1.5
+
+frozen:
+  # 是否启用 frozen prefix（默认 true）
+  enabled: true
+  # Frozen prefix 内存 TTL 分钟数（默认 30）
+  ttl_minutes: 30
+
+cache:
+  # 是否启用 cache_control 管理（默认 true）
+  enabled: true
+  # 最大 cache_control breakpoint 数（Anthropic 硬限制 4）
+  breakpoint_limit: 4
+  # Cache TTL 策略："ephemeral"（默认 5m）或 "1h"
+  # 影响 Frozen TTL 和 SawtoothTrigger pause 阈值的自适应推导
+  cache_ttl: "ephemeral"
