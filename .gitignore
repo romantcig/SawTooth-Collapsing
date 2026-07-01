@@ -1,0 +1,41 @@
+# Build artifacts
+*.exe
+*.exe~
+*.test
+*.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# GSD / Claude Code internals
+.claude/
+.gsd-profile
+gsd-file-manifest.json
+gsd-install-state.json
+settings.local.json
+package.json
+
+# Planning artifacts
+.planning/
+
+# Runtime data
+data/
+
+# Project docs (local only)
+CLAUDE.md
+PLAN.md
+
+# Local config (copy sawtooth.yaml.example to sawtooth.yaml)
+sawtooth.yaml
+
+# Release draft (local only)
+RELEASE.md
+
+.claude/

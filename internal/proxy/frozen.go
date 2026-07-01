@@ -1,0 +1,636 @@
+package proxy
+
+import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+)
+
+// PersistFunc 将 key-value 状态持久化到外部存储（如 SQLite frozen_state 表）。
+type PersistFunc func(key, value string)
+
+// LoadFunc 从外部存储读取 key 对应的状态值。
+// 返回 value 和是否找到。
+type LoadFunc func(key string) (string, bool)
+
+// FrozenStubs 存储每个 thread 的冻结桩化消息前缀，用于缓存优化。
+// 桩化周期之间，冻结前缀被逐字节复用，使 API 缓存在前缀部分可命中。
+type FrozenStubs struct {
+	mu           sync.RWMutex
+	ttl          time.Duration    // eviction TTL —— 默认 30 分钟
+	messages     map[string][]Message // threadID → 深拷贝的桩化消息
+	cutoff       map[string]int   // threadID → Store 时的原始消息总数
+	boundaryHash map[string]string // threadID → messages[cutoff-1] 的稳定 hash
+	prefixHash   map[string]string // threadID → 序列化后 frozen prefix 的 SHA-256 hash
+	stubTime     map[string]time.Time
+	tokens       map[string]int // threadID → frozen stubs 的 token 估算
+	rawTokens    map[string]int // threadID → Store 时原始 token 估算（压缩前）
+	lastAccess   map[string]time.Time
+	persistFn    PersistFunc    // 可选：持久化 frozen 状态到 DB
+	loadFn       LoadFunc       // 可选：冷启动时从 DB 加载 frozen 状态
+	loadedFromDB map[string]bool // threadID → 已尝试从 DB 加载
+}
+
+// frozenPersisted 是 frozen 桩化状态的可 JSON 序列化形式。
+type frozenPersisted struct {
+	Messages     []Message `json:"messages"`
+	Cutoff       int       `json:"cutoff"`
+	BoundaryHash string    `json:"boundary_hash"`
+	PrefixHash   string    `json:"prefix_hash"`
+	Tokens       int       `json:"tokens"`
+	RawTokens    int       `json:"raw_tokens,omitempty"`
+}
+
+// FrozenResult 包含一个已验证的 frozen prefix 及其元数据。
+type FrozenResult struct {
+	Messages  []Message // 冻结桩化消息（深拷贝，可安全修改）
+	Cutoff    int       // Store 时的原始消息总数
+	Tokens    int       // token 估算
+	RawTokens int       // Store 时原始 token 估算（压缩前）
+}
+
+// NewFrozenStubs 创建使用默认 30 分钟 TTL 的 FrozenStubs 存储。
+func NewFrozenStubs() *FrozenStubs {
+	return NewFrozenStubsWithTTL(30 * time.Minute)
+}
+
+// NewFrozenStubsWithTTL 创建使用自定义 eviction TTL 的 FrozenStubs 存储。
+func NewFrozenStubsWithTTL(ttl time.Duration) *FrozenStubs {
+	return &FrozenStubs{
+		ttl:          ttl,
+		messages:     make(map[string][]Message),
+		cutoff:       make(map[string]int),
+		boundaryHash: make(map[string]string),
+		prefixHash:   make(map[string]string),
+		stubTime:     make(map[string]time.Time),
+		tokens:       make(map[string]int),
+		rawTokens:    make(map[string]int),
+		lastAccess:   make(map[string]time.Time),
+		loadedFromDB: make(map[string]bool),
+	}
+}
+
+// SetPersistFunc 设置持久化 frozen 状态到 DB 的回调函数。
+func (f *FrozenStubs) SetPersistFunc(fn PersistFunc) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.persistFn = fn
+}
+
+// SetLoadFunc 设置冷启动时从 DB 加载 frozen 状态的回调函数。
+func (f *FrozenStubs) SetLoadFunc(fn LoadFunc) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.loadFn = fn
+}
+
+// Store 冻结指定 thread 的桩化消息。
+// 深拷贝消息并计算 boundary/prefix hash 用于验证。
+// cutoff 是原始消息总数（第一条未桩化消息的索引）。
+// boundaryMsg 是 originalMessages[cutoff-1]，用于 boundary 验证。
+func (f *FrozenStubs) Store(threadID string, stubbed []Message, cutoff int, boundaryMsg Message, tokenEstimate int, rawTokenEstimate int) {
+	frozen := deepCopyMessages(stubbed)
+	if frozen == nil {
+		slog.Warn("frozen prefix 深拷贝失败，跳过存储", "thread_id", threadID)
+		return
+	}
+
+	frozenJSON, _ := json.Marshal(frozen)
+	pHash := sha256hex(frozenJSON)
+
+	bHash := stableBoundaryHash(boundaryMsg)
+
+	now := time.Now()
+
+	f.mu.Lock()
+	f.messages[threadID] = frozen
+	f.cutoff[threadID] = cutoff
+	f.boundaryHash[threadID] = bHash
+	f.prefixHash[threadID] = pHash
+	f.stubTime[threadID] = now
+	f.tokens[threadID] = tokenEstimate
+	f.rawTokens[threadID] = rawTokenEstimate
+	f.lastAccess[threadID] = now
+	f.loadedFromDB[threadID] = true // 内存中的是最新权威数据
+	f.mu.Unlock()
+
+	// 跨重启留存：异步持久化到 DB
+	if f.persistFn != nil {
+		fp := frozenPersisted{
+			Messages:     frozen,
+			Cutoff:       cutoff,
+			BoundaryHash: bHash,
+			PrefixHash:   pHash,
+			Tokens:       tokenEstimate,
+			RawTokens:    rawTokenEstimate,
+		}
+		if data, err := json.Marshal(fp); err == nil {
+			f.persistFn("frozen:"+threadID, string(data))
+		}
+	}
+
+	slog.Info("frozen prefix 已存储",
+		"thread_id", threadID,
+		"cutoff", cutoff,
+		"prefix_hash", pHash[:min(16, len(pHash))],
+		"tokens", tokenEstimate,
+	)
+}
+
+// Get 返回指定 thread 的已验证 frozen stubs（若存在且有效）。
+// 验证：(1) 当前消息数不小于 cutoff；
+//
+//	(2) frozen prefix 在内存中未被意外修改（SHA-256 hash 验证）。
+func (f *FrozenStubs) Get(threadID string, currentMessages []Message) *FrozenResult {
+	f.mu.RLock()
+	_, ok := f.messages[threadID]
+	loaded := f.loadedFromDB[threadID]
+	f.mu.RUnlock()
+
+	// 冷启动 lazy-load：首次访问时尝试从 DB 恢复
+	if !ok && !loaded {
+		f.loadFrozenFromDB(threadID)
+	}
+
+	f.mu.RLock()
+	msgs, ok := f.messages[threadID]
+	if !ok {
+		f.mu.RUnlock()
+		return nil
+	}
+	cutoff := f.cutoff[threadID]
+	pHash := f.prefixHash[threadID]
+	tokens := f.tokens[threadID]
+	rawTokens := f.rawTokens[threadID]
+	f.mu.RUnlock()
+
+	// 验证 1：当前消息数不足（消息被删除了）
+	if len(currentMessages) < cutoff {
+		slog.Warn("frozen prefix 验证失败：当前消息数不足",
+			"thread_id", threadID,
+			"current", len(currentMessages),
+			"cutoff", cutoff,
+		)
+		f.Invalidate(threadID)
+		return nil
+	}
+
+	// 验证 2：prefix hash 不匹配（内存被意外修改）
+	frozenJSON, _ := json.Marshal(msgs)
+	if sha256hex(frozenJSON) != pHash {
+		slog.Warn("frozen prefix 验证失败：hash 不匹配",
+			"thread_id", threadID,
+		)
+		f.Invalidate(threadID)
+		return nil
+	}
+
+	// 验证 3：boundary hash 不匹配（用户编辑了 frozen 范围内的消息）
+	// sawtooth-proxy 在 Get 之前运行 StripReminders，CC 注入不会误触发
+	if cutoff > 0 && cutoff <= len(currentMessages) {
+		f.mu.RLock()
+		storedBHash := f.boundaryHash[threadID]
+		f.mu.RUnlock()
+		if storedBHash != "" {
+			currentBHash := stableBoundaryHash(currentMessages[cutoff-1])
+			if currentBHash != storedBHash {
+				slog.Warn("frozen prefix 验证失败：boundary 已变化（用户可能编辑了消息）",
+					"thread_id", threadID,
+					"cutoff", cutoff,
+				)
+				f.Invalidate(threadID)
+				return nil
+			}
+		}
+	}
+
+	// 深拷贝——防止下游（cache_control inject 等）原地修改 frozen 数据
+	copied := deepCopyMessages(msgs)
+	if copied == nil {
+		slog.Warn("frozen prefix 验证失败：深拷贝失败",
+			"thread_id", threadID,
+		)
+		f.Invalidate(threadID)
+		return nil
+	}
+
+	// 更新最后访问时间
+	f.mu.Lock()
+	f.lastAccess[threadID] = time.Now()
+	f.mu.Unlock()
+
+	slog.Info("frozen prefix 命中",
+		"thread_id", threadID,
+		"cutoff", cutoff,
+		"frozen_tokens", tokens,
+	)
+
+	return &FrozenResult{
+		Messages:  copied,
+		Cutoff:    cutoff,
+		Tokens:    tokens,
+		RawTokens: rawTokens,
+	}
+}
+
+// UpdateMessages 用 newMsgs 覆盖已存储的 frozen prefix 并刷新 prefix hash。
+// 要求 newMsgs 长度与已有条目一致（防止同一管线内二次 sawtooth 触发）。
+// 返回是否成功更新。
+func (f *FrozenStubs) UpdateMessages(threadID string, newMsgs []Message) bool {
+	f.mu.RLock()
+	existing, ok := f.messages[threadID]
+	f.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	if len(newMsgs) != len(existing) {
+		return false
+	}
+
+	fresh := deepCopyMessages(newMsgs)
+	if fresh == nil {
+		return false
+	}
+
+	freshJSON, _ := json.Marshal(fresh)
+	pHash := sha256hex(freshJSON)
+
+	f.mu.Lock()
+	f.messages[threadID] = fresh
+	f.prefixHash[threadID] = pHash
+	f.lastAccess[threadID] = time.Now()
+	f.mu.Unlock()
+
+	return true
+}
+
+// Invalidate 删除指定 thread 的 frozen stubs。
+func (f *FrozenStubs) Invalidate(threadID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.messages, threadID)
+	delete(f.cutoff, threadID)
+	delete(f.boundaryHash, threadID)
+	delete(f.prefixHash, threadID)
+	delete(f.stubTime, threadID)
+	delete(f.tokens, threadID)
+	delete(f.rawTokens, threadID)
+	delete(f.lastAccess, threadID)
+	delete(f.loadedFromDB, threadID)
+	slog.Warn("frozen prefix 已失效", "thread_id", threadID)
+}
+
+// UpdateTTL 动态更新 FrozenStubs 的 eviction TTL。
+// 用于 Cache TTL 自适应：检测到 1h 断点时升至 65min，默认 ephemeral 保持 30min。
+func (f *FrozenStubs) UpdateTTL(ttl time.Duration) {
+	f.mu.Lock()
+	f.ttl = ttl
+	f.mu.Unlock()
+}
+
+// Evict 清理超过 TTL 未访问的条目，返回清理数量。
+func (f *FrozenStubs) Evict() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cutoff := time.Now().Add(-f.ttl)
+	evicted := 0
+	for tid, t := range f.lastAccess {
+		if t.Before(cutoff) {
+			delete(f.messages, tid)
+			delete(f.cutoff, tid)
+			delete(f.boundaryHash, tid)
+			delete(f.prefixHash, tid)
+			delete(f.stubTime, tid)
+			delete(f.tokens, tid)
+			delete(f.rawTokens, tid)
+			delete(f.lastAccess, tid)
+			delete(f.loadedFromDB, tid)
+			evicted++
+		}
+	}
+	if evicted > 0 {
+		slog.Info("frozen stubs eviction 完成", "evicted", evicted)
+	}
+	return evicted
+}
+
+// loadFrozenFromDB 尝试从 DB 恢复指定 thread 的 frozen stubs。
+// 每个 thread 在冷启动时仅调用一次（由 Get 触发 lazy-load）。
+func (f *FrozenStubs) loadFrozenFromDB(threadID string) {
+	f.mu.Lock()
+	if f.loadedFromDB[threadID] {
+		f.mu.Unlock()
+		return
+	}
+	f.loadedFromDB[threadID] = true
+	loadFn := f.loadFn
+	f.mu.Unlock()
+
+	if loadFn == nil {
+		return
+	}
+
+	raw, ok := loadFn("frozen:" + threadID)
+	if !ok || raw == "" {
+		return
+	}
+
+	var fp frozenPersisted
+	if err := json.Unmarshal([]byte(raw), &fp); err != nil {
+		return
+	}
+	if len(fp.Messages) == 0 || fp.PrefixHash == "" {
+		return
+	}
+
+	// 验证 prefix hash 与存储的消息一致
+	frozenJSON, _ := json.Marshal(fp.Messages)
+	if sha256hex(frozenJSON) != fp.PrefixHash {
+		slog.Warn("从 DB 恢复的 frozen 状态 hash 不匹配，丢弃", "thread_id", threadID)
+		return
+	}
+
+	now := time.Now()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// 仅在仍为空时写入（Store() 可能在并发中被调用）
+	if _, exists := f.messages[threadID]; exists {
+		return
+	}
+	f.messages[threadID] = fp.Messages
+	f.cutoff[threadID] = fp.Cutoff
+	f.boundaryHash[threadID] = fp.BoundaryHash
+	f.prefixHash[threadID] = fp.PrefixHash
+	f.tokens[threadID] = fp.Tokens
+	f.rawTokens[threadID] = fp.RawTokens
+	f.stubTime[threadID] = now
+	f.lastAccess[threadID] = now
+
+	slog.Info("从 SQLite 恢复 frozen 状态",
+		"thread_id", threadID,
+		"cutoff", fp.Cutoff,
+		"tokens", fp.Tokens,
+	)
+}
+
+// deepCopyMessages 通过 JSON round-trip 创建消息切片的深拷贝。
+func deepCopyMessages(msgs []Message) []Message {
+	data, err := json.Marshal(msgs)
+	if err != nil {
+		return nil
+	}
+	var out []Message
+	if json.Unmarshal(data, &out) != nil {
+		return nil
+	}
+	return out
+}
+
+// stableBoundaryHash 从 boundary message 的稳定部分计算 hash：
+// role + 第一个 text content block 的前 200 字符。
+// 避免因注入的 system-reminders 和 context tags 导致失效。
+func stableBoundaryHash(msg Message) string {
+	blocks, _ := parseContent(msg.Content)
+	text := ""
+	for _, b := range blocks {
+		if b.Type == "text" {
+			text = b.Text
+			break
+		}
+	}
+	if len(text) > 200 {
+		text = text[:200]
+	}
+	return sha256hex([]byte(msg.Role + ":" + text))
+}
+
+// sha256hex 返回 data 的十六进制编码 SHA-256 hash。
+func sha256hex(data []byte) string {
+	h := sha256.Sum256(data)
+	return fmt.Sprintf("%x", h[:])
+}
+
+// ==== SawtoothTrigger ====
+
+// TriggerReason 表示桩化周期触发的原因。
+type TriggerReason string
+
+const (
+	TriggerNone      TriggerReason = ""          // 无需触发
+	TriggerTokens    TriggerReason = "tokens"    // 超过 token 阈值
+	TriggerPause     TriggerReason = "pause"     // 暂停超时 + token 足够
+	TriggerEmergency TriggerReason = "emergency" // 原始估算超过紧急阈值
+)
+
+// persistedState 是持久化到 proxy_state 的 JSON 结构。
+type persistedState struct {
+	Tokens   int `json:"tokens"`
+	MsgCount int `json:"msg_count"`
+}
+
+// SawtoothTrigger 根据 token 使用量和时间判断是否执行桩化周期。
+type SawtoothTrigger struct {
+	mu               sync.RWMutex
+	lastTotalTokens  map[string]int       // threadID → 上次 API 响应 input tokens
+	lastMessageCount map[string]int       // threadID → 上次响应时的消息数
+	lastRequestTime  map[string]time.Time // threadID → 上次 API 响应时间
+	loadedFromDB     map[string]bool      // threadID → 已尝试从 DB 加载
+	requestSeq       map[string]int       // threadID → 当前请求序号（Phase B: DecayTracker 用）
+	pauseThreshold   time.Duration        // 暂停检测阈值（cache TTL - 安全边距）
+	tokenThreshold   int                  // 超过此值触发桩化周期（来自配置）
+	tokenMinimum     int                  // 桩化下限（来自配置）
+	persistFn        PersistFunc          // 可选：更新时持久化 token 状态到 DB
+	loadFn           LoadFunc             // 可选：冷启动时从 DB 加载 token 状态
+}
+
+// NewSawtoothTrigger 创建新的触发状态跟踪器。
+func NewSawtoothTrigger(pauseThreshold time.Duration, tokenThreshold, tokenMinimum int) *SawtoothTrigger {
+	return &SawtoothTrigger{
+		lastTotalTokens:  make(map[string]int),
+		lastMessageCount: make(map[string]int),
+		lastRequestTime:  make(map[string]time.Time),
+		loadedFromDB:     make(map[string]bool),
+		requestSeq:       make(map[string]int),
+		pauseThreshold:   pauseThreshold,
+		tokenThreshold:   tokenThreshold,
+		tokenMinimum:     tokenMinimum,
+	}
+}
+
+// SetPersistFunc 设置持久化 sawtooth 状态到 DB 的回调函数。
+func (st *SawtoothTrigger) SetPersistFunc(fn PersistFunc) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.persistFn = fn
+}
+
+// SetLoadFunc 设置冷启动时从 DB 加载 sawtooth 状态的回调函数。
+func (st *SawtoothTrigger) SetLoadFunc(fn LoadFunc) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.loadFn = fn
+}
+
+// ShouldTrigger 判断是否应为此 thread 执行桩化周期。
+// rawEstimate 是 API 调用前的 token 预估算（用于紧急制动）。
+func (st *SawtoothTrigger) ShouldTrigger(threadID string, rawEstimate int) TriggerReason {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+
+	emergencyThreshold := st.tokenThreshold + 10_000 // 比阈值多 10k 安全边距
+
+	// 紧急制动 —— 原始估算过高，无需历史数据
+	if rawEstimate > emergencyThreshold {
+		return TriggerEmergency
+	}
+
+	// 基于原始估算的 token 阈值（即使没有历史 API 数据也能触发）
+	if rawEstimate > st.tokenThreshold {
+		return TriggerTokens
+	}
+
+	tokens, hasTokens := st.lastTotalTokens[threadID]
+	lastTime, hasTime := st.lastRequestTime[threadID]
+
+	// 无历史数据且低于阈值 → 无需桩化
+	if !hasTokens {
+		// 冷启动：尝试从 DB 加载
+		if !st.loadedFromDB[threadID] {
+			st.mu.RUnlock()
+			st.loadSawtoothFromDB(threadID)
+			st.mu.RLock()
+			tokens, hasTokens = st.lastTotalTokens[threadID]
+			lastTime, hasTime = st.lastRequestTime[threadID]
+		}
+		if !hasTokens {
+			return TriggerNone
+		}
+	}
+
+	// 基于上次 API 响应的 token 阈值（比估算更精确）
+	if tokens > st.tokenThreshold {
+		return TriggerTokens
+	}
+
+	// 暂停检测：cache TTL 过期后，token 量足够则重新桩化
+	if hasTime && tokens > st.tokenMinimum {
+		if time.Since(lastTime) > st.pauseThreshold {
+			return TriggerPause
+		}
+	}
+
+	return TriggerNone
+}
+
+// UpdateAfterResponse 在 API 响应后记录实际 token 数、消息数和时间。
+func (st *SawtoothTrigger) UpdateAfterResponse(threadID string, totalInputTokens, messageCount int) {
+	st.mu.Lock()
+	st.lastTotalTokens[threadID] = totalInputTokens
+	st.lastMessageCount[threadID] = messageCount
+	st.lastRequestTime[threadID] = time.Now()
+	st.loadedFromDB[threadID] = true
+	st.mu.Unlock()
+
+	if st.persistFn != nil {
+		data, _ := json.Marshal(persistedState{Tokens: totalInputTokens, MsgCount: messageCount})
+		st.persistFn("sawtooth:"+threadID, string(data))
+	}
+}
+
+// IncrementRequestSeq 递增指定 thread 的请求序号并返回新值。
+// 每次 HandleMessages 调用时递增一次（Phase B: DecayTracker 用）。
+func (st *SawtoothTrigger) IncrementRequestSeq(threadID string) int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.requestSeq[threadID]++
+	return st.requestSeq[threadID]
+}
+
+// GetRequestSeq 返回当前请求序号（不递增）。
+func (st *SawtoothTrigger) GetRequestSeq(threadID string) int {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	return st.requestSeq[threadID]
+}
+
+// SetPauseThreshold 动态更新 SawtoothTrigger 的 pause 检测阈值。
+// 用于 Cache TTL 自适应：检测到 1h 断点时升至 61min，默认 ephemeral 保持 4min。
+func (st *SawtoothTrigger) SetPauseThreshold(pauseThreshold time.Duration) {
+	st.mu.Lock()
+	st.pauseThreshold = pauseThreshold
+	st.mu.Unlock()
+}
+
+// loadSawtoothFromDB 从 DB 加载指定 thread 的持久化 sawtooth 状态。
+// 每个 thread 在冷启动时仅调用一次（由 ShouldTrigger 触发 lazy-load）。
+func (st *SawtoothTrigger) loadSawtoothFromDB(threadID string) {
+	st.mu.Lock()
+	if st.loadedFromDB[threadID] {
+		st.mu.Unlock()
+		return
+	}
+	st.loadedFromDB[threadID] = true
+	loadFn := st.loadFn
+	st.mu.Unlock()
+
+	if loadFn == nil {
+		return
+	}
+
+	raw, ok := loadFn("sawtooth:" + threadID)
+	if !ok || raw == "" {
+		return
+	}
+
+	var state persistedState
+	if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		return
+	}
+	if state.Tokens <= 0 {
+		return // 无效状态
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	// 仅在仍为空时写入（UpdateAfterResponse 可能在并发中被调用）
+	if _, exists := st.lastTotalTokens[threadID]; exists {
+		return
+	}
+	st.lastTotalTokens[threadID] = state.Tokens
+	st.lastMessageCount[threadID] = state.MsgCount
+	// 不设置 lastRequestTime —— 保持零值，ShouldTrigger 中 hasTime=false 会跳过 Pause 检查。
+	// 下次 API 响应后 UpdateAfterResponse 才会设置真实时间。
+
+	slog.Info("从 SQLite 恢复 Sawtooth 状态",
+		"thread_id", threadID,
+		"tokens", state.Tokens,
+		"msg_count", state.MsgCount,
+	)
+}
+
+// ── Cache TTL 自适应辅助函数 ──
+
+// CacheGapForTTL 返回缓存过期前的"等待窗口"（即最后一次 API 调用后缓存还活多久）。
+// 1h TTL → 61min（剩余 1min 安全边距），默认 ephemeral → 4min。
+func CacheGapForTTL(cacheTTL string) time.Duration {
+	switch cacheTTL {
+	case "1h":
+		return 61 * time.Minute
+	default:
+		return 4 * time.Minute
+	}
+}
+
+// SawtoothTTLForCacheTTL 返回 FrozenStubs 的 TTL（应略大于 cache TTL，确保缓存未过期时 prefix 不被释放）。
+// 1h TTL → 65min，默认 ephemeral → 30min。
+func SawtoothTTLForCacheTTL(cacheTTL string) time.Duration {
+	switch cacheTTL {
+	case "1h":
+		return 65 * time.Minute
+	default:
+		return 30 * time.Minute
+	}
+}
