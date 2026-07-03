@@ -306,13 +306,54 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Phase 5: Subagent detection (SUBAGENT-02)
+		// 子代理请求携带未压缩的超长消息历史。用主线 frozen prefix 替换前缀，
+		// 使远端 DeepSeek 缓存命中率对齐主线（95%+）。
+		//
+		// 无需 30s 延迟：子代理由 CC 新进程 spawn，从主线响应返回到子代理请求
+		// 到达 proxy 已有 5-15s 自然延迟，足够 DeepSeek 磁盘缓存落盘。
+		// （YesMem forked_agent.go 的 30s 延迟是因为 fork 在主线响应返回后
+		//   毫秒级立即触发，与本场景时机不同。）
 		if isSubagent(bodyMap, messages) {
-			slog.Info("子代理检测到，透传跳过管线",
+			slog.Info("子代理检测到，替换 frozen prefix 并直接转发",
 				"session_id", sessionID,
 				"model", extractModelFromBody(body),
 				"message_count", len(messages),
 			)
-			r.Body = io.NopCloser(bytes.NewReader(body))
+
+			// Step 1: 用主线 frozen prefix 替换子代理的未压缩前缀
+			if s.Frozen != nil {
+				frozenResult := s.Frozen.Get(sessionID, messages)
+				if frozenResult != nil && frozenResult.Cutoff > 0 {
+					if frozenResult.Cutoff <= len(messages) {
+						messages = append(frozenResult.Messages, messages[frozenResult.Cutoff:]...)
+					} else {
+						// 子代理消息数异常少于 cutoff（极少见），全部用 frozen 消息
+						messages = frozenResult.Messages
+					}
+				}
+			}
+
+			// Step 2: 重新序列化请求体（对齐主线 Go json.Marshal 格式）
+			msgBytes, err := json.Marshal(messages)
+			if err != nil {
+				slog.Warn("子代理消息序列化失败，回退原样转发",
+					"session_id", sessionID, "error", err)
+				r.Body = io.NopCloser(bytes.NewReader(body))
+				s.forwardRaw(w, r, sessionID)
+				return
+			}
+			bodyMap["messages"] = json.RawMessage(msgBytes)
+			newBody, err := json.Marshal(bodyMap)
+			if err != nil {
+				slog.Warn("子代理请求体重建失败，回退原样转发",
+					"session_id", sessionID, "error", err)
+				r.Body = io.NopCloser(bytes.NewReader(body))
+				s.forwardRaw(w, r, sessionID)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(newBody))
+
+			// Step 3: 直接转发（forwardRaw 包含 usage deflation + SawtoothTrigger 更新）
 			s.forwardRaw(w, r, sessionID)
 			return
 		}
