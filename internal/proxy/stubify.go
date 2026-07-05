@@ -30,15 +30,13 @@ type Message struct {
 }
 
 // StubStats 记录 stub 操作前后的统计信息。
-// ArchivedMessages 保存被桩化的消息的原始副本，供 buildArchiveBlock 使用。
 type StubStats struct {
-	OriginalTokens   int
-	StubbedTokens    int
-	MessagesStubbed  int
-	ThinkingRemoved  int
-	ToolsProcessed   int
-	IsDecision       bool
-	ArchivedMessages []Message // 被桩化的原始消息（未修改副本）
+	OriginalTokens  int
+	StubbedTokens   int
+	MessagesStubbed int
+	ThinkingRemoved int
+	ToolsProcessed  int
+	IsDecision      bool
 }
 
 // parseContent 解析 Message.Content 字段。
@@ -199,13 +197,6 @@ func stubifyMessages(messages []Message, tc *TokenCounter, pivotText string, kee
 			}
 			stubbed = append(stubbed, msg)
 			continue
-		}
-
-		// 保存原始消息副本（供 archive 使用）
-		originalJSON, _ := json.Marshal(msg)
-		var originalMsg Message
-		if json.Unmarshal(originalJSON, &originalMsg) == nil {
-			stats.ArchivedMessages = append(stats.ArchivedMessages, originalMsg)
 		}
 
 		// STUB-06: 决策消息检测
