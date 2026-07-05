@@ -388,11 +388,10 @@ func TestStubifyThresholdGuardZero(t *testing.T) {
 		{Role: "user", Content: json.RawMessage(`"hello"`)},
 		{Role: "assistant", Content: json.RawMessage(`"hi there, this is a response with enough tokens to be meaningful"`)},
 	}
-	stubbed, stats := stubifyMessages(messages, tc, "", 0, false, nil, "test", 1, 0.0, 0)
-	if stats.OriginalTokens == stats.StubbedTokens && stats.MessagesStubbed == 0 {
-		// 0 阈值不触发守卫——消息仍然经过 stub 处理
+	stubbed, _ := stubifyMessages(messages, tc, "", 0, false, nil, "test", 1, 0.0, 0)
+	if len(stubbed) != len(messages) {
+		t.Errorf("stubify with threshold=0 should not change message count: got %d, want %d", len(stubbed), len(messages))
 	}
-	_ = stubbed
 }
 
 func TestStubifyThresholdGuardActive(t *testing.T) {

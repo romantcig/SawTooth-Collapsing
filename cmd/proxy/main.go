@@ -66,7 +66,7 @@ func main() {
 	// Phase B: DecayTracker 初始化（per-message decay tracking）
 	srv.DecayTracker = proxy.NewDecayTracker()
 	srv.DecayTracker.SetPersistFunc(func(key, value string) {
-		store.PersistState(key, value) // best-effort
+		_ = store.PersistState(key, value) // best-effort
 	})
 	srv.DecayTracker.SetLoadFunc(store.LoadState)
 	slog.Info("decay tracker 已初始化（per-message + SQLite 持久化）")
@@ -76,7 +76,7 @@ func main() {
 		proxy.SawtoothTTLForCacheTTL(cfg.Cache.CacheTTL), // Phase 8 D7: 从 cache_ttl 推导
 	)
 	frozenStore.SetPersistFunc(func(key, value string) {
-		store.PersistState(key, value) // best-effort，忽略错误
+		_ = store.PersistState(key, value) // best-effort，忽略错误
 	})
 	frozenStore.SetLoadFunc(store.LoadState)
 	if cfg.Frozen.Enabled {
@@ -93,7 +93,7 @@ func main() {
 		cfg.Stubify.TokenThreshold/2,              // tokenMinimum (D-03: threshold/2)
 	)
 	sawtoothTrigger.SetPersistFunc(func(key, value string) {
-		store.PersistState(key, value) // best-effort，忽略错误
+		_ = store.PersistState(key, value) // best-effort，忽略错误
 	})
 	sawtoothTrigger.SetLoadFunc(store.LoadState)
 	srv.Sawtooth = sawtoothTrigger
@@ -106,7 +106,7 @@ func main() {
 	// Phase 5: EagerStubMemory 初始化 (EAGER-02)
 	eagerStubMem := proxy.NewEagerStubMemory()
 	eagerStubMem.SetPersistFunc(func(key, value string) {
-		store.PersistState(key, value) // best-effort
+		_ = store.PersistState(key, value) // best-effort
 	})
 	eagerStubMem.SetLoadFunc(store.LoadState)
 	srv.EagerStub = eagerStubMem

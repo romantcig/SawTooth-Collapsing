@@ -168,7 +168,7 @@ func (s *SQLiteStore) SaveArchive(block ArchiveBlock) error {
 	if err != nil {
 		return fmt.Errorf("开启事务失败: %w", err)
 	}
-	defer tx.Rollback() // Commit 后 Rollback 为 no-op
+	defer func() { _ = tx.Rollback() }() // Commit 后 Rollback 为 no-op
 
 	messagesJSON, err := json.Marshal(block.Messages)
 	if err != nil {
@@ -276,6 +276,6 @@ func (s *SQLiteStore) SearchArchives(query string, limit int) ([]ArchiveSummary,
 // Close 执行 WAL checkpoint (TRUNCATE) 后关闭数据库连接（D-15）。
 func (s *SQLiteStore) Close() error {
 	// 确保 WAL 完整落盘（忽略 error，因为 db 可能已经关闭）
-	s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 	return s.db.Close()
 }

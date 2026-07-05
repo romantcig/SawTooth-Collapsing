@@ -476,11 +476,7 @@ func isDecisionMessage(content json.RawMessage, tc *TokenCounter) bool {
 
 	// 条件 a: 短确认 —— total tokens < 50
 	tokenCount := tc.CountTokens(text)
-	if tokenCount < 50 {
-		return true
-	}
-
-	return false
+	return tokenCount < 50
 }
 
 // isTaskList 检查文本是否包含 TODO 项或 checklist。

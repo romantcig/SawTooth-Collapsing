@@ -416,7 +416,7 @@ func messagesToAny(msgs []Message) []any {
 	for i, m := range msgs {
 		data, _ := json.Marshal(m)
 		var v map[string]any
-		json.Unmarshal(data, &v)
+		_ = json.Unmarshal(data, &v)
 		result[i] = v
 	}
 	return result

@@ -171,7 +171,7 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, sessionID st
 		slog.Warn("请求体超限", "session_id", sessionID, "size", len(body))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusRequestEntityTooLarge)
-		json.NewEncoder(w).Encode(map[string]string{
+		_ = json.NewEncoder(w).Encode(map[string]string{
 			"error": "Request Entity Too Large",
 		})
 		return
@@ -201,7 +201,7 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, sessionID st
 		slog.Error("创建上游请求失败", "session_id", sessionID, "error", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
-		json.NewEncoder(w).Encode(map[string]string{
+		_ = json.NewEncoder(w).Encode(map[string]string{
 			"error":  "Bad Gateway",
 			"detail": "failed to create upstream request",
 		})
@@ -228,7 +228,7 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, sessionID st
 		slog.Error("上游请求失败", "session_id", sessionID, "error", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
-		json.NewEncoder(w).Encode(map[string]string{
+		_ = json.NewEncoder(w).Encode(map[string]string{
 			"error":  "Bad Gateway",
 			"detail": err.Error(),
 		})
@@ -258,7 +258,7 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, sessionID st
 		if readErr != nil {
 			slog.Warn("读取非 2xx 响应体失败", "session_id", sessionID, "error", readErr)
 		}
-		w.Write(respBody)
+		_, _ = w.Write(respBody)
 
 		// Debug 写非 2xx 响应
 		if s.Config.Debug.Enabled {
@@ -468,7 +468,7 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, sessionI
 		slog.Error("读取上游 JSON 响应失败", "session_id", sessionID, "error", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
-		json.NewEncoder(w).Encode(map[string]string{
+		_ = json.NewEncoder(w).Encode(map[string]string{
 			"error":  "Bad Gateway",
 			"detail": "failed to read upstream response",
 		})
@@ -506,7 +506,7 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, sessionI
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	w.Write(respBody)
+	_, _ = w.Write(respBody)
 
 	// 步骤 5: Debug 写 JSON 响应
 	if s.Config.Debug.Enabled {

@@ -274,7 +274,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("请求体超限", "session_id", sessionID, "size", len(body))
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusRequestEntityTooLarge)
-			json.NewEncoder(w).Encode(map[string]string{"error": "Request Entity Too Large"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "Request Entity Too Large"})
 			return
 		}
 
