@@ -3,19 +3,11 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"sort"
 	"strings"
 
 	"github.com/google/uuid"
 )
-
-// CollapseStats 记录折叠操作的统计信息。
-type CollapseStats struct {
-	MessagesCollapsed int // 折叠的消息数
-	TokensArchived    int // 归档消息的估算 token 数
-	MessagesRemaining int // 折叠后剩余的消息数
-}
 
 // ── 公开纯函数 ──
 
@@ -622,17 +614,6 @@ func isStopWord(word string) bool {
 	return stopWords[word]
 }
 
-// filterStopWords 过滤停用词，保留实词。
-func filterStopWords(words []string) []string {
-	filtered := make([]string, 0, len(words))
-	for _, w := range words {
-		if !isStopWord(w) {
-			filtered = append(filtered, w)
-		}
-	}
-	return filtered
-}
-
 // getFilePath 从 tool_use input 中提取文件路径。
 func getFilePath(input map[string]any) string {
 	fileKeys := []string{"file_path", "path", "filename", "file", "filePath"}
@@ -742,15 +723,5 @@ func formatArchiveBlockText(
 // sortStrings 对字符串 slice 排序。
 func sortStrings(s []string) {
 	sort.Strings(s)
-}
-
-// logCollapse 记录折叠操作日志。
-func logCollapse(sessionID string, stats CollapseStats) {
-	slog.Info("折叠完成",
-		"session_id", sessionID,
-		"messages_collapsed", stats.MessagesCollapsed,
-		"tokens_archived", stats.TokensArchived,
-		"messages_remaining", stats.MessagesRemaining,
-	)
 }
 
