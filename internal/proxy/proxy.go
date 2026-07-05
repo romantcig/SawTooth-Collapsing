@@ -455,7 +455,6 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				s.Frozen.Invalidate(sessionID)
 				messages = originalMessages
 				frozenCount = 0
-				frozenTokens = 0
 				// 在原始消息上重新执行 Reexpand（之前执行时 messages 还是 frozen+tail）
 				if s.Store != nil {
 					messages = SearchAndExpand(messages, s.Store, s.Config.Stubify.TokenThreshold, s.TokenCounter, reExpandBudget)
@@ -474,7 +473,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 			// Phase A: CompressContext — 预压缩 keepRecent 外的 thinking block 和
 			// 超过 500 token 的 tool_result block，回收已被模型"消化"的上下文空间。
-			compressResult := CompressResult{}
+			var compressResult CompressResult
 			messages, compressResult = CompressContext(messages, s.Config.Stubify.KeepRecent, s.TokenCounter)
 			if compressResult.ThinkingCompressed > 0 || compressResult.ToolResultsCompressed > 0 {
 				slog.Debug("compress_context 完成",
@@ -646,7 +645,6 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 						"after", len(decayedMessages),
 						"blocks", len(compactedBlocks),
 					)
-					totalTokens = s.TokenCounter.CountMessagesTokens(decayedMessages)
 				}
 			}
 
