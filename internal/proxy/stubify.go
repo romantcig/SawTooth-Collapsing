@@ -168,13 +168,6 @@ func stubifyMessages(messages []Message, tc *TokenCounter, pivotText string, kee
 		// 工具配对检测：前一条消息有 tool_use 且当前有 tool_result → 强制桩化
 		forceStub := prevHadToolUse && hasToolResultBlocks(msg.Content)
 
-		// 活跃 debug 序列保护（F-10）：前一条消息有错误 tool_result，
-		// 当前消息可能是修复响应 → 保护不被桩化
-		isDebugFollowup := false
-		if i > 0 && hasErrorToolResult(messages[i-1].Content) {
-			isDebugFollowup = true
-		}
-
 		// STUB-01: 移除 thinking 块（keepThinking 为 true 时跳过）。
 		// 必须在尾部保护之前执行——即使受保护的消息也应移除 thinking，
 		// 否则 ContentBlock.Thinking 的 omitempty 标签在 re-marshal 时
@@ -188,9 +181,9 @@ func stubifyMessages(messages []Message, tc *TokenCounter, pivotText string, kee
 		}
 
 		// 尾部保护区：最近 keepRecent 条消息跳过文本截断和工具桩化。
-		// 例外：工具配对强制桩化（F-9）或 debug 错误响应（F-10）。
+		// 例外：工具配对强制桩化（F-9）。
 		// 注意：若 thinking blocks 在上方被移除，需重建 content 再追加。
-		if i >= protectedTail && !forceStub && !isDebugFollowup {
+		if i >= protectedTail && !forceStub {
 			if thinkingRemoved > 0 {
 				msg.Content = rebuildContent(blocks, isArray)
 			}
@@ -199,8 +192,8 @@ func stubifyMessages(messages []Message, tc *TokenCounter, pivotText string, kee
 		}
 
 		// STUB-07: pivot + debug + task list 扩展保护
-		// 工具配对强制桩化或活跃 debug 序列时不做保护跳过
-		if isProtectedExtended(msg.Content, pivotText) && !forceStub && !isDebugFollowup {
+		// 工具配对强制桩化时不做保护跳过
+		if isProtectedExtended(msg.Content, pivotText) && !forceStub {
 			if thinkingRemoved > 0 {
 				msg.Content = rebuildContent(blocks, isArray)
 			}
@@ -499,26 +492,6 @@ func isDecisionMessage(content json.RawMessage, tc *TokenCounter) bool {
 	return false
 }
 
-// hasErrorToolResult 检查消息的 content block 中是否包含错误 tool_result。
-// 用于 isActiveDebug 检测——保护错误修复序列不被桩化。
-func hasErrorToolResult(content json.RawMessage) bool {
-	blocks, _ := parseContent(content)
-	for _, b := range blocks {
-		if b.Type == "tool_result" {
-			if b.IsError {
-				return true
-			}
-			// 检查 tool_result content 是否包含非零 exit code
-			if s, ok := b.Content.(string); ok {
-				if strings.Contains(s, "exit code") && !strings.Contains(s, "exit code 0") {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
 // isTaskList 检查文本是否包含 TODO 项或 checklist。
 func isTaskList(text string) bool {
 	if text == "" {
@@ -530,7 +503,7 @@ func isTaskList(text string) bool {
 		strings.Contains(text, "- [X]")
 }
 
-// isProtectedExtended 扩展保护检测：pivot 文本 + 活跃 debug 序列 + task list。
+// isProtectedExtended 扩展保护检测：pivot 文本 + task list。
 func isProtectedExtended(content json.RawMessage, pivotText string) bool {
 	blocks, _ := parseContent(content)
 	var allText strings.Builder
