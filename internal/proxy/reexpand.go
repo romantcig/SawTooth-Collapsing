@@ -93,7 +93,9 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 	// 构建 FTS5 查询：关键词用 OR 连接，单引号转义，最多 20 个关键词
 	// T-03-06: 关键词注入防护——单引号转义 + 限制数量
 	fts5Query := buildFTS5Query(keywords)
-
+	if fts5Query == "" {
+		return messages
+	}
 	// 执行搜索
 	limit := 5
 	if len(keywords) > limit {
@@ -246,28 +248,25 @@ func extractFilePaths(text string) []string {
 }
 
 // buildFTS5Query 将关键词列表构建为 FTS5 MATCH 查询。
-// 用 OR 连接，单引号转义，最多 20 个关键词。
+// 用 OR 连接，双引号转义，最多 20 个关键词。
+// T-03-06: 关键词注入防护——双引号转义 + 限制数量。
+// 所有 token 用双引号包裹（phrase literal 策略），使 FTS5 保留字符（* : ( ) + - 等）被视为字面量。
 func buildFTS5Query(keywords []string) string {
-	// 限制最多 20 个关键词
-	limit := 20
-	if len(keywords) > limit {
-		keywords = keywords[:limit]
-	}
-
 	var parts []string
 	for _, kw := range keywords {
-		// 单引号转义：FTS5 中 '' 转义为 ''' 不安全，使用 doubles '' 是标准方式
-		escaped := strings.ReplaceAll(kw, "'", "''")
-		// 空关键词或转义后为空 → 跳过
+		// FTS5 phrase literal 转义：双引号加倍（FTS5 规定双引号内 "" 才是字面 "）
+		escaped := strings.ReplaceAll(kw, `"`, `""`)
+		// 空关键词跳过
 		if escaped == "" {
 			continue
 		}
-		// 含空格的关键词需要用双引号包裹
-		if strings.Contains(escaped, " ") {
-			parts = append(parts, `"`+escaped+`"`)
-		} else {
-			parts = append(parts, escaped)
-		}
+		// 始终用双引号包裹——确保 FTS5 保留字符（* : ( ) + - 等）被视为字面量而非操作符
+		parts = append(parts, `"`+escaped+`"`)
+	}
+
+	// 限制最多 20 个关键词（先过滤再截断，防止空词浪费槽位）
+	if len(parts) > 20 {
+		parts = parts[:20]
 	}
 
 	if len(parts) == 0 {
