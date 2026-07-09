@@ -251,15 +251,29 @@ func (s *SQLiteStore) LoadState(key string) (string, bool) {
 // SearchArchives 通过 FTS5 MATCH + bm25() 搜索匹配的 archive 摘要（D-07, D-11）。
 // query 应当已经过 buildFTS5Query 清洗——所有 token 已双引号包裹（phrase literal），
 // 参数化查询 ? 防止 SQL 注入，双引号包裹防止 FTS5 语法注入。
+// 排序：FTS5 索引的是单 token 关键词文档（每行一个关键词，dl=avgdl=1），
+// 每匹配行 bm25() = -IDF；GROUP BY block 后 SUM = -Σ IDF(匹配词)，
+// 升序即"匹配词越多、词越稀有越靠前"，恢复查询级 BM25 语义。
+// bm25() 是 FTS5 辅助函数，只能在全文查询的逐匹配行上下文求值
+// （聚合上下文报 "unable to use function bm25"），故经 MATERIALIZED CTE
+// 物化为普通列 rank 后再在外层 SUM 聚合——MATERIALIZED 阻止查询计划器
+// 将 CTE 扁平化回聚合上下文。
+// GROUP BY 主键 a.id 时其余 a.* 列函数依赖于主键（组内值一致），
+// SQLite 允许 bare columns，安全。
 func (s *SQLiteStore) SearchArchives(query string, limit int) ([]ArchiveSummary, error) {
 	rows, err := s.db.Query(
-		`SELECT DISTINCT a.id, a.session_id, a.block_range_start, a.block_range_end,
+		`WITH matched AS MATERIALIZED (
+		     SELECT rowid, bm25(archive_keywords_fts) AS rank
+		     FROM archive_keywords_fts
+		     WHERE archive_keywords_fts MATCH ?
+		 )
+		 SELECT a.id, a.session_id, a.block_range_start, a.block_range_end,
 		        a.message_count, a.estimated_tokens, a.summary_text, a.created_at
 		 FROM archive_blocks a
 		 JOIN archive_keywords k ON k.block_id = a.id
-		 JOIN archive_keywords_fts fts ON fts.rowid = k.id
-		 WHERE archive_keywords_fts MATCH ?
-		 ORDER BY bm25(archive_keywords_fts)
+		 JOIN matched fts ON fts.rowid = k.id
+		 GROUP BY a.id
+		 ORDER BY SUM(fts.rank)
 		 LIMIT ?`,
 		query, limit,
 	)
