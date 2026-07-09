@@ -447,12 +447,20 @@ func countRunes(s string) int {
 
 // truncateRunes 按 rune 位置截断字符串，并追加 "…"。
 // 若字符串 rune 数不超过 maxRunes，原样返回。
+// 截断可能落在代码块中间，未闭合围栏会吞掉下游对话内容
+// （经 reexpand.go 的 SummaryText 注入路径级联污染），
+// 故截断后围栏计数为奇数时补一个闭合围栏止血。
 func truncateRunes(s string, maxRunes int) string {
 	runes := []rune(s)
 	if len(runes) <= maxRunes {
 		return s
 	}
-	return string(runes[:maxRunes]) + "…"
+	truncated := string(runes[:maxRunes]) + "…"
+	if strings.Count(truncated, "```")%2 == 1 {
+		// 闭合围栏须独占一行（Markdown 围栏在行首才生效）
+		truncated += "\n```"
+	}
+	return truncated
 }
 
 // isDecisionMessage 检测消息是否为决策消息（STUB-06，对应 D-03）。

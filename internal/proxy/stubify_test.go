@@ -568,3 +568,50 @@ func TestStubToolUsesDeepSearchSuffix(t *testing.T) {
 		t.Errorf("tool_use stub should have deep_search hint, got: %s", result[0].Text)
 	}
 }
+
+// ---- truncateRunes 围栏截断测试 ----
+
+func TestTruncateRunesFenceClosedAfterCut(t *testing.T) {
+	// 截断点落在代码块中间 → 输出围栏计数应为偶数，且以闭合围栏结尾
+	input := "前导文字\n```go\n" + strings.Repeat("x", 100) + "\n```\n结尾"
+	result := truncateRunes(input, 50)
+	if strings.Count(result, "```")%2 != 0 {
+		t.Errorf("expected even fence count after cut inside code block, got %d in: %q",
+			strings.Count(result, "```"), result)
+	}
+	if !strings.HasSuffix(result, "\n```") {
+		t.Errorf("expected result to end with closing fence on its own line, got: %q", result)
+	}
+}
+
+func TestTruncateRunesNoFenceUnchanged(t *testing.T) {
+	// 不含围栏的文本截断行为与修复前逐字节一致
+	input := strings.Repeat("a", 200)
+	result := truncateRunes(input, 50)
+	expected := string([]rune(input)[:50]) + "…"
+	if result != expected {
+		t.Errorf("no-fence truncation changed: expected %q, got %q", expected, result)
+	}
+}
+
+func TestTruncateRunesNoCutReturnsAsIs(t *testing.T) {
+	// 未触发截断 → 原样返回，即使自带奇数个围栏也不修改
+	input := "孤立围栏 ```"
+	result := truncateRunes(input, 50)
+	if result != input {
+		t.Errorf("untruncated input should be returned as-is, got: %q", result)
+	}
+}
+
+func TestTruncateRunesCutAfterClosedBlockNoAppend(t *testing.T) {
+	// 完整闭合代码块之后截断 → 围栏计数已为偶数，不追加围栏
+	input := "```go\ncode\n```\n" + strings.Repeat("t", 100)
+	result := truncateRunes(input, 50)
+	if !strings.HasSuffix(result, "…") {
+		t.Errorf("cut in plain tail should end with ellipsis, got: %q", result)
+	}
+	if strings.Count(result, "```")%2 != 0 {
+		t.Errorf("expected even fence count (no append needed), got %d in: %q",
+			strings.Count(result, "```"), result)
+	}
+}
