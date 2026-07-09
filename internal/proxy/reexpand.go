@@ -126,8 +126,8 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 	var injected []Message
 
 	for i, summary := range summaries {
-		// 截断到 2000 字符
-		truncated := truncateRunes(summary.SummaryText, 2000)
+		// 分段感知截断到 2000 字符——优先保留 Gotchas/Conclusion
+		truncated := truncateSummaryText(summary.SummaryText, 2000)
 		if truncated == "" {
 			continue
 		}
@@ -137,15 +137,27 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 			i+1, summary.BlockRangeStart, summary.BlockRangeEnd, summary.EstimatedTokens)
 		cost := tc.CountTokens(prefix + truncated)
 
-		// Budget 门控：超出预算则停止注入后续 block
+		// Budget 门控：超出预算则先按 1000→500 减半降级重试，降到底仍装不下才停止注入
 		if budget != nil && tokenUsed+cost > maxBudget {
-			slog.Info("archive 注入预算耗尽",
-				"injected_count", i,
-				"total_summaries", len(summaries),
-				"token_used", tokenUsed,
-				"max_budget", maxBudget,
-			)
-			break
+			fits := false
+			for _, level := range []int{1000, 500} {
+				truncated = truncateSummaryText(summary.SummaryText, level)
+				cost = tc.CountTokens(prefix + truncated)
+				if tokenUsed+cost <= maxBudget {
+					fits = true
+					break
+				}
+			}
+			if !fits {
+				slog.Info("archive 注入预算耗尽",
+					"injected_count", i,
+					"total_summaries", len(summaries),
+					"token_used", tokenUsed,
+					"max_budget", maxBudget,
+					"degraded_levels", "1000,500",
+				)
+				break
+			}
 		}
 		tokenUsed += cost
 
@@ -322,6 +334,109 @@ func dedupKeywords(keywords []string) []string {
 		result = append(result, kw)
 	}
 	return result
+}
+
+// truncateSummaryText 对 archive SummaryText 做分段感知截断：
+// 超限时优先保留头部行与 Gotchas/Conclusion 尾段，剩余 rune 预算按原顺序
+// 贪心装填中间段（整段装或整段弃），被省略的段在原位置插入一行标注。
+// 不含任何已知段标题的文本回退 truncateRunes。
+func truncateSummaryText(s string, maxRunes int) string {
+	if countRunes(s) <= maxRunes {
+		return s
+	}
+
+	// 段定位：按 formatArchiveBlockText 的段序精确查找各标题一次。
+	// token 以 "\n### " 开头——生成器对 Tools Used 写 "\n\n###"，恰命中其第二个换行。
+	titles := []string{"Tools Used", "Files", "Commits", "Timeline", "Gotchas", "Conclusion"}
+	positions := make([]int, len(titles))
+	searchFrom := 0
+	for i, title := range titles {
+		token := "\n### " + title + "\n"
+		idx := strings.Index(s[searchFrom:], token)
+		if idx < 0 {
+			positions[i] = -1
+			continue
+		}
+		positions[i] = searchFrom + idx
+		searchFrom = positions[i] + len(token)
+	}
+
+	// 6 个标题全部未命中 → 非 7 段结构，防御回退
+	firstHit := -1
+	for _, pos := range positions {
+		if pos >= 0 {
+			firstHit = pos
+			break
+		}
+	}
+	if firstHit < 0 {
+		return truncateRunes(s, maxRunes)
+	}
+
+	// 切分：head 为头部行；chunk 以自身 "\n### 标题\n" 开头、含该段全部内容
+	head := s[:firstHit]
+	chunks := make([]string, len(titles))
+	for i, pos := range positions {
+		if pos < 0 {
+			continue
+		}
+		end := len(s)
+		for j := i + 1; j < len(titles); j++ {
+			if positions[j] >= 0 {
+				end = positions[j]
+				break
+			}
+		}
+		chunks[i] = s[pos:end]
+	}
+
+	// 必保集：头部行 + Gotchas + Conclusion；自身超限则对拼接结果整体兜底
+	mustKeep := head + chunks[4] + chunks[5]
+	if countRunes(mustKeep) > maxRunes {
+		return truncateRunes(mustKeep, maxRunes)
+	}
+
+	// 贪心装填：按原顺序遍历 4 个中间段，装不下则标记省略并继续试下一段
+	remaining := maxRunes - countRunes(mustKeep)
+	kept := make([]bool, len(titles))
+	kept[4] = positions[4] >= 0
+	kept[5] = positions[5] >= 0
+	for i := 0; i < 4; i++ {
+		if positions[i] < 0 {
+			continue
+		}
+		n := countRunes(chunks[i])
+		if n <= remaining {
+			kept[i] = true
+			remaining -= n
+		}
+	}
+
+	// 组装：按原始段序输出保留段；每处连续省略段 run 在原位置插一行标注
+	//（标注行不计入 rune 预算，真实预算控制在下游 CountTokens）
+	var sb strings.Builder
+	sb.WriteString(head)
+	var omitted []string
+	flushOmitted := func() {
+		if len(omitted) == 0 {
+			return
+		}
+		sb.WriteString("\n[...omitted: " + strings.Join(omitted, ", ") + "...]\n")
+		omitted = omitted[:0]
+	}
+	for i := range titles {
+		if positions[i] < 0 {
+			continue
+		}
+		if kept[i] {
+			flushOmitted()
+			sb.WriteString(chunks[i])
+		} else {
+			omitted = append(omitted, titles[i])
+		}
+	}
+	flushOmitted()
+	return sb.String()
 }
 
 // extractDSKeywords 从文本中提取所有 deep_search('...') 提示中的关键词。
