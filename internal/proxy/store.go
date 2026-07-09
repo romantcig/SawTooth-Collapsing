@@ -50,6 +50,7 @@ type KeywordEntry struct {
 
 // NewSQLiteStore 打开或创建指定路径的 SQLite 数据库。
 // 设置 PRAGMA、创建 schema，对每一步错误进行 wrap 返回。
+// 内建损坏检测与自动恢复：检测到 corruption 时删除损坏文件并重试一次。
 func NewSQLiteStore(path string) (*SQLiteStore, error) {
 	// 确保父目录存在（纯 Go SQLite 驱动不会自动创建）
 	dir := filepath.Dir(path)
@@ -57,6 +58,22 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("创建数据目录失败 %s: %w", dir, err)
 	}
 
+	// 孤儿 WAL 清理：若主 DB 不存在，清理进程闪退残留的 -wal/-shm
+	// （Windows 上残留的 WAL/SHM 可能导致下次打开报 "file is not a database"）
+	removeStaleWALFiles(path)
+
+	s, err := tryInitDB(path)
+	if err != nil && isCorruptionError(err) {
+		// 自动恢复：删除损坏文件（主 DB + -wal + -shm），从头重建
+		removeDBFiles(path)
+		s, err = tryInitDB(path)
+	}
+	return s, err
+}
+
+// tryInitDB 尝试打开并初始化 SQLite 数据库。
+// 不含损坏恢复逻辑（由 NewSQLiteStore 外层处理）。
+func tryInitDB(path string) (*SQLiteStore, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("打开 sqlite 数据库失败: %w", err)
@@ -232,11 +249,9 @@ func (s *SQLiteStore) LoadState(key string) (string, bool) {
 }
 
 // SearchArchives 通过 FTS5 MATCH + bm25() 搜索匹配的 archive 摘要（D-07, D-11）。
-// 对 query 做单引号转义防止注入（T-03-01 缓解）。
+// query 应当已经过 buildFTS5Query 清洗——所有 token 已双引号包裹（phrase literal），
+// 参数化查询 ? 防止 SQL 注入，双引号包裹防止 FTS5 语法注入。
 func (s *SQLiteStore) SearchArchives(query string, limit int) ([]ArchiveSummary, error) {
-	// T-03-01: 单引号转义——防止 FTS5 查询注入
-	safeQuery := strings.ReplaceAll(query, "'", "''")
-
 	rows, err := s.db.Query(
 		`SELECT DISTINCT a.id, a.session_id, a.block_range_start, a.block_range_end,
 		        a.message_count, a.estimated_tokens, a.summary_text, a.created_at
@@ -246,7 +261,7 @@ func (s *SQLiteStore) SearchArchives(query string, limit int) ([]ArchiveSummary,
 		 WHERE archive_keywords_fts MATCH ?
 		 ORDER BY bm25(archive_keywords_fts)
 		 LIMIT ?`,
-		safeQuery, limit,
+		query, limit,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("搜索 archive 失败: %w", err)
@@ -278,4 +293,34 @@ func (s *SQLiteStore) Close() error {
 	// 确保 WAL 完整落盘（忽略 error，因为 db 可能已经关闭）
 	_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 	return s.db.Close()
+}
+
+// ── SQLite 损坏恢复辅助函数 ──
+
+// isCorruptionError 检测错误消息中是否包含 SQLite 损坏关键字。
+// 覆盖 SQLITE_CORRUPT、SQLITE_NOTADB 及其标准人类可读描述。
+func isCorruptionError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "database disk image is malformed") ||
+		strings.Contains(msg, "file is not a database") ||
+		strings.Contains(msg, "SQLITE_CORRUPT") ||
+		strings.Contains(msg, "SQLITE_NOTADB")
+}
+
+// removeDBFiles 删除数据库主文件及其 WAL/SHM 伴生文件。
+// 忽略单个文件删除失败（文件可能不存在），确保尽力清理。
+func removeDBFiles(path string) {
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		_ = os.Remove(path + suffix)
+	}
+}
+
+// removeStaleWALFiles 当主 DB 文件不存在时，清理进程闪退残留的 -wal/-shm。
+// Windows 上进程异常退出后，残留的伴生文件可能使 sqlite 将空 WAL 误判为有效数据库。
+func removeStaleWALFiles(path string) {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		for _, suffix := range []string{"-wal", "-shm"} {
+			_ = os.Remove(path + suffix)
+		}
+	}
 }
