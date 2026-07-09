@@ -90,8 +90,8 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 		return messages
 	}
 
-	// 构建 FTS5 查询：关键词用 OR 连接，单引号转义，最多 20 个关键词
-	// T-03-06: 关键词注入防护——单引号转义 + 限制数量
+	// 构建 FTS5 查询：关键词用 OR 连接，双引号转义，最多 20 个关键词
+	// T-03-06: 关键词注入防护——双引号转义 + 限制数量
 	fts5Query := buildFTS5Query(keywords)
 	if fts5Query == "" {
 		return messages
@@ -121,7 +121,7 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 	// Phase E: 预算门控——若无可用预算则跳过重展开
 	if budget != nil && !budget.CanSpendReExpansion(1) {
 		return messages
-	} // 10% of threshold
+	}
 	tokenUsed := 0
 	var injected []Message
 
@@ -178,11 +178,10 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 		"token_cost", tokenUsed,
 		"budget_used_pct", fmt.Sprintf("%.1f%%", float64(tokenUsed)/float64(maxBudget)*100),
 	)
-		// Phase E: 记录重展开 token 支出
-		if budget != nil {
-			budget.SpendReExpansion(tokenUsed)
-		}
-
+	// Phase E: 记录重展开 token 支出
+	if budget != nil {
+		budget.SpendReExpansion(tokenUsed)
+	}
 
 	return result
 }
