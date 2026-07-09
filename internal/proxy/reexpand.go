@@ -137,15 +137,27 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 			i+1, summary.BlockRangeStart, summary.BlockRangeEnd, summary.EstimatedTokens)
 		cost := tc.CountTokens(prefix + truncated)
 
-		// Budget 门控：超出预算则停止注入后续 block
+		// Budget 门控：超出预算则先按 1000→500 减半降级重试，降到底仍装不下才停止注入
 		if budget != nil && tokenUsed+cost > maxBudget {
-			slog.Info("archive 注入预算耗尽",
-				"injected_count", i,
-				"total_summaries", len(summaries),
-				"token_used", tokenUsed,
-				"max_budget", maxBudget,
-			)
-			break
+			fits := false
+			for _, level := range []int{1000, 500} {
+				truncated = truncateSummaryText(summary.SummaryText, level)
+				cost = tc.CountTokens(prefix + truncated)
+				if tokenUsed+cost <= maxBudget {
+					fits = true
+					break
+				}
+			}
+			if !fits {
+				slog.Info("archive 注入预算耗尽",
+					"injected_count", i,
+					"total_summaries", len(summaries),
+					"token_used", tokenUsed,
+					"max_budget", maxBudget,
+					"degraded_levels", "1000,500",
+				)
+				break
+			}
 		}
 		tokenUsed += cost
 
