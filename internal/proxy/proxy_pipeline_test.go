@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -11,6 +13,145 @@ import (
 	"testing"
 	"time"
 )
+
+func TestHandleMessagesSubagentNoSideEffects(t *testing.T) {
+	testHandleMessagesDirectAgentBypass(t, "subagent", `"deepseek-v4-pro"`, `{"type":"enabled"}`, `[{"type":"text","text":"cc_entrypoint=sdk-ts"}]`)
+}
+
+func TestHandleMessagesAgentUnknownNoSideEffects(t *testing.T) {
+	testHandleMessagesDirectAgentBypass(t, "unknown", `"unverified-model"`, `{"type":"enabled"}`, `[{"type":"text","text":"ordinary system"}]`)
+}
+
+func testHandleMessagesDirectAgentBypass(t *testing.T, name, model, thinking, system string) {
+	t.Helper()
+	var forwardedBodies [][]byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream request: %v", err)
+		}
+		forwardedBodies = append(forwardedBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	searchCalls := 0
+	server.searchAndExpandFn = func(messages []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, _ string) RecallOutcome {
+		searchCalls++
+		return RecallOutcome{Messages: messages}
+	}
+	messagesJSON, err := json.Marshal(pipelineMessages(300, 80))
+	if err != nil {
+		t.Fatalf("marshal messages: %v", err)
+	}
+	body := []byte(fmt.Sprintf("{ \"model\" : %s, \"thinking\" : %s, \"system\" : %s, \"messages\" : %s }", model, thinking, system, messagesJSON))
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Claude-Code-Session-Id", "thread-agent-"+name)
+	recorder := httptest.NewRecorder()
+	server.HandleMessages(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("HandleMessages status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if searchCalls != 0 {
+		t.Fatalf("SearchAndExpand calls = %d, want 0", searchCalls)
+	}
+	if got := archiveCount(t, server.Store); got != 0 {
+		t.Fatalf("archive rows = %d, want 0", got)
+	}
+	if len(forwardedBodies) != 1 {
+		t.Fatalf("forward calls = %d, want 1", len(forwardedBodies))
+	}
+	if !bytes.Equal(forwardedBodies[0], body) {
+		t.Fatalf("direct-forward body changed\ngot:  %s\nwant: %s", forwardedBodies[0], body)
+	}
+}
+
+func TestHandleMessagesParentFrozenRequiresExplicitRelation(t *testing.T) {
+	const (
+		childID  = "11111111-1111-4111-8111-111111111111"
+		parentID = "22222222-2222-4222-8222-222222222222"
+	)
+	tests := []struct {
+		name          string
+		parentHeader  string
+		wantFirstText string
+		wantLog       string
+	}{
+		{name: "explicit parent", parentHeader: parentID, wantFirstText: "parent frozen"},
+		{name: "parent unavailable", wantFirstText: "raw child", wantLog: "parent_frozen_unavailable"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var forwarded []Message
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Messages []Message `json:"messages"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatalf("decode upstream request: %v", err)
+				}
+				forwarded = deepCopyMessages(body.Messages)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+			}))
+			defer upstream.Close()
+
+			server := newPipelineTestServer(t, upstream.URL)
+			raw := []Message{
+				{Role: "user", Content: mustMarshal("raw child")},
+				{Role: "assistant", Content: mustMarshal("fresh tail")},
+			}
+			parentPrefix := []Message{{Role: "user", Content: mustMarshal("parent frozen")}}
+			server.Frozen.Store(parentID, parentPrefix, 1, raw[0], 10, 20)
+			childPrefix := []Message{{Role: "user", Content: mustMarshal("child frozen must not be used")}}
+			server.Frozen.Store(childID, childPrefix, 1, raw[0], 10, 20)
+
+			var logs bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+			t.Cleanup(func() { slog.SetDefault(previous) })
+
+			body, err := json.Marshal(map[string]any{
+				"model":    "deepseek-v4-pro",
+				"thinking": map[string]any{"type": "enabled"},
+				"system":   []map[string]string{{"type": "text", "text": "cc_entrypoint=sdk-ts"}},
+				"messages": raw,
+			})
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Claude-Code-Session-Id", childID)
+			if tt.parentHeader != "" {
+				req.Header.Set(parentSessionHeader, tt.parentHeader)
+			}
+			recorder := httptest.NewRecorder()
+			server.HandleMessages(recorder, req)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("HandleMessages status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if len(forwarded) != 2 {
+				t.Fatalf("forwarded message count = %d, want 2", len(forwarded))
+			}
+			var firstText string
+			if err := json.Unmarshal(forwarded[0].Content, &firstText); err != nil {
+				t.Fatalf("decode first content: %v", err)
+			}
+			if firstText != tt.wantFirstText {
+				t.Fatalf("first message = %q, want %q", firstText, tt.wantFirstText)
+			}
+			if tt.wantLog != "" && !strings.Contains(logs.String(), tt.wantLog) {
+				t.Fatalf("logs missing %q: %s", tt.wantLog, logs.String())
+			}
+		})
+	}
+}
 
 func TestHandleMessagesCollapseFreezeLifecycle(t *testing.T) {
 	var forwarded []Message
