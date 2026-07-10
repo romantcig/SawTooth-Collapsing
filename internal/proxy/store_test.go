@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -264,5 +265,98 @@ func TestNewSQLiteStoreCleansOrphanWALFiles(t *testing.T) {
 	}
 	if got != "v" {
 		t.Errorf("LoadState(%q) = %q, want %q", "k", got, "v")
+	}
+}
+
+func TestSaveArchiveIdempotent(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "idempotent.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	first := archiveTestBlock("retry-a", "same content")
+	second := archiveTestBlock("retry-b", "same content")
+	if err := store.SaveArchive(first); err != nil {
+		t.Fatalf("第一次 SaveArchive failed: %v", err)
+	}
+	if err := store.SaveArchive(second); err != nil {
+		t.Fatalf("第二次 SaveArchive failed: %v", err)
+	}
+
+	assertArchiveCounts(t, store, 1, len(first.Keywords))
+	var storedID, contentHash string
+	if err := store.db.QueryRow(`SELECT id, content_hash FROM archive_blocks`).Scan(&storedID, &contentHash); err != nil {
+		t.Fatalf("读取幂等结果失败: %v", err)
+	}
+	if storedID != first.ID {
+		t.Fatalf("重复保存覆盖了首个引用 ID: got %q want %q", storedID, first.ID)
+	}
+	if contentHash == "" {
+		t.Fatal("SaveArchive 未防御性补算 content_hash")
+	}
+
+	different := archiveTestBlock("different", "different content")
+	if err := store.SaveArchive(different); err != nil {
+		t.Fatalf("保存不同正文失败: %v", err)
+	}
+	assertArchiveCounts(t, store, 2, len(first.Keywords)+len(different.Keywords))
+}
+
+func TestSaveArchiveConcurrent(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "concurrent.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	const writers = 12
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			block := archiveTestBlock(string(rune('a'+i)), "concurrent content")
+			errs <- store.SaveArchive(block)
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("并发 SaveArchive failed: %v", err)
+		}
+	}
+
+	example := archiveTestBlock("example", "concurrent content")
+	assertArchiveCounts(t, store, 1, len(example.Keywords))
+}
+
+func archiveTestBlock(id, text string) ArchiveBlock {
+	return ArchiveBlock{
+		ID:              id,
+		SessionID:       "session-idempotent",
+		BlockRangeStart: 1,
+		BlockRangeEnd:   4,
+		MessageCount:    4,
+		EstimatedTokens: 100,
+		Messages:        []Message{{Role: "user", Content: mustMarshal(text)}},
+		SummaryText:     text,
+		Keywords:        []KeywordEntry{{Word: "archive", Source: "user_message"}, {Word: "content", Source: "user_message"}},
+	}
+}
+
+func assertArchiveCounts(t *testing.T, store *SQLiteStore, blocks, keywords int) {
+	t.Helper()
+	var gotBlocks, gotKeywords int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM archive_blocks`).Scan(&gotBlocks); err != nil {
+		t.Fatalf("统计 archive_blocks 失败: %v", err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM archive_keywords`).Scan(&gotKeywords); err != nil {
+		t.Fatalf("统计 archive_keywords 失败: %v", err)
+	}
+	if gotBlocks != blocks || gotKeywords != keywords {
+		t.Fatalf("archive 计数=%d/%d, want %d/%d", gotBlocks, gotKeywords, blocks, keywords)
 	}
 }

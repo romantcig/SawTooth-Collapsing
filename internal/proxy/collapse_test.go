@@ -123,6 +123,39 @@ func TestCollapseOldMessagesLargeSessionReducesMessagesAndTokens(t *testing.T) {
 	}
 }
 
+func TestArchiveContentHashIsStableAndContentSensitive(t *testing.T) {
+	messages := []Message{
+		{Role: "user", Content: mustMarshal("same content")},
+		{Role: "assistant", Content: mustMarshal("same answer")},
+	}
+	first, err := archiveContentHash(messages)
+	if err != nil {
+		t.Fatalf("archiveContentHash 第一次计算失败: %v", err)
+	}
+	second, err := archiveContentHash(deepCopyMessages(messages))
+	if err != nil {
+		t.Fatalf("archiveContentHash 第二次计算失败: %v", err)
+	}
+	if first == "" || first != second {
+		t.Fatalf("相同消息 hash 不稳定: first=%q second=%q", first, second)
+	}
+
+	changed := deepCopyMessages(messages)
+	changed[1].Content = mustMarshal("different answer")
+	different, err := archiveContentHash(changed)
+	if err != nil {
+		t.Fatalf("archiveContentHash 变更正文计算失败: %v", err)
+	}
+	if different == first {
+		t.Fatalf("不同正文得到相同 hash: %q", first)
+	}
+
+	block := buildArchiveBlock(messages, len(messages), mustTokenCounter(t), "session-hash")
+	if block.ContentHash != first {
+		t.Fatalf("buildArchiveBlock ContentHash=%q, want %q", block.ContentHash, first)
+	}
+}
+
 func mustTokenCounter(t *testing.T) *TokenCounter {
 	t.Helper()
 	tc, err := NewTokenCounter()
