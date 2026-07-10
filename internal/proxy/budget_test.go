@@ -61,6 +61,22 @@ func TestBudgetSpendReExpansion(t *testing.T) {
 	}
 }
 
+func TestBudgetRemainingReExpansion(t *testing.T) {
+	b := &Budget{ReExpansion: 100}
+
+	if got := b.RemainingReExpansion(); got != 100 {
+		t.Fatalf("initial remaining = %d, want 100", got)
+	}
+	b.SpendReExpansion(35)
+	if got := b.RemainingReExpansion(); got != 65 {
+		t.Fatalf("remaining after spend = %d, want 65", got)
+	}
+	b.SpendReExpansion(100)
+	if got := b.RemainingReExpansion(); got != 0 {
+		t.Fatalf("overspent remaining = %d, want saturated 0", got)
+	}
+}
+
 func TestBudgetCanSpendRetrieval(t *testing.T) {
 	b := NewBudget(100000)
 

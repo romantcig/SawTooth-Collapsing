@@ -166,7 +166,8 @@ func TestSearchAndExpandBudgetDegradesTruncation(t *testing.T) {
 	}
 	budget := &Budget{ReExpansion: (cost2000 + cost500) / 2}
 
-	result := SearchAndExpand(messages, store, 100000, tc, budget)
+	outcome := SearchAndExpand(messages, store, 100000, tc, budget)
+	result := outcome.Messages
 	if len(result) != len(messages)+1 {
 		t.Fatalf("expected %d messages after degraded injection, got %d", len(messages)+1, len(result))
 	}
@@ -191,7 +192,8 @@ func TestSearchAndExpandBudgetExhaustedStopsInjection(t *testing.T) {
 	store, _, messages, tc := seedBudgetStore(t)
 
 	budget := &Budget{ReExpansion: 1}
-	result := SearchAndExpand(messages, store, 100000, tc, budget)
+	outcome := SearchAndExpand(messages, store, 100000, tc, budget)
+	result := outcome.Messages
 	if len(result) != len(messages) {
 		t.Fatalf("expected no injection with exhausted budget, got %d messages (want %d)", len(result), len(messages))
 	}
@@ -348,7 +350,8 @@ func TestSearchAndExpandFullExpansion(t *testing.T) {
 	store, messages, tc := seedFullExpandStore(t)
 
 	budget := &Budget{ReExpansion: 100000}
-	result := SearchAndExpand(messages, store, 100000, tc, budget)
+	outcome := SearchAndExpand(messages, store, 100000, tc, budget)
+	result := outcome.Messages
 	if len(result) != len(messages)+1 {
 		t.Fatalf("expected 1 injected message, got %d total (want %d)", len(result), len(messages)+1)
 	}
@@ -375,7 +378,8 @@ func TestSearchAndExpandFullExpansionBudgetFallsBack(t *testing.T) {
 	summaryCost := tc.CountTokens(prefix + truncateSummaryText("archive summary about flimflam parsing", 2000))
 	budget := &Budget{ReExpansion: summaryCost + 5}
 
-	result := SearchAndExpand(messages, store, 100000, tc, budget)
+	outcome := SearchAndExpand(messages, store, 100000, tc, budget)
+	result := outcome.Messages
 	if len(result) != len(messages)+1 {
 		t.Fatalf("expected 1 injected message, got %d total (want %d)", len(result), len(messages)+1)
 	}
@@ -397,7 +401,8 @@ func TestSearchAndExpandFullExpansionCorruptJSONFallsBack(t *testing.T) {
 	}
 
 	budget := &Budget{ReExpansion: 100000}
-	result := SearchAndExpand(messages, store, 100000, tc, budget)
+	outcome := SearchAndExpand(messages, store, 100000, tc, budget)
+	result := outcome.Messages
 	if len(result) != len(messages)+1 {
 		t.Fatalf("expected 1 injected message, got %d total (want %d)", len(result), len(messages)+1)
 	}
@@ -470,7 +475,8 @@ func TestSearchAndExpandFullExpansionSameSessionOnce(t *testing.T) {
 		{Role: "user", Content: json.RawMessage(`"tell me about flimflam warbler"`)},
 	}
 	budget := &Budget{ReExpansion: 100000}
-	result := SearchAndExpand(messages, store, 100000, tc, budget)
+	outcome := SearchAndExpand(messages, store, 100000, tc, budget)
+	result := outcome.Messages
 	if len(result) != len(messages)+2 {
 		t.Fatalf("expected 2 injected messages, got %d total (want %d)", len(result), len(messages)+2)
 	}
@@ -485,5 +491,79 @@ func TestSearchAndExpandFullExpansionSameSessionOnce(t *testing.T) {
 	}
 	if !strings.Contains(second, "second summary") {
 		t.Errorf("second block should inject its summary, got: %q", second)
+	}
+}
+
+func seedBudgetCandidates(t *testing.T, count int) (*SQLiteStore, []Message, *TokenCounter, string) {
+	t.Helper()
+
+	tc, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	summary := "flimflam archive summary with enough detail for budget accounting"
+	for i := 0; i < count; i++ {
+		block := ArchiveBlock{
+			ID: fmt.Sprintf("budget-candidate-%d", i), SessionID: fmt.Sprintf("session-%d", i),
+			BlockRangeStart: 1, BlockRangeEnd: 2,
+			MessageCount: 2, EstimatedTokens: 80,
+			SummaryText: summary,
+			Keywords:    []KeywordEntry{{Word: "flimflam", Source: "user_message"}},
+		}
+		if err := store.SaveArchive(block); err != nil {
+			t.Fatalf("SaveArchive(%s): %v", block.ID, err)
+		}
+	}
+
+	messages := []Message{{Role: "user", Content: json.RawMessage(`"tell me about flimflam"`)}}
+	return store, messages, tc, summary
+}
+
+func TestSearchAndExpandBudgetTracksOnlyInjectedPayload(t *testing.T) {
+	store, messages, tc, summary := seedBudgetCandidates(t, 2)
+	prefix := fmt.Sprintf("[Retrieved archive #%d — %d-%d, ~%d tokens]\n\n", 1, 1, 2, 80)
+	oneCost := tc.CountTokens(prefix + summary)
+	budget := &Budget{ReExpansion: oneCost}
+
+	outcome := SearchAndExpand(messages, store, 100000, tc, budget)
+	if outcome.Candidates != 2 || outcome.Selected != 2 {
+		t.Fatalf("candidates/selected = %d/%d, want 2/2", outcome.Candidates, outcome.Selected)
+	}
+	if outcome.Injected != 1 || outcome.Discarded != 1 {
+		t.Fatalf("injected/discarded = %d/%d, want 1/1", outcome.Injected, outcome.Discarded)
+	}
+	if len(outcome.Messages) != len(messages)+1 {
+		t.Fatalf("message count = %d, want %d", len(outcome.Messages), len(messages)+1)
+	}
+	injected := injectedTextAt(t, outcome.Messages, 1)
+	actualCost := tc.CountTokens(injected)
+	if outcome.TokenCost != actualCost {
+		t.Fatalf("token cost = %d, want actual injected cost %d", outcome.TokenCost, actualCost)
+	}
+	if budget.RemainingReExpansion() != 0 || outcome.BudgetRemaining != 0 {
+		t.Fatalf("remaining budget = %d/%d, want 0/0", budget.RemainingReExpansion(), outcome.BudgetRemaining)
+	}
+}
+
+func TestSearchAndExpandBudgetNilUsesHardLimit(t *testing.T) {
+	store, messages, tc, summary := seedBudgetCandidates(t, 2)
+	prefix := fmt.Sprintf("[Retrieved archive #%d — %d-%d, ~%d tokens]\n\n", 1, 1, 2, 80)
+	oneCost := tc.CountTokens(prefix + summary)
+
+	outcome := SearchAndExpand(messages, store, oneCost*10, tc, nil)
+	if outcome.BudgetLimit != oneCost {
+		t.Fatalf("budget limit = %d, want %d", outcome.BudgetLimit, oneCost)
+	}
+	if outcome.Injected != 1 || outcome.Discarded != 1 {
+		t.Fatalf("injected/discarded = %d/%d, want 1/1", outcome.Injected, outcome.Discarded)
+	}
+	if outcome.TokenCost > outcome.BudgetLimit {
+		t.Fatalf("token cost %d exceeds hard limit %d", outcome.TokenCost, outcome.BudgetLimit)
 	}
 }
