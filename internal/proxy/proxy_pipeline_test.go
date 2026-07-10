@@ -133,6 +133,110 @@ func TestHandleMessagesFrozenBoundaryEdit(t *testing.T) {
 	}
 }
 
+func TestHandleMessagesSearchOnceAcrossFrozenPaths(t *testing.T) {
+	tests := []struct {
+		name        string
+		setupFrozen func(t *testing.T, server *Server, raw []Message)
+	}{
+		{name: "no frozen"},
+		{
+			name: "valid frozen",
+			setupFrozen: func(t *testing.T, server *Server, raw []Message) {
+				t.Helper()
+				prefix := deepCopyMessages(raw[:1])
+				server.Frozen.Store("thread-search-once", prefix, 1, raw[0], server.TokenCounter.CountMessagesTokens(prefix), server.TokenCounter.CountMessagesTokens(raw))
+			},
+		},
+		{
+			name: "invalidated frozen",
+			setupFrozen: func(t *testing.T, server *Server, raw []Message) {
+				t.Helper()
+				prefix := []Message{{Role: "user", Content: mustMarshal(strings.Repeat("oversized frozen context ", 20000))}}
+				server.Frozen.Store("thread-search-once", prefix, 1, raw[0], server.TokenCounter.CountMessagesTokens(prefix), server.TokenCounter.CountMessagesTokens(raw))
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var forwarded []Message
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Messages []Message `json:"messages"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatalf("decode upstream request: %v", err)
+				}
+				forwarded = deepCopyMessages(body.Messages)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+			}))
+			defer upstream.Close()
+
+			server := newPipelineTestServer(t, upstream.URL)
+			seedRecallArchive(t, server.Store)
+			raw := pipelineMessages(3, 10)
+			raw[2].Content = mustMarshal("restore flimflam archive details")
+			if tc.setupFrozen != nil {
+				tc.setupFrozen(t, server, raw)
+			}
+
+			searchCalls := 0
+			var outcomes []RecallOutcome
+			server.searchAndExpandFn = func(messages []Message, store *SQLiteStore, threshold int, counter *TokenCounter, budget *Budget) RecallOutcome {
+				searchCalls++
+				outcome := SearchAndExpand(messages, store, threshold, counter, budget)
+				outcomes = append(outcomes, outcome)
+				return outcome
+			}
+
+			servePipelineRequest(t, server, "thread-search-once", raw)
+
+			if searchCalls != 1 {
+				t.Fatalf("SearchAndExpand calls = %d, want 1", searchCalls)
+			}
+			if len(outcomes) != 1 {
+				t.Fatalf("outcome count = %d, want 1", len(outcomes))
+			}
+			outcome := outcomes[0]
+			if outcome.Injected != 1 || outcome.Discarded != 0 {
+				t.Fatalf("injected/discarded = %d/%d, want 1/0", outcome.Injected, outcome.Discarded)
+			}
+			if outcome.TokenCost > outcome.BudgetLimit || outcome.BudgetRemaining < 0 {
+				t.Fatalf("budget cost/limit/remaining = %d/%d/%d", outcome.TokenCost, outcome.BudgetLimit, outcome.BudgetRemaining)
+			}
+			if got := countRetrievedArchives(forwarded); got != outcome.Injected {
+				t.Fatalf("forwarded archive count = %d, want outcome injected %d", got, outcome.Injected)
+			}
+		})
+	}
+}
+
+func seedRecallArchive(t *testing.T, store *SQLiteStore) {
+	t.Helper()
+	block := ArchiveBlock{
+		ID: "pipeline-recall", SessionID: "archive-session",
+		BlockRangeStart: 1, BlockRangeEnd: 2,
+		MessageCount: 2, EstimatedTokens: 80,
+		SummaryText: "flimflam archive details",
+		Keywords:    []KeywordEntry{{Word: "flimflam", Source: "user_message"}},
+	}
+	if err := store.SaveArchive(block); err != nil {
+		t.Fatalf("SaveArchive: %v", err)
+	}
+}
+
+func countRetrievedArchives(messages []Message) int {
+	count := 0
+	for _, message := range messages {
+		var text string
+		if err := json.Unmarshal(message.Content, &text); err == nil && strings.Contains(text, "[Retrieved archive #") {
+			count++
+		}
+	}
+	return count
+}
+
 func newPipelineTestServer(t *testing.T, upstreamURL string) *Server {
 	t.Helper()
 	cfg := DefaultConfig()
