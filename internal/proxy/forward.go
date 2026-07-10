@@ -195,7 +195,7 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, sessionID st
 	}
 
 	// 步骤 3: 创建上游请求
-	targetURL := s.Config.Proxy.Target + r.URL.RequestURI()
+	targetURL := strings.TrimRight(s.Config.Proxy.Target, "/") + r.URL.RequestURI()
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, strings.NewReader(string(body)))
 	if err != nil {
 		slog.Error("创建上游请求失败", "session_id", sessionID, "error", err)
