@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -142,6 +143,149 @@ func recalledArchiveIDs(messages []Message) []string {
 		}
 	}
 	return ids
+}
+
+func TestDedupeDominatedCandidates(t *testing.T) {
+	candidates := []recallCandidate{
+		{Summary: ArchiveSummary{ID: "duplicate", SessionID: "session-a", ContentHash: "same-hash", BlockRangeStart: 1, BlockRangeEnd: 299, MatchedTermCount: 3, Rank: -2, CreatedAt: "2026-01-01"}, SameSession: true},
+		{Summary: ArchiveSummary{ID: "dominated", SessionID: "session-a", ContentHash: "old-hash", BlockRangeStart: 1, BlockRangeEnd: 299, MatchedTermCount: 3, Rank: -2, CreatedAt: "2026-01-01"}, SameSession: true},
+		{Summary: ArchiveSummary{ID: "winner", SessionID: "session-a", ContentHash: "same-hash", BlockRangeStart: 1, BlockRangeEnd: 347, MatchedTermCount: 3, Rank: -2, CreatedAt: "2026-01-02"}, SameSession: true},
+		{Summary: ArchiveSummary{ID: "other-session", SessionID: "session-b", ContentHash: "other-hash", BlockRangeStart: 1, BlockRangeEnd: 347, MatchedTermCount: 3, Rank: -2, CreatedAt: "2026-01-02"}},
+	}
+	sort.SliceStable(candidates, func(i, j int) bool { return recallCandidateLess(candidates[i], candidates[j]) })
+	got := dedupeDominatedCandidates(candidates)
+	if len(got) != 2 || got[0].Summary.ID != "winner" || got[1].Summary.ID != "other-session" {
+		t.Fatalf("deduped candidates=%+v, want winner + other-session", got)
+	}
+}
+
+func TestSearchAndExpandSameSessionDominance(t *testing.T) {
+	tc, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "dominance.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer store.Close()
+
+	for _, block := range []ArchiveBlock{
+		{ID: "range-short", SessionID: "current", BlockRangeStart: 1, BlockRangeEnd: 299, MessageCount: 299, EstimatedTokens: 100, SummaryText: "short range", Keywords: recallTestKeywords()},
+		{ID: "range-wide", SessionID: "current", BlockRangeStart: 1, BlockRangeEnd: 347, MessageCount: 347, EstimatedTokens: 120, SummaryText: "wide range", Keywords: recallTestKeywords()},
+	} {
+		if err := store.SaveArchive(block); err != nil {
+			t.Fatalf("SaveArchive(%s): %v", block.ID, err)
+		}
+	}
+	if _, err := store.db.Exec(`UPDATE archive_blocks SET created_at = CASE id WHEN 'range-wide' THEN '2026-01-02' ELSE '2026-01-01' END`); err != nil {
+		t.Fatalf("set created_at: %v", err)
+	}
+
+	messages := []Message{{Role: "user", Content: json.RawMessage(`"recall archive about flimflam warbler parser"`)}}
+	outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "current")
+	texts := allMessageTexts(outcome.Messages)
+	if outcome.Selected != 1 || outcome.Injected != 1 {
+		t.Fatalf("selected/injected=%d/%d, want 1/1", outcome.Selected, outcome.Injected)
+	}
+	joined := strings.Join(texts, "\n")
+	if !strings.Contains(joined, "wide range") || strings.Contains(joined, "short range") {
+		t.Fatalf("dominance result=%q, want only wide range", joined)
+	}
+}
+
+func TestSearchAndExpandInPlaceReplacesDeepSearchStub(t *testing.T) {
+	tc, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "in-place.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer store.Close()
+	block := ArchiveBlock{ID: "in-place", SessionID: "current", BlockRangeStart: 10, BlockRangeEnd: 20, MessageCount: 11, EstimatedTokens: 80, SummaryText: "recovered in place", Keywords: recallTestKeywords()}
+	if err := store.SaveArchive(block); err != nil {
+		t.Fatalf("SaveArchive: %v", err)
+	}
+
+	stub := "[tool result archived → deep_search('flimflam warbler parser')]"
+	messages := []Message{
+		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "text", Text: stub}})},
+		{Role: "user", Content: json.RawMessage(`"explain flimflam warbler parser"`)},
+	}
+	outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "current")
+	if len(outcome.Messages) != len(messages) {
+		t.Fatalf("message count=%d, want unchanged %d", len(outcome.Messages), len(messages))
+	}
+	blocks, _ := parseContent(outcome.Messages[0].Content)
+	if len(blocks) != 1 || !strings.Contains(blocks[0].Text, "recovered in place") || strings.Contains(blocks[0].Text, "deep_search") {
+		t.Fatalf("stub was not replaced in place: %+v", blocks)
+	}
+}
+
+func TestSearchAndExpandToolPairsAppendToLatestUser(t *testing.T) {
+	tc, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "tool-pairs.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer store.Close()
+	path := `C:\work\src\proxy.go`
+	block := ArchiveBlock{ID: "path", SessionID: "other", BlockRangeStart: 1, BlockRangeEnd: 2, MessageCount: 2, EstimatedTokens: 50, SummaryText: "path archive", Keywords: []KeywordEntry{{Word: path, Source: "file_path"}}}
+	if err := store.SaveArchive(block); err != nil {
+		t.Fatalf("SaveArchive: %v", err)
+	}
+
+	messages := []Message{
+		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "tool_use", ID: "tool-1", Name: "Read"}})},
+		{Role: "user", Content: mustRawJSON(t, []ContentBlock{{Type: "tool_result", ToolUseID: "tool-1", Content: "ok"}, {Type: "text", Text: "restore " + path}})},
+	}
+	outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "current")
+	if len(outcome.Messages) != len(messages) {
+		t.Fatalf("message count=%d, want unchanged %d", len(outcome.Messages), len(messages))
+	}
+	for i := range messages {
+		if outcome.Messages[i].Role != messages[i].Role {
+			t.Fatalf("role[%d]=%s, want %s", i, outcome.Messages[i].Role, messages[i].Role)
+		}
+	}
+	if _, removed := validateToolPairs(outcome.Messages); removed != 0 {
+		t.Fatalf("recall broke tool pairs: removed=%d", removed)
+	}
+	blocks, _ := parseContent(outcome.Messages[1].Content)
+	if len(blocks) != 3 || blocks[0].Type != "tool_result" || !strings.Contains(blocks[2].Text, "path archive") {
+		t.Fatalf("latest user blocks=%+v", blocks)
+	}
+}
+
+func recallTestKeywords() []KeywordEntry {
+	return []KeywordEntry{{Word: "flimflam", Source: "user_message"}, {Word: "warbler", Source: "user_message"}, {Word: "parser", Source: "user_message"}}
+}
+
+func allMessageTexts(messages []Message) []string {
+	var texts []string
+	for _, message := range messages {
+		blocks, _ := parseContent(message.Content)
+		for _, block := range blocks {
+			if block.Type == "text" && block.Text != "" {
+				texts = append(texts, block.Text)
+			}
+		}
+	}
+	return texts
+}
+
+func mustRawJSON(t *testing.T, value any) json.RawMessage {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal JSON: %v", err)
+	}
+	return data
 }
 
 // (a) 超限时巨型中间段 Files/Timeline 整段省略且各自原位置有一行标注，
