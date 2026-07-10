@@ -42,8 +42,9 @@ Phase 08 (yesmem-gaps) 已完成 — 对齐 YesMem 压缩管线 4 缺口（B→C
 | 260711-12v | 定制 slog.Handler，使终端日志颜色和短时间戳对齐 YesMem，并确保文件日志无 ANSI 编码 | 2026-07-11 | 22eaf65 | [260711-12v-slog-handler-yesmem-ansi](./quick/260711-12v-slog-handler-yesmem-ansi/) |
 | 260711-1he | 将 AGENTS.md 加入提交黑名单，审查剩余改动并在验证后提交推送 GitHub | 2026-07-11 | 01849d6 | [260711-1he-agents-md-github](./quick/260711-1he-agents-md-github/) |
 | 260711-32d | 将日志格式改为时间戳加方括号级别，并仅为级别文字着色 | 2026-07-11 | 21717fe | [260711-32d-log-level-prefix-color](./quick/260711-32d-log-level-prefix-color/) |
+| 260711-4e0 | 修复上游 Base URL 尾斜杠导致请求路径错误，并添加回归测试 | 2026-07-11 | 1fa804d | [260711-4e0-base-url](./quick/260711-4e0-base-url/) |
 
-Last activity: 2026-07-11 - Completed quick task 260711-32d: 方括号日志级别与仅标签着色
+Last activity: 2026-07-11 - Completed quick task 260711-4e0: 修复上游 Base URL 尾斜杠导致请求路径错误
 
 ---
 *Last updated: 2026-07-09*
