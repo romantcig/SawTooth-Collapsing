@@ -61,12 +61,84 @@ func TestHandleMessagesCollapseFreezeLifecycle(t *testing.T) {
 	}
 }
 
+func TestHandleMessagesCollapseThenRestore(t *testing.T) {
+	var forwarded [][]Message
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []Message `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		forwarded = append(forwarded, deepCopyMessages(body.Messages))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	raw := pipelineMessages(300, 80)
+	servePipelineRequest(t, server, "thread-restore", raw)
+	archivesAfterFreeze := archiveCount(t, server.Store)
+
+	tail := pipelineMessages(2, 10)
+	tail[0].Content = mustMarshal("fresh-tail-0")
+	tail[1].Content = mustMarshal("fresh-tail-1")
+	secondRaw := append(deepCopyMessages(raw), tail...)
+	servePipelineRequest(t, server, "thread-restore", secondRaw)
+
+	if len(forwarded) != 2 {
+		t.Fatalf("upstream request count = %d, want 2", len(forwarded))
+	}
+	if got, want := len(forwarded[1]), len(forwarded[0])+len(tail); got != want {
+		t.Fatalf("restored message count = %d, want frozen prefix %d + tail %d = %d", got, len(forwarded[0]), len(tail), want)
+	}
+	for i := range tail {
+		got, err := json.Marshal(forwarded[1][len(forwarded[0])+i])
+		if err != nil {
+			t.Fatalf("marshal forwarded tail %d: %v", i, err)
+		}
+		want, err := json.Marshal(tail[i])
+		if err != nil {
+			t.Fatalf("marshal expected tail %d: %v", i, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("fresh tail %d changed\ngot:  %s\nwant: %s", i, got, want)
+		}
+	}
+	if got := archiveCount(t, server.Store); got != archivesAfterFreeze {
+		t.Fatalf("archive rows after restore = %d, want unchanged %d", got, archivesAfterFreeze)
+	}
+}
+
+func TestHandleMessagesFrozenBoundaryEdit(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	raw := pipelineMessages(300, 80)
+	servePipelineRequest(t, server, "thread-boundary-edit", raw)
+	archivesAfterFreeze := archiveCount(t, server.Store)
+
+	edited := deepCopyMessages(raw)
+	edited[299].Content = mustMarshal("edited raw boundary")
+	edited = append(edited, pipelineMessages(2, 10)...)
+	servePipelineRequest(t, server, "thread-boundary-edit", edited)
+
+	if got := archiveCount(t, server.Store); got <= archivesAfterFreeze {
+		t.Fatalf("archive rows after edited boundary = %d, want a fresh collapse beyond %d", got, archivesAfterFreeze)
+	}
+}
+
 func newPipelineTestServer(t *testing.T, upstreamURL string) *Server {
 	t.Helper()
 	cfg := DefaultConfig()
 	cfg.Proxy.Target = upstreamURL
 	cfg.Proxy.Deflation = 1
-	cfg.Stubify.TokenThreshold = 12000
+	cfg.Stubify.TokenThreshold = 16000
 	cfg.Stubify.KeepRecent = 8
 	cfg.Debug.Enabled = false
 
@@ -88,6 +160,15 @@ func newPipelineTestServer(t *testing.T, upstreamURL string) *Server {
 	server.Sawtooth = NewSawtoothTrigger(time.Minute, cfg.Stubify.TokenThreshold, cfg.Stubify.TokenThreshold/2)
 	server.EagerStub = NewEagerStubMemory()
 	return server
+}
+
+func archiveCount(t *testing.T, store *SQLiteStore) int {
+	t.Helper()
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM archive_blocks`).Scan(&count); err != nil {
+		t.Fatalf("count archive rows: %v", err)
+	}
+	return count
 }
 
 func servePipelineRequest(t *testing.T, server *Server, sessionID string, messages []Message) {
