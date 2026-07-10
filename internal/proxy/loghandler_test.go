@@ -12,8 +12,8 @@ import (
 // logTestTime 测试用固定时间戳——对应输出 2026/07/06 15:04:05。
 var logTestTime = time.Date(2026, 7, 6, 15, 4, 5, 0, time.Local)
 
-// logTestPrefix 固定时间戳对应的行前缀（永远无色段）。
-const logTestPrefix = "[proxy] 2026/07/06 15:04:05 "
+// logTestPrefix 固定时间戳对应的无色前缀。
+const logTestPrefix = "2026/07/06 15:04:05 "
 
 // emitLogRecord 用固定时间手工构造 record 并直接调 Handle，返回输出内容。
 func emitLogRecord(t *testing.T, h *LogHandler, buf *bytes.Buffer, level slog.Level, msg string, attrs ...slog.Attr) string {
@@ -27,8 +27,8 @@ func emitLogRecord(t *testing.T, h *LogHandler, buf *bytes.Buffer, level slog.Le
 	return buf.String()
 }
 
-// Test 1: 时间戳格式——行以 "[proxy] 2006/01/02 15:04:05 " 格式前缀开头，
-// 且该前缀段无任何 ANSI 码（开色时色码只出现在消息段之前）。
+// Test 1: 时间戳格式——行以 "2006/01/02 15:04:05 " 格式前缀开头，
+// 且时间戳段无任何 ANSI 码（开色时色码只包裹级别标签）。
 func TestLogHandlerTimestampFormat(t *testing.T) {
 	var buf bytes.Buffer
 	h := NewLogHandler(&buf, slog.LevelInfo)
@@ -50,8 +50,8 @@ func TestLogHandlerTimestampFormat(t *testing.T) {
 	}
 }
 
-// Test 2: 非 TTY 去色+级别前缀——bytes.Buffer writer 下零转义码，
-// Warn/Error 行在消息前分别带 "WARN " / "ERROR " 文本前缀。
+// Test 2: 非 TTY 去色+级别标签——bytes.Buffer writer 下零转义码，
+// 所有级别均保留方括号标签且消息列对齐。
 func TestLogHandlerNonTTY(t *testing.T) {
 	var buf bytes.Buffer
 	h := NewLogHandler(&buf, slog.LevelInfo)
@@ -62,8 +62,8 @@ func TestLogHandlerNonTTY(t *testing.T) {
 	if strings.Contains(out, "\033") {
 		t.Errorf("Info 行含 ANSI 码: %q", out)
 	}
-	if strings.Contains(out, "WARN ") || strings.Contains(out, "ERROR ") {
-		t.Errorf("Info 行不应带级别前缀: %q", out)
+	if !strings.Contains(out, "[INFO]  info msg") {
+		t.Errorf("Info 行级别标签错误: %q", out)
 	}
 
 	buf.Reset()
@@ -72,8 +72,8 @@ func TestLogHandlerNonTTY(t *testing.T) {
 	if strings.Contains(out, "\033") {
 		t.Errorf("Warn 行含 ANSI 码: %q", out)
 	}
-	if !strings.Contains(out, "WARN warn msg") {
-		t.Errorf("Warn 行缺 WARN 文本前缀: %q", out)
+	if !strings.Contains(out, "[WARN]  warn msg") {
+		t.Errorf("Warn 行级别标签错误: %q", out)
 	}
 
 	buf.Reset()
@@ -82,13 +82,13 @@ func TestLogHandlerNonTTY(t *testing.T) {
 	if strings.Contains(out, "\033") {
 		t.Errorf("Error 行含 ANSI 码: %q", out)
 	}
-	if !strings.Contains(out, "ERROR error msg") {
-		t.Errorf("Error 行缺 ERROR 文本前缀: %q", out)
+	if !strings.Contains(out, "[ERROR] error msg") {
+		t.Errorf("Error 行级别标签错误: %q", out)
 	}
 }
 
-// Test 3: level 默认色（强制开色）——Error 红、Warn 黄、Debug 暗灰，
-// 行尾复位色码；Info 无语义 attr 时整行不含任何 ANSI 码。
+// Test 3: level 默认色（强制开色）——Info 绿、Error 红、Warn 黄、Debug 暗灰，
+// 色码只包裹级别标签，消息正文不着色。
 func TestLogHandlerLevelColors(t *testing.T) {
 	var buf bytes.Buffer
 	h := NewLogHandler(&buf, slog.LevelDebug)
@@ -98,30 +98,27 @@ func TestLogHandlerLevelColors(t *testing.T) {
 		name  string
 		level slog.Level
 		code  string
+		label string
 	}{
-		{"Error红", slog.LevelError, "\033[31m"},
-		{"Warn黄", slog.LevelWarn, "\033[33m"},
-		{"Debug暗灰", slog.LevelDebug, "\033[2m"},
+		{"Info绿", slog.LevelInfo, "\033[32m", "[INFO]"},
+		{"Error红", slog.LevelError, "\033[31m", "[ERROR]"},
+		{"Warn黄", slog.LevelWarn, "\033[33m", "[WARN]"},
+		{"Debug暗灰", slog.LevelDebug, "\033[2m", "[DEBUG]"},
 	}
 	for _, c := range cases {
 		got := emitLogRecord(t, h, &buf, c.level, "msg")
 		rest := strings.TrimPrefix(got, logTestPrefix)
-		if !strings.HasPrefix(rest, c.code) {
-			t.Errorf("%s: 消息段 = %q, want 以 %q 开头", c.name, rest, c.code)
+		wantColoredLabel := c.code + c.label + colorReset
+		if !strings.HasPrefix(rest, wantColoredLabel) {
+			t.Errorf("%s: 级别段 = %q, want 以 %q 开头", c.name, rest, wantColoredLabel)
 		}
-		line := strings.TrimSuffix(got, "\n")
-		if !strings.HasSuffix(line, "\033[0m") {
-			t.Errorf("%s: 行尾缺复位码: %q", c.name, line)
+		if strings.Contains(strings.TrimPrefix(rest, wantColoredLabel), "\033") {
+			t.Errorf("%s: 级别标签后的消息仍含 ANSI: %q", c.name, rest)
 		}
-	}
-
-	got := emitLogRecord(t, h, &buf, slog.LevelInfo, "plain")
-	if strings.Contains(got, "\033") {
-		t.Errorf("Info 无语义 attr 时行含 ANSI 码: %q", got)
 	}
 }
 
-// Test 4: 语义色消费（强制开色）——语义色 attr 决定消息段颜色，
+// Test 4: 语义色消费（强制开色）——语义色 attr 决定级别标签颜色，
 // 且该 attr 本身（key）不出现在输出文本中。
 func TestLogHandlerSemanticColors(t *testing.T) {
 	var buf bytes.Buffer
@@ -141,8 +138,9 @@ func TestLogHandlerSemanticColors(t *testing.T) {
 	for _, c := range cases {
 		got := emitLogRecord(t, h, &buf, slog.LevelInfo, "msg", c.attr)
 		rest := strings.TrimPrefix(got, logTestPrefix)
-		if !strings.HasPrefix(rest, c.code) {
-			t.Errorf("%s: 消息段 = %q, want 以 %q 开头", c.name, rest, c.code)
+		wantColoredLabel := c.code + "[INFO]" + colorReset
+		if !strings.HasPrefix(rest, wantColoredLabel) {
+			t.Errorf("%s: 级别段 = %q, want 以 %q 开头", c.name, rest, wantColoredLabel)
 		}
 		if strings.Contains(got, logColorKey) {
 			t.Errorf("%s: 语义色 attr key 泄漏到输出: %q", c.name, got)
@@ -157,7 +155,7 @@ func TestLogHandlerAttrFormat(t *testing.T) {
 
 	got := emitLogRecord(t, h, &buf, slog.LevelInfo, "msg",
 		slog.String("k", "v"), slog.Int("k2", 42))
-	want := logTestPrefix + "msg k=v k2=42\n"
+	want := logTestPrefix + "[INFO]  msg k=v k2=42\n"
 	if got != want {
 		t.Errorf("输出 = %q, want %q", got, want)
 	}

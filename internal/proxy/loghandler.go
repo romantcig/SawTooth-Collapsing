@@ -25,7 +25,7 @@ const (
 // logColorKey 语义色 attr 的 key——Handle 消费该 attr 用于选色，不输出到文本。
 const logColorKey = "logColor"
 
-// 语义色常量——调用点追加到 slog.Info 参数列表末尾为整行消息着色。
+// 语义色常量——调用点追加到 slog.Info 参数列表末尾为级别标签着色。
 // attr 值直接存 ANSI 色码，Handle 消费后原样使用。
 var (
 	LogGreen      = slog.String(logColorKey, colorGreen)      // 折叠/压缩完成
@@ -35,8 +35,8 @@ var (
 )
 
 // LogHandler 是对齐 YesMem 日志体验的 slog.Handler：
-// 行格式 `[proxy] 2006/01/02 15:04:05 消息 k=v`，前缀与时间戳永远无色，
-// 消息+attrs 段按级别/语义着色；非 TTY 输出零转义码并补 WARN/ERROR 文本前缀。
+// 行格式 `2006/01/02 15:04:05 [LEVEL] 消息 k=v`，仅级别标签按级别/语义着色，
+// 时间戳、消息和 attrs 永远保持终端默认颜色；非 TTY 输出零转义码。
 type LogHandler struct {
 	w         io.Writer
 	level     slog.Level  // 最低输出级别
@@ -67,13 +67,12 @@ func (h *LogHandler) Enabled(_ context.Context, level slog.Level) bool {
 	return level >= h.level
 }
 
-// Handle 输出一行：`[proxy] 时间戳 ` + [色码] + 消息 + attrs + [复位] + 换行。
+// Handle 输出一行：`时间戳 ` + [色码] + `[LEVEL]` + [复位] + 消息 + attrs + 换行。
 // 在本地 buffer 拼完整行后持锁单次 Write，保证并发下行不交错。
 func (h *LogHandler) Handle(_ context.Context, r slog.Record) error {
 	var buf bytes.Buffer
 
-	// 前缀段（永远无色）：[proxy] 2006/01/02 15:04:05␣
-	buf.WriteString("[proxy] ")
+	// 时间戳段永远无色。
 	buf.WriteString(r.Time.Format("2006/01/02 15:04:05"))
 	buf.WriteByte(' ')
 
@@ -93,7 +92,7 @@ func (h *LogHandler) Handle(_ context.Context, r slog.Record) error {
 		return true
 	})
 
-	// 选色优先级：record 语义色 > WithAttrs 语义色 > level 默认色（Info 无色）
+	// 选色优先级：record 语义色 > WithAttrs 语义色 > level 默认色。
 	c := semColor
 	if c == "" {
 		c = h.withColor
@@ -106,36 +105,44 @@ func (h *LogHandler) Handle(_ context.Context, r slog.Record) error {
 			c = colorYellow
 		case r.Level < slog.LevelInfo:
 			c = colorDim
+		default:
+			c = colorGreen
 		}
 	}
 
-	if h.color {
-		if c != "" {
-			buf.WriteString(c)
-		}
-	} else {
-		// 非 TTY：零转义码，Warn/Error 补文本级别前缀防丢失级别信息
-		switch {
-		case r.Level >= slog.LevelError:
-			buf.WriteString("ERROR ")
-		case r.Level >= slog.LevelWarn:
-			buf.WriteString("WARN ")
-		}
+	label, padding := logLevelLabel(r.Level)
+	if h.color && c != "" {
+		buf.WriteString(c)
 	}
-
-	buf.WriteString(r.Message)
-	buf.WriteString(h.preAttrs) // WithAttrs 预置段在 record attrs 之前
-	buf.Write(attrBuf.Bytes())
-
+	buf.WriteString(label)
 	if h.color && c != "" {
 		buf.WriteString(colorReset)
 	}
+	buf.WriteString(padding)
+	buf.WriteString(r.Message)
+	buf.WriteString(h.preAttrs) // WithAttrs 预置段在 record attrs 之前
+	buf.Write(attrBuf.Bytes())
 	buf.WriteByte('\n')
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	_, err := h.w.Write(buf.Bytes())
 	return err
+}
+
+// logLevelLabel 返回固定宽度的级别标签和标签后的对齐空格。
+// label + padding 始终占 8 列，使不同级别的消息正文从同一列开始。
+func logLevelLabel(level slog.Level) (label, padding string) {
+	switch {
+	case level >= slog.LevelError:
+		return "[ERROR]", " "
+	case level >= slog.LevelWarn:
+		return "[WARN]", "  "
+	case level < slog.LevelInfo:
+		return "[DEBUG]", " "
+	default:
+		return "[INFO]", "  "
+	}
 }
 
 // WithAttrs 克隆 handler 并预格式化 attrs 追加存储；
