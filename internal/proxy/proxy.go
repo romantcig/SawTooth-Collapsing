@@ -318,6 +318,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				"session_id", sessionID,
 				"model", extractModelFromBody(body),
 				"message_count", len(messages),
+				LogDim,
 			)
 
 			// Step 1: 用主线 frozen prefix 替换子代理的未压缩前缀
@@ -404,6 +405,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					"session_id", sessionID,
 					"frozen_count", result.Cutoff,
 					"frozen_tokens", result.Tokens,
+					LogGreen,
 				)
 			}
 		}
@@ -441,6 +443,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					"tail_tokens", tailTokens,
 					"combined_tokens", combinedTokens,
 					"threshold", threshold,
+					LogLightGreen,
 				)
 			} else {
 				slog.Info("frozen prefix 不足，重新压缩",
@@ -449,6 +452,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					"tail_tokens", tailTokens,
 					"combined_tokens", combinedTokens,
 					"threshold", threshold,
+					LogGreen,
 				)
 				// frozen prefix 失效——清除并从原始消息重新压缩
 				// 对标 YesMem: frozen=nil 后 runStubCycle(messages) 使用原始未压缩消息
@@ -527,6 +531,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					"after", len(collapsedMessages),
 					"cutoff", cutoffIdx,
 					"archived_tokens", archiveBlock.EstimatedTokens,
+					LogGreen,
 				)
 
 				// DecayTracker: 清理被折叠的旧消息索引。
@@ -550,6 +555,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 							"session_id", sessionID,
 							"reason", trigger,
 							"raw_estimate", rawEstimate,
+							LogGreen,
 						)
 						compressedTokens := s.TokenCounter.CountMessagesTokens(collapsedMessages)
 						s.Frozen.Store(sessionID, collapsedMessages, collapseCutoff, collapseBoundary, compressedTokens, rawEstimate)
@@ -575,6 +581,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 							"session_id", sessionID,
 							"fresh_stubs", freshStubs,
 							"sticky_hits", stickyHits,
+							LogGreen,
 						)
 					}
 				}
@@ -630,6 +637,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				"tools_processed", stats.ToolsProcessed,
 				"decay_phase", phase,
 				"pressure", fmt.Sprintf("%.2f", float64(totalTokens)/float64(threshold)),
+				LogGreen,
 			)
 
 			// Phase C: CompactMessages
@@ -644,6 +652,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 						"before", beforeCompact,
 						"after", len(decayedMessages),
 						"blocks", len(compactedBlocks),
+						LogGreen,
 					)
 				}
 			}
@@ -656,6 +665,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 						"session_id", sessionID,
 						"reason", trigger,
 						"raw_estimate", rawEstimate,
+						LogGreen,
 					)
 					compressedTokens := s.TokenCounter.CountMessagesTokens(decayedMessages)
 					s.Frozen.Store(sessionID, decayedMessages, originalMsgCount, boundaryMsgForFrozen, compressedTokens, rawEstimate)

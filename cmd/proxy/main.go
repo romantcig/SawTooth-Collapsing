@@ -24,9 +24,7 @@ func main() {
 	flag.Parse()
 
 	// 2. 日志初始化
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
+	logger := slog.New(proxy.NewLogHandler(os.Stdout, slog.LevelInfo))
 	slog.SetDefault(logger)
 
 	// 3. Config 加载
