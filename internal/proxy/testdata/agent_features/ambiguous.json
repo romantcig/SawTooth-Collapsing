@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "evidence": "no_verified_parent_or_role_marker",
+  "cases": [
+    {
+      "expected_role": "unknown",
+      "features": {
+        "model_family": "deepseek",
+        "thinking_present": true,
+        "system_present": true,
+        "system_shape": "array",
+        "sdk_ts_marker_present": false,
+        "metadata_present": true,
+        "session_header_present": true,
+        "parent_marker_present": false,
+        "parent_relation": "unavailable",
+        "messages_present": true
+      }
+    },
+    {
+      "expected_role": "unknown",
+      "features": {
+        "model_family": "unknown",
+        "thinking_present": false,
+        "system_present": false,
+        "system_shape": "missing",
+        "sdk_ts_marker_present": false,
+        "metadata_present": false,
+        "session_header_present": false,
+        "parent_marker_present": false,
+        "parent_relation": "unavailable",
+        "messages_present": true
+      }
+    }
+  ]
+}
