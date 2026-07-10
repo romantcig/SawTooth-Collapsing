@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 )
@@ -192,6 +193,68 @@ func TestSearchArchivesMultiKeywordRanking(t *testing.T) {
 	}
 	if results[1].ID != "block-a" {
 		t.Errorf("expected block-a (matches alpha only) second, got %s", results[1].ID)
+	}
+}
+
+func TestSearchArchivesStableOrderingAndFields(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "stable.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	defer store.Close()
+
+	blocks := []ArchiveBlock{
+		{
+			ID: "block-b", SessionID: "session-b", ContentHash: "hash-b",
+			BlockRangeStart: 1, BlockRangeEnd: 4, MessageCount: 4, EstimatedTokens: 100,
+			SummaryText: "beta summary",
+			Keywords:    []KeywordEntry{{Word: "flimflam", Source: "user_message"}, {Word: "warbler", Source: "user_message"}},
+		},
+		{
+			ID: "block-a", SessionID: "session-a", ContentHash: "hash-a",
+			BlockRangeStart: 1, BlockRangeEnd: 4, MessageCount: 4, EstimatedTokens: 100,
+			SummaryText: "alpha summary",
+			Keywords:    []KeywordEntry{{Word: "flimflam", Source: "user_message"}, {Word: "warbler", Source: "user_message"}},
+		},
+	}
+	for _, block := range blocks {
+		if err := store.SaveArchive(block); err != nil {
+			t.Fatalf("SaveArchive(%s): %v", block.ID, err)
+		}
+	}
+	if _, err := store.db.Exec(`UPDATE archive_blocks SET created_at = '2026-01-01 00:00:00'`); err != nil {
+		t.Fatalf("固定 created_at: %v", err)
+	}
+
+	var first []ArchiveSummary
+	for run := 0; run < 3; run++ {
+		got, err := store.SearchArchives(`"flimflam" OR "warbler"`, 99)
+		if err != nil {
+			t.Fatalf("SearchArchives run %d: %v", run, err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("run %d results=%d, want 2", run, len(got))
+		}
+		if run == 0 {
+			first = got
+		} else if !reflect.DeepEqual(got, first) {
+			t.Fatalf("run %d ordering changed:\nfirst=%+v\ngot=%+v", run, first, got)
+		}
+	}
+
+	if first[0].ID != "block-a" || first[1].ID != "block-b" {
+		t.Fatalf("stable ID tie-break = [%s %s], want [block-a block-b]", first[0].ID, first[1].ID)
+	}
+	for _, got := range first {
+		if got.ContentHash == "" {
+			t.Fatalf("%s missing content_hash", got.ID)
+		}
+		if got.MatchedTermCount != 2 || !reflect.DeepEqual(got.MatchedTerms, []string{"flimflam", "warbler"}) {
+			t.Fatalf("%s matched terms=%v/%d, want [flimflam warbler]/2", got.ID, got.MatchedTerms, got.MatchedTermCount)
+		}
+		if got.Rank >= 0 {
+			t.Fatalf("%s rank=%f, want negative BM25 aggregate", got.ID, got.Rank)
+		}
 	}
 }
 

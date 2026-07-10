@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -26,6 +27,121 @@ func buildBigTimeline(n int) []string {
 		timeline[i] = fmt.Sprintf("event %03d %s", i, strings.Repeat("y", 50))
 	}
 	return timeline
+}
+
+func TestRecallSignalRejectsCommonToolWords(t *testing.T) {
+	messages := []Message{
+		{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"go test"}}]`)},
+		{Role: "user", Content: json.RawMessage(`"what did the bash tool request from the user"`)},
+	}
+	if got := extractRecallSignals(messages); len(got) != 0 {
+		t.Fatalf("common tool words produced signals: %+v", got)
+	}
+}
+
+func TestRecallSignalDeepSearchRequiresOverlap(t *testing.T) {
+	messages := []Message{
+		{Role: "assistant", Content: json.RawMessage(`[{"type":"text","text":"[tool result archived → deep_search('flimflam parser warbler')]"}]`)},
+		{Role: "user", Content: json.RawMessage(`"explain the parser"`)},
+	}
+	if got := extractRecallSignals(messages); len(got) != 0 {
+		t.Fatalf("one-word overlap produced signals: %+v", got)
+	}
+
+	messages[1].Content = json.RawMessage(`"explain the flimflam parser"`)
+	got := extractRecallSignals(messages)
+	if len(got) != 1 || got[0].Kind != RecallSignalDeepSearch || got[0].Query != "flimflam parser warbler" {
+		t.Fatalf("valid deep_search signal=%+v", got)
+	}
+}
+
+func TestRecallSignalExactPathIsSingleStrongSignal(t *testing.T) {
+	messages := []Message{{Role: "user", Content: json.RawMessage(`"restore C:\\work\\src\\proxy.go"`)}}
+	got := extractRecallSignals(messages)
+	if len(got) != 1 || got[0].Kind != RecallSignalExactPath || got[0].ExactPath != `C:\work\src\proxy.go` {
+		t.Fatalf("exact path signal=%+v", got)
+	}
+}
+
+func TestSearchAndExpandTriggerRequiresExplicitSignal(t *testing.T) {
+	store, _, _, tc := seedBudgetStore(t)
+	messages := []Message{{Role: "user", Content: json.RawMessage(`"what is flimflam"`)}}
+	outcome := SearchAndExpand(messages, store, 100000, tc, &Budget{ReExpansion: 100000})
+	if outcome.Attempted || outcome.Candidates != 0 || outcome.Injected != 0 {
+		t.Fatalf("ordinary question triggered recall: %+v", outcome)
+	}
+}
+
+func TestSearchAndExpandTop3Stable(t *testing.T) {
+	tc, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "top3.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer store.Close()
+
+	termSets := [][]string{
+		{"flimflam", "warbler", "parser"},
+		{"quokka", "serializer", "schema"},
+		{"narwhal", "cache", "boundary"},
+	}
+	for i, terms := range termSets {
+		block := ArchiveBlock{
+			ID: fmt.Sprintf("top3-%d", i), SessionID: fmt.Sprintf("source-%d", i),
+			BlockRangeStart: i * 10, BlockRangeEnd: i*10 + 4, MessageCount: 5, EstimatedTokens: 50,
+			SummaryText: fmt.Sprintf("summary %d", i),
+			Keywords:    []KeywordEntry{{Word: terms[0], Source: "user_message"}, {Word: terms[1], Source: "user_message"}, {Word: terms[2], Source: "user_message"}},
+		}
+		if err := store.SaveArchive(block); err != nil {
+			t.Fatalf("SaveArchive(%s): %v", block.ID, err)
+		}
+	}
+
+	messages := []Message{
+		{Role: "assistant", Content: json.RawMessage(`[{"type":"text","text":"deep_search('flimflam warbler parser')\ndeep_search('quokka serializer schema')\ndeep_search('narwhal cache boundary')"}]`)},
+		{Role: "user", Content: json.RawMessage(`"recall archive about flimflam warbler parser quokka serializer schema narwhal cache boundary"`)},
+	}
+	var first []string
+	for run := 0; run < 3; run++ {
+		outcome := SearchAndExpand(messages, store, 100000, tc, &Budget{ReExpansion: 100000})
+		if outcome.Selected > 3 || outcome.Injected > 3 {
+			t.Fatalf("run %d selected/injected=%d/%d, want <=3", run, outcome.Selected, outcome.Injected)
+		}
+		got := recalledArchiveIDs(outcome.Messages)
+		if run == 0 {
+			first = got
+		} else if !reflect.DeepEqual(got, first) {
+			t.Fatalf("run %d IDs=%v, first=%v", run, got, first)
+		}
+	}
+	if len(first) != 3 {
+		t.Fatalf("recalled IDs=%v, want exactly 3", first)
+	}
+}
+
+func recalledArchiveIDs(messages []Message) []string {
+	var ids []string
+	for _, message := range messages {
+		blocks, _ := parseContent(message.Content)
+		for _, block := range blocks {
+			if block.Type != "text" {
+				continue
+			}
+			idx := strings.Index(block.Text, "[Retrieved archive ")
+			if idx < 0 {
+				continue
+			}
+			line := block.Text[idx:]
+			if end := strings.IndexByte(line, '\n'); end >= 0 {
+				line = line[:end]
+			}
+			ids = append(ids, line)
+		}
+	}
+	return ids
 }
 
 // (a) 超限时巨型中间段 Files/Timeline 整段省略且各自原位置有一行标注，
