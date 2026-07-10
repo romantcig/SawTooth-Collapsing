@@ -54,28 +54,19 @@ func CalcCollapseCutoff(messages []Message, tokenFloor int, tc *TokenCounter, ke
 		}
 	}
 
-	// Orphan safety (COLLAPSE-02, D-03, T-03-05):
-	// 若 cutoff 落在含 tool_result 的 user 消息上，前移纳入配套 tool_use
-	for cutoff < n {
-		if messages[cutoff].Role != "user" {
-			break
-		}
-		if !hasToolResultContent(messages[cutoff].Content) {
-			break
-		}
-		cutoff++
+	maxCutoff := n
+	if keepRecent > 0 {
+		maxCutoff = n - keepRecent
 	}
 
-	// Reverse orphan safety: 若 cutoff 落在含 tool_use 的 assistant 消息上，
-	// 且 cutoff+1 是含对应 tool_result 的 user 消息，则前移以避免
-	// tool_use 被折叠后 tool_result 残留导致 API 400。
-	if cutoff < n && messages[cutoff].Role == "assistant" {
-		if hasToolUseContent(messages[cutoff].Content) {
-			if cutoff+1 < n && messages[cutoff+1].Role == "user" {
-				if hasToolResultContent(messages[cutoff+1].Content) {
-					cutoff++
-				}
-			}
+	// Orphan safety (COLLAPSE-02, D-03, T-03-05):
+	// 若 cutoff 落在含 tool_result 的 user 消息上，优先将整对纳入折叠；
+	// 若这会侵入 recent window，则后退保留整对。
+	if cutoff < n && messages[cutoff].Role == "user" && hasToolResultContent(messages[cutoff].Content) {
+		if cutoff+1 <= maxCutoff {
+			cutoff++
+		} else if cutoff > 1 && messages[cutoff-1].Role == "assistant" && hasToolUseContent(messages[cutoff-1].Content) {
+			cutoff--
 		}
 	}
 
@@ -724,4 +715,3 @@ func formatArchiveBlockText(
 func sortStrings(s []string) {
 	sort.Strings(s)
 }
-
