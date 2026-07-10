@@ -217,12 +217,6 @@ func extractSessionID(r *http.Request) string {
 	return sid
 }
 
-// isSubagent 仅保留给旧调用点；主管线使用 agentClassification 三态结果。
-func isSubagent(bodyMap map[string]json.RawMessage, messages []Message) bool {
-	features := extractAgentRequestFeatures(nil, bodyMap, messages)
-	return classifyAgentFeatures(features).Role == agentRoleSubagent
-}
-
 // extractModelFromBody 从请求体 JSON 中提取 model 字段值。
 // 若 model 字段缺失、非字符串类型或 body 解析失败，返回 "unknown"。
 func extractModelFromBody(body []byte) string {
