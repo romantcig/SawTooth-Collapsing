@@ -137,7 +137,7 @@ type Server struct {
 	Sawtooth    *SawtoothTrigger   // Phase 4: 桩化周期触发 (D-03)
 	EagerStub   *EagerStubMemory   // Phase 5: eager stub memory (EAGER-01)
 	cachedTTL   string             // 当前生效的 cache TTL（"ephemeral" 或 "1h"），用于检测切换
-	searchAndExpandFn func([]Message, *SQLiteStore, int, *TokenCounter, *Budget) RecallOutcome
+	searchAndExpandFn func([]Message, *SQLiteStore, int, *TokenCounter, *Budget, string) RecallOutcome
 }
 
 // NewServer 创建代理服务实例。
@@ -467,7 +467,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		recallOutcome := RecallOutcome{Messages: messages}
 		if s.Store != nil {
 			reExpandBudget := NewBudget(threshold)
-			recallOutcome = s.searchAndExpand(messages, reExpandBudget)
+			recallOutcome = s.searchAndExpand(messages, reExpandBudget, sessionID)
 			messages = recallOutcome.Messages
 		}
 
@@ -779,11 +779,11 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 }
 
 // searchAndExpand 是 HandleMessages 的唯一召回调用点；测试可注入计数 spy。
-func (s *Server) searchAndExpand(messages []Message, budget *Budget) RecallOutcome {
+func (s *Server) searchAndExpand(messages []Message, budget *Budget, sessionID string) RecallOutcome {
 	if s.searchAndExpandFn != nil {
-		return s.searchAndExpandFn(messages, s.Store, s.Config.Stubify.TokenThreshold, s.TokenCounter, budget)
+		return s.searchAndExpandFn(messages, s.Store, s.Config.Stubify.TokenThreshold, s.TokenCounter, budget, sessionID)
 	}
-	return SearchAndExpand(messages, s.Store, s.Config.Stubify.TokenThreshold, s.TokenCounter, budget)
+	return searchAndExpandForSession(messages, s.Store, s.Config.Stubify.TokenThreshold, s.TokenCounter, budget, sessionID)
 }
 
 // applyCacheControl 执行 cache_control 四步处理（Phase 4, D-09/D-10）。

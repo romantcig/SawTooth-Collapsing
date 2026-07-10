@@ -230,6 +230,7 @@ func searchAndExpandForSession(messages []Message, store *SQLiteStore, tokenThre
 		return outcome
 	}
 	sort.SliceStable(candidates, func(i, j int) bool { return recallCandidateLess(candidates[i], candidates[j]) })
+	candidates = dedupeDominatedCandidates(candidates)
 	if len(candidates) > maxRecallSignals {
 		candidates = candidates[:maxRecallSignals]
 	}
@@ -255,9 +256,10 @@ func searchAndExpandForSession(messages []Message, store *SQLiteStore, tokenThre
 		outcome.TokenCost += cost
 	}
 
-	var injected []Message
 	// 同 session 完整展开去重：一个 session 只完整展开一次，预算留给不同 session 的块
 	expandedSessions := make(map[string]bool)
+	fullExpansionCount := 0
+	result := messages
 
 	for i, candidate := range candidates {
 		summary := candidate.Summary
@@ -269,8 +271,8 @@ func searchAndExpandForSession(messages []Message, store *SQLiteStore, tokenThre
 		outcome.Selected++
 
 		// 估算 token 消耗（含前缀 "[Retrieved archive #n — ...]\n\n"）
-		prefix := fmt.Sprintf("[Retrieved archive #%d — %d-%d, ~%d tokens]\n\n",
-			i+1, summary.BlockRangeStart, summary.BlockRangeEnd, summary.EstimatedTokens)
+		prefix := fmt.Sprintf("[Retrieved archive #%d — source=%s, range=%d-%d, ~%d tokens]\n\n",
+			i+1, summary.SessionID, summary.BlockRangeStart, summary.BlockRangeEnd, summary.EstimatedTokens)
 
 		// 完整展开尝试：messages_json 可用且剩余预算装得下时，摘要 header 后附
 		// 完整原始消息（LLM 先看摘要判断相关性，需要细节再往下翻）；
@@ -278,7 +280,8 @@ func searchAndExpandForSession(messages []Message, store *SQLiteStore, tokenThre
 		// 与 summary 路径不同，本分支在 budget == nil 时也按 maxBudget 门控——
 		// 完整消息可达数万 token，无约束注入会挤爆上下文。
 		payload, payloadCost, fullExpanded := "", 0, false
-		if summary.MessagesJSON != "" && !expandedSessions[summary.SessionID] {
+		rawHistoryStillPresent := candidate.SameSession && summary.BlockRangeEnd < len(messages)
+		if summary.MessagesJSON != "" && fullExpansionCount == 0 && !expandedSessions[summary.SessionID] && !rawHistoryStillPresent {
 			headCost := tc.CountTokens(prefix + truncated)
 			remaining := outcome.BudgetRemaining - headCost
 			if remaining > 0 {
@@ -324,17 +327,17 @@ func searchAndExpandForSession(messages []Message, store *SQLiteStore, tokenThre
 			payloadCost = cost
 		}
 
+		var applied bool
+		result, applied = applyRecallPayload(result, candidate.Signal, payload)
+		if !applied {
+			outcome.Discarded++
+			continue
+		}
 		spend(payloadCost)
 		if fullExpanded {
 			expandedSessions[summary.SessionID] = true
+			fullExpansionCount++
 		}
-
-		// 构造注入消息
-		contentJSON, _ := json.Marshal(payload)
-		injected = append(injected, Message{
-			Role:    "user",
-			Content: contentJSON,
-		})
 		outcome.Injected++
 
 		slog.Info("注入存档块",
@@ -345,22 +348,16 @@ func searchAndExpandForSession(messages []Message, store *SQLiteStore, tokenThre
 		)
 	}
 
-	if len(injected) == 0 {
+	if outcome.Injected == 0 {
 		return outcome
 	}
-
-	// 在 messages 开头（索引 0 之后、索引 1 之前）插入 archive blocks
-	result := make([]Message, 0, 1+len(injected)+len(messages)-1)
-	result = append(result, messages[0])     // 保留第一条消息
-	result = append(result, injected...)     // 插入 archive blocks
-	result = append(result, messages[1:]...) // 其余消息
 
 	budgetUsedPct := "0.0%"
 	if outcome.BudgetLimit > 0 {
 		budgetUsedPct = fmt.Sprintf("%.1f%%", float64(outcome.TokenCost)/float64(outcome.BudgetLimit)*100)
 	}
 	slog.Info("archive 注入完成",
-		"injected_blocks", len(injected),
+		"injected_blocks", outcome.Injected,
 		"discarded_blocks", outcome.Discarded,
 		"token_cost", outcome.TokenCost,
 		"budget_limit", outcome.BudgetLimit,
@@ -475,6 +472,119 @@ func recallCandidateLess(a, b recallCandidate) bool {
 		return aSpan > bSpan
 	}
 	return a.Summary.ID < b.Summary.ID
+}
+
+func dedupeDominatedCandidates(candidates []recallCandidate) []recallCandidate {
+	seenHashes := make(map[string]bool)
+	result := make([]recallCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if hash := candidate.Summary.ContentHash; hash != "" && seenHashes[hash] {
+			continue
+		}
+		dominated := false
+		for _, kept := range result {
+			if candidate.Summary.SessionID != kept.Summary.SessionID {
+				continue
+			}
+			if rangesHighlyOverlap(candidate.Summary, kept.Summary) {
+				dominated = true
+				break
+			}
+		}
+		if dominated {
+			continue
+		}
+		if candidate.Summary.ContentHash != "" {
+			seenHashes[candidate.Summary.ContentHash] = true
+		}
+		result = append(result, candidate)
+	}
+	return result
+}
+
+func rangesHighlyOverlap(a, b ArchiveSummary) bool {
+	start := a.BlockRangeStart
+	if b.BlockRangeStart > start {
+		start = b.BlockRangeStart
+	}
+	end := a.BlockRangeEnd
+	if b.BlockRangeEnd < end {
+		end = b.BlockRangeEnd
+	}
+	if end < start {
+		return false
+	}
+	intersection := end - start + 1
+	aLen := a.BlockRangeEnd - a.BlockRangeStart + 1
+	bLen := b.BlockRangeEnd - b.BlockRangeStart + 1
+	shorter := aLen
+	if bLen < shorter {
+		shorter = bLen
+	}
+	return shorter > 0 && intersection*5 >= shorter*4
+}
+
+func applyRecallPayload(messages []Message, signal RecallSignal, payload string) ([]Message, bool) {
+	if signal.Kind == RecallSignalDeepSearch {
+		if result, ok := replaceRecallStub(messages, signal, payload); ok {
+			return result, true
+		}
+	}
+	return appendRecallToLatestUser(messages, payload)
+}
+
+func replaceRecallStub(messages []Message, signal RecallSignal, payload string) ([]Message, bool) {
+	if signal.MessageIdx < 0 || signal.MessageIdx >= len(messages) || signal.StubText == "" {
+		return messages, false
+	}
+	result := append([]Message(nil), messages...)
+	message := result[signal.MessageIdx]
+	var text string
+	if err := json.Unmarshal(message.Content, &text); err == nil {
+		if text != signal.StubText {
+			return messages, false
+		}
+		message.Content, _ = json.Marshal(payload)
+		result[signal.MessageIdx] = message
+		return result, true
+	}
+	var blocks []ContentBlock
+	if err := json.Unmarshal(message.Content, &blocks); err != nil {
+		return messages, false
+	}
+	for i := range blocks {
+		if blocks[i].Type != "text" || blocks[i].Text != signal.StubText {
+			continue
+		}
+		blocks[i] = ContentBlock{Type: "text", Text: payload}
+		message.Content, _ = json.Marshal(blocks)
+		result[signal.MessageIdx] = message
+		return result, true
+	}
+	return messages, false
+}
+
+func appendRecallToLatestUser(messages []Message, payload string) ([]Message, bool) {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != "user" {
+			continue
+		}
+		result := append([]Message(nil), messages...)
+		message := result[i]
+		var blocks []ContentBlock
+		if err := json.Unmarshal(message.Content, &blocks); err != nil {
+			var text string
+			if err := json.Unmarshal(message.Content, &text); err != nil {
+				return messages, false
+			}
+			blocks = []ContentBlock{{Type: "text", Text: text}}
+		}
+		blocks = append(blocks, ContentBlock{Type: "text", Text: payload})
+		message.Content, _ = json.Marshal(blocks)
+		result[i] = message
+		return result, true
+	}
+	return messages, false
 }
 
 // extractFilePaths 从文本中提取文件路径。

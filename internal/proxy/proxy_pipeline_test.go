@@ -128,8 +128,14 @@ func TestHandleMessagesFrozenBoundaryEdit(t *testing.T) {
 	edited = append(edited, pipelineMessages(2, 10)...)
 	servePipelineRequest(t, server, "thread-boundary-edit", edited)
 
-	if got := archiveCount(t, server.Store); got <= archivesAfterFreeze {
-		t.Fatalf("archive rows after edited boundary = %d, want a fresh collapse beyond %d", got, archivesAfterFreeze)
+	if got := archiveCount(t, server.Store); got < archivesAfterFreeze {
+		t.Fatalf("archive rows after edited boundary = %d, want at least %d", got, archivesAfterFreeze)
+	}
+	server.Frozen.mu.RLock()
+	refreshedCutoff := server.Frozen.cutoff["thread-boundary-edit"]
+	server.Frozen.mu.RUnlock()
+	if refreshedCutoff != len(edited) {
+		t.Fatalf("refreshed cutoff=%d, want %d", refreshedCutoff, len(edited))
 	}
 }
 
@@ -178,16 +184,16 @@ func TestHandleMessagesSearchOnceAcrossFrozenPaths(t *testing.T) {
 			server := newPipelineTestServer(t, upstream.URL)
 			seedRecallArchive(t, server.Store)
 			raw := pipelineMessages(3, 10)
-			raw[2].Content = mustMarshal("restore flimflam archive details")
+			raw[2].Content = mustMarshal("restore archive about flimflam details parser")
 			if tc.setupFrozen != nil {
 				tc.setupFrozen(t, server, raw)
 			}
 
 			searchCalls := 0
 			var outcomes []RecallOutcome
-			server.searchAndExpandFn = func(messages []Message, store *SQLiteStore, threshold int, counter *TokenCounter, budget *Budget) RecallOutcome {
+			server.searchAndExpandFn = func(messages []Message, store *SQLiteStore, threshold int, counter *TokenCounter, budget *Budget, sessionID string) RecallOutcome {
 				searchCalls++
-				outcome := SearchAndExpand(messages, store, threshold, counter, budget)
+				outcome := searchAndExpandForSession(messages, store, threshold, counter, budget, sessionID)
 				outcomes = append(outcomes, outcome)
 				return outcome
 			}
@@ -228,7 +234,13 @@ func seedRecallArchive(t *testing.T, store *SQLiteStore) {
 		BlockRangeStart: 1, BlockRangeEnd: 2,
 		MessageCount: 2, EstimatedTokens: 80,
 		SummaryText: "flimflam archive details",
-		Keywords:    []KeywordEntry{{Word: "flimflam", Source: "user_message"}},
+		Messages:    []Message{{Role: "user", Content: mustMarshal("pipeline recall content")}},
+		Keywords: []KeywordEntry{
+			{Word: "flimflam", Source: "user_message"},
+			{Word: "archive", Source: "user_message"},
+			{Word: "details", Source: "user_message"},
+			{Word: "parser", Source: "user_message"},
+		},
 	}
 	if err := store.SaveArchive(block); err != nil {
 		t.Fatalf("SaveArchive: %v", err)
@@ -238,9 +250,11 @@ func seedRecallArchive(t *testing.T, store *SQLiteStore) {
 func retrievedArchiveTexts(messages []Message) []string {
 	var archives []string
 	for _, message := range messages {
-		var text string
-		if err := json.Unmarshal(message.Content, &text); err == nil && strings.Contains(text, "[Retrieved archive #") {
-			archives = append(archives, text)
+		blocks, _ := parseContent(message.Content)
+		for _, block := range blocks {
+			if block.Type == "text" && strings.Contains(block.Text, "[Retrieved archive #") {
+				archives = append(archives, block.Text)
+			}
 		}
 	}
 	return archives

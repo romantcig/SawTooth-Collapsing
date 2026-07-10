@@ -73,6 +73,39 @@ func TestSearchAndExpandTriggerRequiresExplicitSignal(t *testing.T) {
 	}
 }
 
+func TestSearchAndExpandTriggerCrossSessionNeedsThreeTerms(t *testing.T) {
+	tc, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "cross-session.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer store.Close()
+	block := ArchiveBlock{
+		ID: "two-terms", SessionID: "source-session", BlockRangeStart: 10, BlockRangeEnd: 20,
+		MessageCount: 11, EstimatedTokens: 50, SummaryText: "two term archive",
+		Keywords: []KeywordEntry{{Word: "flimflam", Source: "user_message"}, {Word: "warbler", Source: "user_message"}},
+	}
+	if err := store.SaveArchive(block); err != nil {
+		t.Fatalf("SaveArchive: %v", err)
+	}
+	messages := []Message{
+		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "text", Text: "deep_search('flimflam warbler')"}})},
+		{Role: "user", Content: json.RawMessage(`"explain flimflam warbler"`)},
+	}
+
+	cross := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "other-session")
+	if cross.Candidates != 1 || cross.Selected != 0 || cross.Injected != 0 {
+		t.Fatalf("cross-session two-term result=%+v, want candidate rejected", cross)
+	}
+	same := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "source-session")
+	if same.Injected != 1 {
+		t.Fatalf("same-session two-term result=%+v, want injected", same)
+	}
+}
+
 func TestSearchAndExpandTop3Stable(t *testing.T) {
 	tc, err := NewTokenCounter()
 	if err != nil {
@@ -94,6 +127,7 @@ func TestSearchAndExpandTop3Stable(t *testing.T) {
 			ID: fmt.Sprintf("top3-%d", i), SessionID: fmt.Sprintf("source-%d", i),
 			BlockRangeStart: i * 10, BlockRangeEnd: i*10 + 4, MessageCount: 5, EstimatedTokens: 50,
 			SummaryText: fmt.Sprintf("summary %d", i),
+			Messages:    []Message{{Role: "user", Content: mustMarshal(fmt.Sprintf("top3 content %d", i))}},
 			Keywords:    []KeywordEntry{{Word: terms[0], Source: "user_message"}, {Word: terms[1], Source: "user_message"}, {Word: terms[2], Source: "user_message"}},
 		}
 		if err := store.SaveArchive(block); err != nil {
@@ -191,6 +225,37 @@ func TestSearchAndExpandSameSessionDominance(t *testing.T) {
 	joined := strings.Join(texts, "\n")
 	if !strings.Contains(joined, "wide range") || strings.Contains(joined, "short range") {
 		t.Fatalf("dominance result=%q, want only wide range", joined)
+	}
+}
+
+func TestSearchAndExpandSameSessionRawHistorySkipsFullExpansion(t *testing.T) {
+	tc, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "raw-history.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer store.Close()
+	block := ArchiveBlock{
+		ID: "raw-present", SessionID: "current", BlockRangeStart: 0, BlockRangeEnd: 1,
+		MessageCount: 2, EstimatedTokens: 50, SummaryText: "raw history summary",
+		Messages: []Message{{Role: "user", Content: json.RawMessage(`"full raw secret"`)}},
+		Keywords: recallTestKeywords(),
+	}
+	if err := store.SaveArchive(block); err != nil {
+		t.Fatalf("SaveArchive: %v", err)
+	}
+	messages := []Message{
+		{Role: "user", Content: json.RawMessage(`"old raw message"`)},
+		{Role: "assistant", Content: json.RawMessage(`"old answer"`)},
+		{Role: "user", Content: json.RawMessage(`"recall archive about flimflam warbler parser"`)},
+	}
+	outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "current")
+	payload := singleRecallPayload(t, outcome.Messages)
+	if strings.Contains(payload, "--- Full messages ---") || strings.Contains(payload, "full raw secret") {
+		t.Fatalf("raw history was fully expanded again: %q", payload)
 	}
 }
 
@@ -400,14 +465,14 @@ func seedBudgetStore(t *testing.T) (*SQLiteStore, string, []Message, *TokenCount
 		BlockRangeStart: 1, BlockRangeEnd: 8,
 		MessageCount: 8, EstimatedTokens: 1200,
 		SummaryText: summaryText,
-		Keywords:    []KeywordEntry{{Word: "flimflam", Source: "user_message"}},
+		Keywords:    recallTestKeywords(),
 	}
 	if err := store.SaveArchive(block); err != nil {
 		t.Fatalf("SaveArchive failed: %v", err)
 	}
 
 	messages := []Message{
-		{Role: "user", Content: json.RawMessage(`"tell me about flimflam"`)},
+		{Role: "user", Content: json.RawMessage(`"recall archive about flimflam warbler parser"`)},
 	}
 	return store, summaryText, messages, tc
 }
@@ -418,7 +483,7 @@ func TestSearchAndExpandBudgetDegradesTruncation(t *testing.T) {
 	store, summaryText, messages, tc := seedBudgetStore(t)
 
 	// 复刻注入循环的 prefix（archive 序号 1 + 播种块的 Range 与 EstimatedTokens）
-	prefix := fmt.Sprintf("[Retrieved archive #%d — %d-%d, ~%d tokens]\n\n", 1, 1, 8, 1200)
+	prefix := fmt.Sprintf("[Retrieved archive #%d — source=%s, range=%d-%d, ~%d tokens]\n\n", 1, "s1", 1, 8, 1200)
 	cost2000 := tc.CountTokens(prefix + truncateSummaryText(summaryText, 2000))
 	cost500 := tc.CountTokens(prefix + truncateSummaryText(summaryText, 500))
 	if cost500 >= cost2000 {
@@ -426,15 +491,12 @@ func TestSearchAndExpandBudgetDegradesTruncation(t *testing.T) {
 	}
 	budget := &Budget{ReExpansion: (cost2000 + cost500) / 2}
 
-	outcome := SearchAndExpand(messages, store, 100000, tc, budget)
+	outcome := searchAndExpandForSession(messages, store, 100000, tc, budget, "s1")
 	result := outcome.Messages
-	if len(result) != len(messages)+1 {
-		t.Fatalf("expected %d messages after degraded injection, got %d", len(messages)+1, len(result))
+	if len(result) != len(messages) {
+		t.Fatalf("expected message count to stay %d, got %d", len(messages), len(result))
 	}
-	var injectedText string
-	if err := json.Unmarshal(result[1].Content, &injectedText); err != nil {
-		t.Fatalf("unmarshal injected content: %v", err)
-	}
+	injectedText := singleRecallPayload(t, result)
 	if !strings.Contains(injectedText, "[Retrieved archive #1") {
 		t.Errorf("injected message should contain archive prefix, got: %q", injectedText)
 	}
@@ -452,7 +514,7 @@ func TestSearchAndExpandBudgetExhaustedStopsInjection(t *testing.T) {
 	store, _, messages, tc := seedBudgetStore(t)
 
 	budget := &Budget{ReExpansion: 1}
-	outcome := SearchAndExpand(messages, store, 100000, tc, budget)
+	outcome := searchAndExpandForSession(messages, store, 100000, tc, budget, "s1")
 	result := outcome.Messages
 	if len(result) != len(messages) {
 		t.Fatalf("expected no injection with exhausted budget, got %d messages (want %d)", len(result), len(messages))
@@ -583,26 +645,35 @@ func seedFullExpandStore(t *testing.T) (*SQLiteStore, []Message, *TokenCounter) 
 			{Role: "assistant", Content: json.RawMessage(`"the quokka module requires quoted flimflam everywhere"`)},
 		},
 		SummaryText: "archive summary about flimflam parsing",
-		Keywords:    []KeywordEntry{{Word: "flimflam", Source: "user_message"}},
+		Keywords:    recallTestKeywords(),
 	}
 	if err := store.SaveArchive(block); err != nil {
 		t.Fatalf("SaveArchive failed: %v", err)
 	}
 
 	messages := []Message{
-		{Role: "user", Content: json.RawMessage(`"tell me about flimflam"`)},
+		{Role: "user", Content: json.RawMessage(`"recall archive about flimflam warbler parser"`)},
 	}
 	return store, messages, tc
 }
 
-// injectedTextAt 取注入结果第 idx 条消息的字符串内容。
-func injectedTextAt(t *testing.T, result []Message, idx int) string {
+func singleRecallPayload(t *testing.T, result []Message) string {
 	t.Helper()
-	var text string
-	if err := json.Unmarshal(result[idx].Content, &text); err != nil {
-		t.Fatalf("unmarshal injected content at %d: %v", idx, err)
+	payloads := recallPayloads(result)
+	if len(payloads) != 1 {
+		t.Fatalf("recall payload count=%d, want 1: %v", len(payloads), payloads)
 	}
-	return text
+	return payloads[0]
+}
+
+func recallPayloads(messages []Message) []string {
+	var payloads []string
+	for _, text := range allMessageTexts(messages) {
+		if strings.HasPrefix(text, "[Retrieved archive #") {
+			payloads = append(payloads, text)
+		}
+	}
+	return payloads
 }
 
 // 预算充足 → 注入完整原始消息，summary header 与全文分隔符同时在场。
@@ -610,12 +681,12 @@ func TestSearchAndExpandFullExpansion(t *testing.T) {
 	store, messages, tc := seedFullExpandStore(t)
 
 	budget := &Budget{ReExpansion: 100000}
-	outcome := SearchAndExpand(messages, store, 100000, tc, budget)
+	outcome := searchAndExpandForSession(messages, store, 100000, tc, budget, "s1")
 	result := outcome.Messages
-	if len(result) != len(messages)+1 {
-		t.Fatalf("expected 1 injected message, got %d total (want %d)", len(result), len(messages)+1)
+	if len(result) != len(messages) {
+		t.Fatalf("message count=%d, want unchanged %d", len(result), len(messages))
 	}
-	text := injectedTextAt(t, result, 1)
+	text := singleRecallPayload(t, result)
 	for _, want := range []string{
 		"[Retrieved archive #1",
 		"archive summary about flimflam parsing",
@@ -634,16 +705,16 @@ func TestSearchAndExpandFullExpansionBudgetFallsBack(t *testing.T) {
 	store, messages, tc := seedFullExpandStore(t)
 
 	// 复刻注入循环的 summary 形态成本，预算设为略高于它——完整版必装不下
-	prefix := fmt.Sprintf("[Retrieved archive #%d — %d-%d, ~%d tokens]\n\n", 1, 1, 2, 80)
+	prefix := fmt.Sprintf("[Retrieved archive #%d — source=%s, range=%d-%d, ~%d tokens]\n\n", 1, "s1", 1, 2, 80)
 	summaryCost := tc.CountTokens(prefix + truncateSummaryText("archive summary about flimflam parsing", 2000))
 	budget := &Budget{ReExpansion: summaryCost + 5}
 
-	outcome := SearchAndExpand(messages, store, 100000, tc, budget)
+	outcome := searchAndExpandForSession(messages, store, 100000, tc, budget, "s1")
 	result := outcome.Messages
-	if len(result) != len(messages)+1 {
-		t.Fatalf("expected 1 injected message, got %d total (want %d)", len(result), len(messages)+1)
+	if len(result) != len(messages) {
+		t.Fatalf("message count=%d, want unchanged %d", len(result), len(messages))
 	}
-	text := injectedTextAt(t, result, 1)
+	text := singleRecallPayload(t, result)
 	if strings.Contains(text, "--- Full messages ---") {
 		t.Errorf("full expansion should be rejected under tight budget, got: %q", text)
 	}
@@ -661,12 +732,12 @@ func TestSearchAndExpandFullExpansionCorruptJSONFallsBack(t *testing.T) {
 	}
 
 	budget := &Budget{ReExpansion: 100000}
-	outcome := SearchAndExpand(messages, store, 100000, tc, budget)
+	outcome := searchAndExpandForSession(messages, store, 100000, tc, budget, "s1")
 	result := outcome.Messages
-	if len(result) != len(messages)+1 {
-		t.Fatalf("expected 1 injected message, got %d total (want %d)", len(result), len(messages)+1)
+	if len(result) != len(messages) {
+		t.Fatalf("message count=%d, want unchanged %d", len(result), len(messages))
 	}
-	text := injectedTextAt(t, result, 1)
+	text := singleRecallPayload(t, result)
 	if strings.Contains(text, "--- Full messages ---") {
 		t.Errorf("corrupt JSON should degrade to summary, got: %q", text)
 	}
@@ -711,7 +782,7 @@ func TestSearchAndExpandFullExpansionSameSessionOnce(t *testing.T) {
 				{Role: "user", Content: json.RawMessage(`"second block original text"`)},
 			},
 			SummaryText: "second summary",
-			Keywords:    []KeywordEntry{{Word: "flimflam", Source: "user_message"}},
+			Keywords:    []KeywordEntry{{Word: "quokka", Source: "user_message"}, {Word: "serializer", Source: "user_message"}},
 		},
 		{
 			ID: "block-noise", SessionID: "s2",
@@ -732,17 +803,20 @@ func TestSearchAndExpandFullExpansionSameSessionOnce(t *testing.T) {
 	}
 
 	messages := []Message{
-		{Role: "user", Content: json.RawMessage(`"tell me about flimflam warbler"`)},
+		{Role: "assistant", Content: json.RawMessage(`[{"type":"text","text":"deep_search('flimflam warbler')\ndeep_search('quokka serializer')"}]`)},
+		{Role: "user", Content: json.RawMessage(`"recall archive about flimflam warbler quokka serializer"`)},
 	}
 	budget := &Budget{ReExpansion: 100000}
-	outcome := SearchAndExpand(messages, store, 100000, tc, budget)
+	outcome := searchAndExpandForSession(messages, store, 100000, tc, budget, "s1")
 	result := outcome.Messages
-	if len(result) != len(messages)+2 {
-		t.Fatalf("expected 2 injected messages, got %d total (want %d)", len(result), len(messages)+2)
+	if len(result) != len(messages) {
+		t.Fatalf("message count=%d, want unchanged %d", len(result), len(messages))
 	}
-
-	first := injectedTextAt(t, result, 1)
-	second := injectedTextAt(t, result, 2)
+	payloads := recallPayloads(result)
+	if len(payloads) != 2 {
+		t.Fatalf("recall payloads=%d, want 2: %v", len(payloads), payloads)
+	}
+	first, second := payloads[0], payloads[1]
 	if !strings.Contains(first, "--- Full messages ---") || !strings.Contains(first, "first block original text") {
 		t.Errorf("top-ranked block should fully expand, got: %q", first)
 	}
@@ -768,26 +842,38 @@ func seedBudgetCandidates(t *testing.T, count int) (*SQLiteStore, []Message, *To
 	t.Cleanup(func() { store.Close() })
 
 	summary := "flimflam archive summary with enough detail for budget accounting"
+	termSets := [][]string{{"flimflam", "warbler", "parser"}, {"quokka", "serializer", "schema"}}
+	var hints []string
 	for i := 0; i < count; i++ {
+		terms := termSets[i]
 		block := ArchiveBlock{
 			ID: fmt.Sprintf("budget-candidate-%d", i), SessionID: fmt.Sprintf("session-%d", i),
 			BlockRangeStart: 1, BlockRangeEnd: 2,
 			MessageCount: 2, EstimatedTokens: 80,
 			SummaryText: summary,
-			Keywords:    []KeywordEntry{{Word: "flimflam", Source: "user_message"}},
+			Messages:    []Message{{Role: "user", Content: mustMarshal(fmt.Sprintf("budget content %d", i))}},
+			Keywords: []KeywordEntry{
+				{Word: terms[0], Source: "user_message"},
+				{Word: terms[1], Source: "user_message"},
+				{Word: terms[2], Source: "user_message"},
+			},
 		}
 		if err := store.SaveArchive(block); err != nil {
 			t.Fatalf("SaveArchive(%s): %v", block.ID, err)
 		}
+		hints = append(hints, fmt.Sprintf("deep_search('%s')", strings.Join(terms, " ")))
 	}
 
-	messages := []Message{{Role: "user", Content: json.RawMessage(`"tell me about flimflam"`)}}
+	messages := []Message{
+		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "text", Text: strings.Join(hints, "\n")}})},
+		{Role: "user", Content: json.RawMessage(`"recall archive about flimflam warbler parser quokka serializer schema"`)},
+	}
 	return store, messages, tc, summary
 }
 
 func TestSearchAndExpandBudgetTracksOnlyInjectedPayload(t *testing.T) {
 	store, messages, tc, summary := seedBudgetCandidates(t, 2)
-	prefix := fmt.Sprintf("[Retrieved archive #%d — %d-%d, ~%d tokens]\n\n", 1, 1, 2, 80)
+	prefix := fmt.Sprintf("[Retrieved archive #%d — source=%s, range=%d-%d, ~%d tokens]\n\n", 1, "session-0", 1, 2, 80)
 	oneCost := tc.CountTokens(prefix + summary)
 	budget := &Budget{ReExpansion: oneCost}
 
@@ -798,10 +884,10 @@ func TestSearchAndExpandBudgetTracksOnlyInjectedPayload(t *testing.T) {
 	if outcome.Injected != 1 || outcome.Discarded != 1 {
 		t.Fatalf("injected/discarded = %d/%d, want 1/1", outcome.Injected, outcome.Discarded)
 	}
-	if len(outcome.Messages) != len(messages)+1 {
-		t.Fatalf("message count = %d, want %d", len(outcome.Messages), len(messages)+1)
+	if len(outcome.Messages) != len(messages) {
+		t.Fatalf("message count = %d, want unchanged %d", len(outcome.Messages), len(messages))
 	}
-	injected := injectedTextAt(t, outcome.Messages, 1)
+	injected := singleRecallPayload(t, outcome.Messages)
 	actualCost := tc.CountTokens(injected)
 	if outcome.TokenCost != actualCost {
 		t.Fatalf("token cost = %d, want actual injected cost %d", outcome.TokenCost, actualCost)
@@ -813,7 +899,7 @@ func TestSearchAndExpandBudgetTracksOnlyInjectedPayload(t *testing.T) {
 
 func TestSearchAndExpandBudgetNilUsesHardLimit(t *testing.T) {
 	store, messages, tc, summary := seedBudgetCandidates(t, 2)
-	prefix := fmt.Sprintf("[Retrieved archive #%d — %d-%d, ~%d tokens]\n\n", 1, 1, 2, 80)
+	prefix := fmt.Sprintf("[Retrieved archive #%d — source=%s, range=%d-%d, ~%d tokens]\n\n", 1, "session-0", 1, 2, 80)
 	oneCost := tc.CountTokens(prefix + summary)
 
 	outcome := SearchAndExpand(messages, store, oneCost*10, tc, nil)
