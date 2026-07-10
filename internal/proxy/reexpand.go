@@ -4,63 +4,138 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 )
 
 // ── 重展开引擎 ──
 
-// ExtractKeywords 从最新用户消息提取关键词。
-// 提取三类：文件路径、tool 名、用户消息实词（过滤停用词）。
-// 返回去重后的关键词列表（保持顺序：文件路径 → tool 名 → 实词）。
-// D-06, D-07
-func ExtractKeywords(messages []Message) []string {
-	// 获取最新用户消息文本
-	userText := getLatestUserText(messages)
-	if userText == "" && len(messages) == 0 {
+type RecallSignalKind string
+
+const (
+	RecallSignalDeepSearch RecallSignalKind = "deep_search"
+	RecallSignalExactPath  RecallSignalKind = "exact_path"
+	RecallSignalRecovery   RecallSignalKind = "recovery_intent"
+	maxRecallSignals                        = 3
+)
+
+// RecallSignal 是一次明确、可审计的 Archive 恢复线索。
+type RecallSignal struct {
+	Kind       RecallSignalKind
+	Query      string
+	Terms      []string
+	ExactPath  string
+	MessageIdx int
+	StubText   string
+}
+
+var recallIntentPhrases = []string{
+	"recall archive", "restore archive", "retrieve archive", "search archive",
+	"recall earlier", "restore earlier", "find earlier", "from earlier",
+	"恢复存档", "找回存档", "恢复之前", "找回之前", "搜索存档",
+}
+
+var recallCommonWords = map[string]bool{
+	"archive": true, "recall": true, "restore": true, "retrieve": true,
+	"search": true, "earlier": true, "previous": true, "before": true,
+	"request": true, "tool": true, "user": true, "assistant": true,
+	"bash": true, "read": true, "write": true, "edit": true,
+	"grep": true, "glob": true, "mcp": true, "agent": true,
+	"恢复": true, "找回": true, "之前": true, "存档": true, "搜索": true,
+}
+
+// extractRecallSignals 只接受 deep_search、精确路径和窄恢复意图。
+func extractRecallSignals(messages []Message) []RecallSignal {
+	latest := getLatestUserText(messages)
+	if latest == "" {
 		return nil
 	}
-
+	queryTerms := effectiveRecallTerms(latest)
+	var signals []RecallSignal
 	seen := make(map[string]bool)
-	var keywords []string
-
-	addKW := func(w string) {
-		if w == "" || seen[w] {
+	add := func(signal RecallSignal) {
+		key := string(signal.Kind) + "\x00" + strings.ToLower(signal.Query)
+		if signal.Query == "" || seen[key] || len(signals) >= maxRecallSignals {
 			return
 		}
-		seen[w] = true
-		keywords = append(keywords, w)
+		seen[key] = true
+		signals = append(signals, signal)
 	}
 
-	// 第 1 类: 文件路径（从最新用户消息文本中提取）
-	for _, fp := range extractFilePaths(userText) {
-		addKW(fp)
+	for _, path := range extractFilePaths(latest) {
+		add(RecallSignal{Kind: RecallSignalExactPath, Query: path, Terms: []string{path}, ExactPath: path, MessageIdx: -1})
 	}
 
-	// 第 2 类: tool 名（从所有消息的 tool_use block 提取）
-	toolNames := make(map[string]bool)
-	for _, msg := range messages {
-		blocks, _ := parseContent(msg.Content)
-		for _, b := range blocks {
-			if b.Type == "tool_use" && b.Name != "" {
-				if !toolNames[b.Name] {
-					toolNames[b.Name] = true
-					addKW(b.Name)
+	for msgIdx, msg := range messages {
+		var texts []string
+		var plain string
+		if err := json.Unmarshal(msg.Content, &plain); err == nil {
+			texts = append(texts, plain)
+		} else {
+			blocks, _ := parseContent(msg.Content)
+			for _, block := range blocks {
+				if block.Type == "text" && block.Text != "" {
+					texts = append(texts, block.Text)
 				}
 			}
 		}
-	}
-
-	// 第 3 类: 用户消息实词（tokenizeWords + 停用词过滤）
-	if userText != "" {
-		words := tokenizeWords(userText)
-		for _, w := range words {
-			if !isStopWord(w) {
-				addKW(w)
+		for _, text := range texts {
+			for _, hint := range extractDeepSearchHints(text) {
+				hintTerms := effectiveRecallTerms(hint)
+				path := exactPathInText(hint)
+				if path == "" && countTermOverlap(queryTerms, hintTerms) < 2 {
+					continue
+				}
+				if path != "" && !containsPath(latest, path) && countTermOverlap(queryTerms, hintTerms) < 2 {
+					continue
+				}
+				add(RecallSignal{Kind: RecallSignalDeepSearch, Query: hint, Terms: hintTerms, ExactPath: path, MessageIdx: msgIdx, StubText: text})
 			}
 		}
 	}
 
-	return keywords
+	lower := strings.ToLower(latest)
+	for _, phrase := range recallIntentPhrases {
+		if !strings.Contains(lower, phrase) {
+			continue
+		}
+		if len(queryTerms) > 0 {
+			add(RecallSignal{Kind: RecallSignalRecovery, Query: strings.Join(queryTerms, " "), Terms: queryTerms, MessageIdx: -1})
+		}
+		break
+	}
+	return signals
+}
+
+func effectiveRecallTerms(text string) []string {
+	seen := make(map[string]bool)
+	var terms []string
+	for _, word := range tokenizeWords(strings.ToLower(text)) {
+		word = strings.Trim(word, ".,;:!?\"'()[]{}…—")
+		if len([]rune(word)) < 3 || isStopWord(word) || recallCommonWords[word] || seen[word] {
+			continue
+		}
+		seen[word] = true
+		terms = append(terms, word)
+		if len(terms) == 8 {
+			break
+		}
+	}
+	return terms
+}
+
+func countTermOverlap(a, b []string) int {
+	set := make(map[string]bool, len(a))
+	for _, term := range a {
+		set[strings.ToLower(term)] = true
+	}
+	count := 0
+	for _, term := range b {
+		if set[strings.ToLower(term)] {
+			count++
+		}
+	}
+	return count
 }
 
 // RecallOutcome 描述一次请求最终保留的 archive 召回结果。
@@ -76,12 +151,22 @@ type RecallOutcome struct {
 	BudgetRemaining int
 }
 
+type recallCandidate struct {
+	Signal      RecallSignal
+	Summary     ArchiveSummary
+	SameSession bool
+}
+
 // SearchAndExpand 搜索 SQLite 中的匹配 archive blocks 并注入到消息中。
 // 每个候选只在实际注入前按真实 token cost 门控并立即扣费。
 // budget 为 nil 时仍受 tokenThreshold/10 的本地硬上限约束。
 // 每条 <= 2000 chars。不修改输入 messages。
 // D-06, D-08 / Phase E: Budget 集成。
 func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int, tc *TokenCounter, budget *Budget) RecallOutcome {
+	return searchAndExpandForSession(messages, store, tokenThreshold, tc, budget, "")
+}
+
+func searchAndExpandForSession(messages []Message, store *SQLiteStore, tokenThreshold int, tc *TokenCounter, budget *Budget, requestSessionID string) RecallOutcome {
 	maxBudget := tokenThreshold / 10
 	if maxBudget < 0 {
 		maxBudget = 0
@@ -107,38 +192,46 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 		return outcome
 	}
 
-	// 提取关键词
-	keywords := ExtractKeywords(messages)
-	// Phase D: 从已桩化的消息中提取 deep_search 提示关键词
-	hintKeywords := extractSearchHintsFromStubs(messages)
-	keywords = append(keywords, hintKeywords...)
-	// 跨来源去重：ExtractKeywords 和 extractSearchHintsFromStubs 可能重叠
-	//（如文件路径、工具名同时出现在两者中），浪费 FTS5 的 20 槽限制
-	keywords = dedupKeywords(keywords)
-	if len(keywords) == 0 {
+	signals := extractRecallSignals(messages)
+	if len(signals) == 0 {
 		return outcome
 	}
-
-	// 构建 FTS5 查询：关键词用 OR 连接，双引号转义，最多 20 个关键词
-	// T-03-06: 关键词注入防护——双引号转义 + 限制数量
-	fts5Query := buildFTS5Query(keywords)
-	if fts5Query == "" {
-		return outcome
-	}
-	// 执行搜索
 	outcome.Attempted = true
-	limit := 5
-	if len(keywords) > limit {
-		limit = len(keywords)
+	seenCandidates := make(map[string]bool)
+	var candidates []recallCandidate
+	for _, signal := range signals {
+		terms := signal.Terms
+		if signal.ExactPath != "" {
+			terms = []string{signal.ExactPath}
+		}
+		query := buildFTS5Query(terms)
+		if query == "" {
+			continue
+		}
+		summaries, err := store.SearchArchives(query, 1)
+		if err != nil {
+			slog.Warn("archive 搜索失败", "query", query, "error", err)
+			continue
+		}
+		for _, summary := range summaries {
+			if seenCandidates[summary.ID] {
+				continue
+			}
+			seenCandidates[summary.ID] = true
+			sameSession := requestSessionID != "" && summary.SessionID == requestSessionID
+			if !candidateMeetsRecallThreshold(signal, summary, sameSession) {
+				continue
+			}
+			candidates = append(candidates, recallCandidate{Signal: signal, Summary: summary, SameSession: sameSession})
+		}
 	}
-	summaries, err := store.SearchArchives(fts5Query, limit)
-	if err != nil {
-		slog.Warn("archive 搜索失败", "query", fts5Query, "error", err)
+	outcome.Candidates = len(seenCandidates)
+	if len(candidates) == 0 {
 		return outcome
 	}
-	outcome.Candidates = len(summaries)
-	if len(summaries) == 0 {
-		return outcome
+	sort.SliceStable(candidates, func(i, j int) bool { return recallCandidateLess(candidates[i], candidates[j]) })
+	if len(candidates) > maxRecallSignals {
+		candidates = candidates[:maxRecallSignals]
 	}
 
 	localSpent := 0
@@ -166,7 +259,8 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 	// 同 session 完整展开去重：一个 session 只完整展开一次，预算留给不同 session 的块
 	expandedSessions := make(map[string]bool)
 
-	for i, summary := range summaries {
+	for i, candidate := range candidates {
+		summary := candidate.Summary
 		// 分段感知截断到 2000 字符——优先保留 Gotchas/Conclusion
 		truncated := truncateSummaryText(summary.SummaryText, 2000)
 		if truncated == "" {
@@ -218,7 +312,7 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 					outcome.Discarded++
 					slog.Info("archive 注入预算耗尽",
 						"injected_count", outcome.Injected,
-						"total_summaries", len(summaries),
+						"total_summaries", len(candidates),
 						"token_used", outcome.TokenCost,
 						"budget_remaining", outcome.BudgetRemaining,
 						"degraded_levels", "1000,500",
@@ -305,6 +399,84 @@ func getLatestUserText(messages []Message) string {
 	return ""
 }
 
+func extractDeepSearchHints(text string) []string {
+	const marker = "deep_search('"
+	var hints []string
+	for {
+		idx := strings.Index(text, marker)
+		if idx < 0 {
+			return hints
+		}
+		start := idx + len(marker)
+		end := strings.Index(text[start:], "')")
+		if end < 0 {
+			return hints
+		}
+		if hint := strings.TrimSpace(text[start : start+end]); hint != "" {
+			hints = append(hints, hint)
+		}
+		text = text[start+end+2:]
+	}
+}
+
+func exactPathInText(text string) string {
+	paths := extractFilePaths(text)
+	if len(paths) == 0 {
+		return ""
+	}
+	return paths[0]
+}
+
+func containsPath(text, path string) bool {
+	return strings.Contains(normalizeRecallPath(text), normalizeRecallPath(path))
+}
+
+func normalizeRecallPath(path string) string {
+	return strings.ToLower(strings.ReplaceAll(path, `\`, "/"))
+}
+
+func matchedExactPath(summary ArchiveSummary, path string) bool {
+	want := normalizeRecallPath(path)
+	for _, term := range summary.MatchedTerms {
+		if normalizeRecallPath(term) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func candidateMeetsRecallThreshold(signal RecallSignal, summary ArchiveSummary, sameSession bool) bool {
+	if signal.ExactPath != "" {
+		return matchedExactPath(summary, signal.ExactPath)
+	}
+	required := 3
+	if sameSession {
+		required = 2
+	}
+	return summary.MatchedTermCount >= required
+}
+
+func recallCandidateLess(a, b recallCandidate) bool {
+	if a.SameSession != b.SameSession {
+		return a.SameSession
+	}
+	if a.Summary.MatchedTermCount != b.Summary.MatchedTermCount {
+		return a.Summary.MatchedTermCount > b.Summary.MatchedTermCount
+	}
+	if a.Summary.Rank != b.Summary.Rank {
+		return a.Summary.Rank < b.Summary.Rank
+	}
+	if a.Summary.CreatedAt != b.Summary.CreatedAt {
+		return a.Summary.CreatedAt > b.Summary.CreatedAt
+	}
+	aSpan := a.Summary.BlockRangeEnd - a.Summary.BlockRangeStart
+	bSpan := b.Summary.BlockRangeEnd - b.Summary.BlockRangeStart
+	if aSpan != bSpan {
+		return aSpan > bSpan
+	}
+	return a.Summary.ID < b.Summary.ID
+}
+
 // extractFilePaths 从文本中提取文件路径。
 // 匹配绝对路径（盘符或 / 开头）和相对路径（含 / 且含扩展名）。
 func extractFilePaths(text string) []string {
@@ -317,6 +489,7 @@ func extractFilePaths(text string) []string {
 	})
 
 	for _, token := range tokens {
+		token = strings.Trim(token, ".,;:!?()[]{}<>\"")
 		// 至少 3 个字符
 		if len(token) < 3 {
 			continue

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	_ "modernc.org/sqlite" // 纯 Go SQLite 驱动，通过 init() 注册 database/sql
@@ -34,16 +35,19 @@ type ArchiveBlock struct {
 // ArchiveSummary SearchArchives 返回的结果——不反序列化 Messages，
 // 原始 messages_json 以字符串携带，由重展开侧按需反序列化（预算允许时完整展开）。
 type ArchiveSummary struct {
-	ID              string `json:"id"`
-	SessionID       string `json:"session_id"`
-	ContentHash     string `json:"content_hash"`
-	BlockRangeStart int    `json:"block_range_start"`
-	BlockRangeEnd   int    `json:"block_range_end"`
-	MessageCount    int    `json:"message_count"`
-	EstimatedTokens int    `json:"estimated_tokens"`
-	SummaryText     string `json:"summary_text"`
-	MessagesJSON    string `json:"messages_json"`
-	CreatedAt       string `json:"created_at"`
+	ID               string   `json:"id"`
+	SessionID        string   `json:"session_id"`
+	ContentHash      string   `json:"content_hash"`
+	BlockRangeStart  int      `json:"block_range_start"`
+	BlockRangeEnd    int      `json:"block_range_end"`
+	MessageCount     int      `json:"message_count"`
+	EstimatedTokens  int      `json:"estimated_tokens"`
+	SummaryText      string   `json:"summary_text"`
+	MessagesJSON     string   `json:"messages_json"`
+	CreatedAt        string   `json:"created_at"`
+	MatchedTerms     []string `json:"matched_terms"`
+	MatchedTermCount int      `json:"matched_term_count"`
+	Rank             float64  `json:"rank"`
 }
 
 // KeywordEntry 关键词条目——关联到 archive block 的关键词及其来源。
@@ -327,19 +331,26 @@ func (s *SQLiteStore) LoadState(key string) (string, bool) {
 // GROUP BY 主键 a.id 时其余 a.* 列函数依赖于主键（组内值一致），
 // SQLite 允许 bare columns，安全。
 func (s *SQLiteStore) SearchArchives(query string, limit int) ([]ArchiveSummary, error) {
+	if limit < 1 {
+		return nil, nil
+	}
+	if limit > 3 {
+		limit = 3
+	}
 	rows, err := s.db.Query(
 		`WITH matched AS MATERIALIZED (
-		     SELECT rowid, bm25(archive_keywords_fts) AS rank
+		     SELECT rowid, keyword, bm25(archive_keywords_fts) AS rank
 		     FROM archive_keywords_fts
 		     WHERE archive_keywords_fts MATCH ?
 		 )
 		 SELECT a.id, a.session_id, COALESCE(a.content_hash, ''), a.block_range_start, a.block_range_end,
-		        a.message_count, a.estimated_tokens, a.summary_text, a.messages_json, a.created_at
+		        a.message_count, a.estimated_tokens, a.summary_text, a.messages_json, a.created_at,
+		        GROUP_CONCAT(DISTINCT fts.keyword), COUNT(DISTINCT fts.keyword), SUM(fts.rank)
 		 FROM archive_blocks a
 		 JOIN archive_keywords k ON k.block_id = a.id
 		 JOIN matched fts ON fts.rowid = k.id
 		 GROUP BY a.id
-		 ORDER BY SUM(fts.rank)
+		 ORDER BY COUNT(DISTINCT fts.keyword) DESC, SUM(fts.rank) ASC, a.created_at DESC, a.id ASC
 		 LIMIT ?`,
 		query, limit,
 	)
@@ -351,13 +362,19 @@ func (s *SQLiteStore) SearchArchives(query string, limit int) ([]ArchiveSummary,
 	var results []ArchiveSummary
 	for rows.Next() {
 		var summary ArchiveSummary
+		var matchedTerms string
 		if err := rows.Scan(
 			&summary.ID, &summary.SessionID, &summary.ContentHash,
 			&summary.BlockRangeStart, &summary.BlockRangeEnd,
 			&summary.MessageCount, &summary.EstimatedTokens,
 			&summary.SummaryText, &summary.MessagesJSON, &summary.CreatedAt,
+			&matchedTerms, &summary.MatchedTermCount, &summary.Rank,
 		); err != nil {
 			return nil, fmt.Errorf("扫描搜索结果失败: %w", err)
+		}
+		if matchedTerms != "" {
+			summary.MatchedTerms = strings.Split(matchedTerms, ",")
+			sort.Strings(summary.MatchedTerms)
 		}
 		results = append(results, summary)
 	}
