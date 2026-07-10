@@ -137,6 +137,7 @@ type Server struct {
 	Sawtooth    *SawtoothTrigger   // Phase 4: 桩化周期触发 (D-03)
 	EagerStub   *EagerStubMemory   // Phase 5: eager stub memory (EAGER-01)
 	cachedTTL   string             // 当前生效的 cache TTL（"ephemeral" 或 "1h"），用于检测切换
+	searchAndExpandFn func([]Message, *SQLiteStore, int, *TokenCounter, *Budget) RecallOutcome
 }
 
 // NewServer 创建代理服务实例。
@@ -415,17 +416,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Phase E: Token 预算分配 — 仅当 Store 存在时创建（per-request）
-		var reExpandBudget *Budget
-
-		// Phase 4 Step 2: Reexpand — 在 frozen Get 之后、stubify 之前（D-11）
-		if s.Store != nil {
-			reExpandBudget = NewBudget(s.Config.Stubify.TokenThreshold)
-			recall := SearchAndExpand(messages, s.Store, s.Config.Stubify.TokenThreshold, s.TokenCounter, reExpandBudget)
-			messages = recall.Messages
-		}
-
-		// 计算当前 token 总量（frozen prefix 拼合 + reexpand 注入后）
+		// 先基于 frozen+tail 判定 frozen 是否仍有效，确定本请求唯一的权威基础消息。
 		totalTokens := s.TokenCounter.CountMessagesTokens(messages)
 		threshold := s.Config.Stubify.TokenThreshold
 
@@ -466,15 +457,23 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				messages = originalMessages
 				frozenRawCutoff = 0
 				frozenPrefixLen = 0
-				// 在原始消息上重新执行 Reexpand（之前执行时 messages 还是 frozen+tail）
-				if s.Store != nil {
-					recall := SearchAndExpand(messages, s.Store, s.Config.Stubify.TokenThreshold, s.TokenCounter, reExpandBudget)
-					messages = recall.Messages
-				}
 				// 重新计算 totalTokens（基于原始未压缩消息）
 				totalTokens = s.TokenCounter.CountMessagesTokens(messages)
 			}
 		}
+
+		// Frozen 最终有效性确定后，每个请求只执行一次 Archive 搜索与注入。
+		// RecallOutcome 保存在请求局部变量中，后续日志可直接复用最终结果。
+		recallOutcome := RecallOutcome{Messages: messages}
+		if s.Store != nil {
+			reExpandBudget := NewBudget(threshold)
+			recallOutcome = s.searchAndExpand(messages, reExpandBudget)
+			messages = recallOutcome.Messages
+		}
+
+		// 召回后的消息才是最终压缩输入；Frozen 失效分支不再重跑召回。
+		totalTokens = s.TokenCounter.CountMessagesTokens(messages)
+		needCompress = totalTokens >= threshold
 		if needCompress {
 			// 提取 pivot text：使用最新一条 user 消息的内容文本
 			pivotText := extractLatestUserText(messages)
@@ -761,7 +760,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				}
 			} else {
 				// 重新 marshal（cache_control 可能改变了 content）
-				if frozenPrefixLen > 0 {
+				if frozenPrefixLen > 0 || recallOutcome.Injected > 0 {
 					if newBody, err := rebuildBody(messages); err == nil {
 						r.Body = io.NopCloser(bytes.NewReader(newBody))
 					} else {
@@ -779,6 +778,13 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	s.forwardRaw(w, r, sessionID)
 }
 
+// searchAndExpand 是 HandleMessages 的唯一召回调用点；测试可注入计数 spy。
+func (s *Server) searchAndExpand(messages []Message, budget *Budget) RecallOutcome {
+	if s.searchAndExpandFn != nil {
+		return s.searchAndExpandFn(messages, s.Store, s.Config.Stubify.TokenThreshold, s.TokenCounter, budget)
+	}
+	return SearchAndExpand(messages, s.Store, s.Config.Stubify.TokenThreshold, s.TokenCounter, budget)
+}
 
 // applyCacheControl 执行 cache_control 四步处理（Phase 4, D-09/D-10）。
 // 仅在 frozen prefix 命中时（frozenCount > 0）执行 Strip/Inject/Normalize/Enforce。

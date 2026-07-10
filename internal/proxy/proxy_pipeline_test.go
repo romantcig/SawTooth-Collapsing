@@ -143,16 +143,18 @@ func TestHandleMessagesSearchOnceAcrossFrozenPaths(t *testing.T) {
 			name: "valid frozen",
 			setupFrozen: func(t *testing.T, server *Server, raw []Message) {
 				t.Helper()
-				prefix := deepCopyMessages(raw[:1])
-				server.Frozen.Store("thread-search-once", prefix, 1, raw[0], server.TokenCounter.CountMessagesTokens(prefix), server.TokenCounter.CountMessagesTokens(raw))
+				stripped := StripReminders(raw)
+				prefix := deepCopyMessages(stripped[:1])
+				server.Frozen.Store("thread-search-once", prefix, 1, stripped[0], server.TokenCounter.CountMessagesTokens(prefix), server.TokenCounter.CountMessagesTokens(raw))
 			},
 		},
 		{
 			name: "invalidated frozen",
 			setupFrozen: func(t *testing.T, server *Server, raw []Message) {
 				t.Helper()
+				stripped := StripReminders(raw)
 				prefix := []Message{{Role: "user", Content: mustMarshal(strings.Repeat("oversized frozen context ", 20000))}}
-				server.Frozen.Store("thread-search-once", prefix, 1, raw[0], server.TokenCounter.CountMessagesTokens(prefix), server.TokenCounter.CountMessagesTokens(raw))
+				server.Frozen.Store("thread-search-once", prefix, 1, stripped[0], server.TokenCounter.CountMessagesTokens(prefix), server.TokenCounter.CountMessagesTokens(raw))
 			},
 		},
 	}
@@ -205,8 +207,15 @@ func TestHandleMessagesSearchOnceAcrossFrozenPaths(t *testing.T) {
 			if outcome.TokenCost > outcome.BudgetLimit || outcome.BudgetRemaining < 0 {
 				t.Fatalf("budget cost/limit/remaining = %d/%d/%d", outcome.TokenCost, outcome.BudgetLimit, outcome.BudgetRemaining)
 			}
-			if got := countRetrievedArchives(forwarded); got != outcome.Injected {
-				t.Fatalf("forwarded archive count = %d, want outcome injected %d", got, outcome.Injected)
+			gotArchives := retrievedArchiveTexts(forwarded)
+			wantArchives := retrievedArchiveTexts(outcome.Messages)
+			if len(gotArchives) != outcome.Injected || len(wantArchives) != outcome.Injected {
+				t.Fatalf("forwarded/outcome archive count = %d/%d, want %d", len(gotArchives), len(wantArchives), outcome.Injected)
+			}
+			for i := range wantArchives {
+				if gotArchives[i] != wantArchives[i] {
+					t.Fatalf("forwarded archive %d differs from outcome\ngot:  %q\nwant: %q", i, gotArchives[i], wantArchives[i])
+				}
 			}
 		})
 	}
@@ -226,15 +235,15 @@ func seedRecallArchive(t *testing.T, store *SQLiteStore) {
 	}
 }
 
-func countRetrievedArchives(messages []Message) int {
-	count := 0
+func retrievedArchiveTexts(messages []Message) []string {
+	var archives []string
 	for _, message := range messages {
 		var text string
 		if err := json.Unmarshal(message.Content, &text); err == nil && strings.Contains(text, "[Retrieved archive #") {
-			count++
+			archives = append(archives, text)
 		}
 	}
-	return count
+	return archives
 }
 
 func newPipelineTestServer(t *testing.T, upstreamURL string) *Server {
