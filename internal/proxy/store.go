@@ -18,16 +18,16 @@ type SQLiteStore struct {
 
 // ArchiveBlock 折叠存档块——包含被折叠的原始消息及元数据。
 type ArchiveBlock struct {
-	ID               string        `json:"id"`
-	SessionID        string        `json:"session_id"`
-	BlockRangeStart  int           `json:"block_range_start"`
-	BlockRangeEnd    int           `json:"block_range_end"`
-	MessageCount     int           `json:"message_count"`
-	EstimatedTokens  int           `json:"estimated_tokens"`
-	Messages         []Message     `json:"messages"`
-	SummaryText      string        `json:"summary_text"`
-	CreatedAt        string        `json:"created_at"`
-	Keywords         []KeywordEntry `json:"keywords"`
+	ID              string         `json:"id"`
+	SessionID       string         `json:"session_id"`
+	BlockRangeStart int            `json:"block_range_start"`
+	BlockRangeEnd   int            `json:"block_range_end"`
+	MessageCount    int            `json:"message_count"`
+	EstimatedTokens int            `json:"estimated_tokens"`
+	Messages        []Message      `json:"messages"`
+	SummaryText     string         `json:"summary_text"`
+	CreatedAt       string         `json:"created_at"`
+	Keywords        []KeywordEntry `json:"keywords"`
 }
 
 // ArchiveSummary SearchArchives 返回的结果——不反序列化 Messages，
@@ -111,9 +111,8 @@ func tryInitDB(path string) (*SQLiteStore, error) {
 // createSchema 创建全部表、索引、FTS5 虚拟表及触发器。
 // 所有 DDL 使用 IF NOT EXISTS，幂等执行。
 func (s *SQLiteStore) createSchema() error {
-	schema := []string{
-		// 存档块主表
-		`CREATE TABLE IF NOT EXISTS archive_blocks (
+	// 存档块主表。content_hash 对新库直接创建；旧库由下方显式迁移补列。
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS archive_blocks (
 			id               TEXT PRIMARY KEY,
 			session_id       TEXT NOT NULL,
 			block_range_start INTEGER NOT NULL,
@@ -122,8 +121,16 @@ func (s *SQLiteStore) createSchema() error {
 			estimated_tokens  INTEGER NOT NULL,
 			messages_json    TEXT NOT NULL,
 			summary_text     TEXT NOT NULL,
-			created_at       TEXT NOT NULL DEFAULT (datetime('now'))
-		)`,
+			created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+			content_hash     TEXT
+		)`); err != nil {
+		return fmt.Errorf("执行 schema 失败: %w", err)
+	}
+	if err := s.ensureArchiveContentHashSchema(); err != nil {
+		return err
+	}
+
+	schema := []string{
 		`CREATE INDEX IF NOT EXISTS idx_archive_blocks_session
 		 ON archive_blocks(session_id)`,
 
@@ -176,6 +183,47 @@ func (s *SQLiteStore) createSchema() error {
 		if _, err := s.db.Exec(ddl); err != nil {
 			return fmt.Errorf("执行 schema 失败: %w", err)
 		}
+	}
+	return nil
+}
+
+// ensureArchiveContentHashSchema 为旧 archive_blocks 表幂等补充内容指纹。
+// 旧行保持 NULL，不回填也不清理；partial unique index 只约束新写入的非空 hash。
+func (s *SQLiteStore) ensureArchiveContentHashSchema() error {
+	rows, err := s.db.Query(`PRAGMA table_info(archive_blocks)`)
+	if err != nil {
+		return fmt.Errorf("读取 archive_blocks schema 失败: %w", err)
+	}
+	hasContentHash := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return fmt.Errorf("扫描 archive_blocks schema 失败: %w", err)
+		}
+		if name == "content_hash" {
+			hasContentHash = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("关闭 archive_blocks schema 查询失败: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("遍历 archive_blocks schema 失败: %w", err)
+	}
+
+	if !hasContentHash {
+		if _, err := s.db.Exec(`ALTER TABLE archive_blocks ADD COLUMN content_hash TEXT`); err != nil {
+			return fmt.Errorf("迁移 archive_blocks.content_hash 失败: %w", err)
+		}
+	}
+
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_archive_blocks_content_identity
+		ON archive_blocks(session_id, block_range_start, block_range_end, content_hash)
+		WHERE content_hash IS NOT NULL`); err != nil {
+		return fmt.Errorf("创建 archive content_hash 唯一索引失败: %w", err)
 	}
 	return nil
 }
