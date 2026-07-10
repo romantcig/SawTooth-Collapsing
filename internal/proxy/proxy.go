@@ -421,7 +421,8 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		// Phase 4 Step 2: Reexpand — 在 frozen Get 之后、stubify 之前（D-11）
 		if s.Store != nil {
 			reExpandBudget = NewBudget(s.Config.Stubify.TokenThreshold)
-			messages = SearchAndExpand(messages, s.Store, s.Config.Stubify.TokenThreshold, s.TokenCounter, reExpandBudget)
+			recall := SearchAndExpand(messages, s.Store, s.Config.Stubify.TokenThreshold, s.TokenCounter, reExpandBudget)
+			messages = recall.Messages
 		}
 
 		// 计算当前 token 总量（frozen prefix 拼合 + reexpand 注入后）
@@ -467,7 +468,8 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				frozenPrefixLen = 0
 				// 在原始消息上重新执行 Reexpand（之前执行时 messages 还是 frozen+tail）
 				if s.Store != nil {
-					messages = SearchAndExpand(messages, s.Store, s.Config.Stubify.TokenThreshold, s.TokenCounter, reExpandBudget)
+					recall := SearchAndExpand(messages, s.Store, s.Config.Stubify.TokenThreshold, s.TokenCounter, reExpandBudget)
+					messages = recall.Messages
 				}
 				// 重新计算 totalTokens（基于原始未压缩消息）
 				totalTokens = s.TokenCounter.CountMessagesTokens(messages)

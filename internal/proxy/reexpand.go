@@ -63,19 +63,48 @@ func ExtractKeywords(messages []Message) []string {
 	return keywords
 }
 
+// RecallOutcome 描述一次请求最终保留的 archive 召回结果。
+type RecallOutcome struct {
+	Messages        []Message
+	Attempted       bool
+	Candidates      int
+	Selected        int
+	Injected        int
+	Discarded       int
+	TokenCost       int
+	BudgetLimit     int
+	BudgetRemaining int
+}
+
 // SearchAndExpand 搜索 SQLite 中的匹配 archive blocks 并注入到消息中。
-// 预算控制：总注入 <= budget.ReExpansion（若 budget 非 nil），否则回退 <= 10% tokenThreshold。
-// 每条 <= 2000 chars。不修改输入 messages，返回新 slice。
+// 每个候选只在实际注入前按真实 token cost 门控并立即扣费。
+// budget 为 nil 时仍受 tokenThreshold/10 的本地硬上限约束。
+// 每条 <= 2000 chars。不修改输入 messages。
 // D-06, D-08 / Phase E: Budget 集成。
-func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int, tc *TokenCounter, budget *Budget) []Message {
+func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int, tc *TokenCounter, budget *Budget) RecallOutcome {
+	maxBudget := tokenThreshold / 10
+	if maxBudget < 0 {
+		maxBudget = 0
+	}
+	outcome := RecallOutcome{
+		Messages:        messages,
+		BudgetLimit:     maxBudget,
+		BudgetRemaining: maxBudget,
+	}
+	if budget != nil {
+		maxBudget = budget.RemainingReExpansion()
+		outcome.BudgetLimit = budget.ReExpansion
+		outcome.BudgetRemaining = maxBudget
+	}
+
 	// Guard 1: store == nil → 不做任何处理
 	if store == nil {
-		return messages
+		return outcome
 	}
 
 	// Guard 2: messages 为空
 	if len(messages) == 0 {
-		return messages
+		return outcome
 	}
 
 	// 提取关键词
@@ -87,16 +116,17 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 	//（如文件路径、工具名同时出现在两者中），浪费 FTS5 的 20 槽限制
 	keywords = dedupKeywords(keywords)
 	if len(keywords) == 0 {
-		return messages
+		return outcome
 	}
 
 	// 构建 FTS5 查询：关键词用 OR 连接，双引号转义，最多 20 个关键词
 	// T-03-06: 关键词注入防护——双引号转义 + 限制数量
 	fts5Query := buildFTS5Query(keywords)
 	if fts5Query == "" {
-		return messages
+		return outcome
 	}
 	// 执行搜索
+	outcome.Attempted = true
 	limit := 5
 	if len(keywords) > limit {
 		limit = len(keywords)
@@ -104,25 +134,34 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 	summaries, err := store.SearchArchives(fts5Query, limit)
 	if err != nil {
 		slog.Warn("archive 搜索失败", "query", fts5Query, "error", err)
-		return messages
+		return outcome
 	}
+	outcome.Candidates = len(summaries)
 	if len(summaries) == 0 {
-		return messages
+		return outcome
 	}
 
-	// 预算控制过滤（D-08）
-	// T-03-08: 跨 session archive 通过 bm25 相关性 + 预算控制防止无关注入
-	// Phase E: 动态预算——使用 Budget 的 ReExpansion，否则回退到 tokenThreshold 的 10%
-	maxBudget := tokenThreshold / 10
-	if budget != nil {
-		maxBudget = budget.ReExpansion
+	localSpent := 0
+	canSpend := func(cost int) bool {
+		if cost < 0 {
+			return false
+		}
+		if budget != nil {
+			return budget.CanSpendReExpansion(cost)
+		}
+		return localSpent+cost <= maxBudget
+	}
+	spend := func(cost int) {
+		if budget != nil {
+			budget.SpendReExpansion(cost)
+			outcome.BudgetRemaining = budget.RemainingReExpansion()
+		} else {
+			localSpent += cost
+			outcome.BudgetRemaining = maxBudget - localSpent
+		}
+		outcome.TokenCost += cost
 	}
 
-	// Phase E: 预算门控——若无可用预算则跳过重展开
-	if budget != nil && !budget.CanSpendReExpansion(1) {
-		return messages
-	}
-	tokenUsed := 0
 	var injected []Message
 	// 同 session 完整展开去重：一个 session 只完整展开一次，预算留给不同 session 的块
 	expandedSessions := make(map[string]bool)
@@ -133,6 +172,7 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 		if truncated == "" {
 			continue
 		}
+		outcome.Selected++
 
 		// 估算 token 消耗（含前缀 "[Retrieved archive #n — ...]\n\n"）
 		prefix := fmt.Sprintf("[Retrieved archive #%d — %d-%d, ~%d tokens]\n\n",
@@ -143,19 +183,18 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 		// JSON 损坏、预算不足、同 session 已展开——任一不满足即落回 summary_text 路径。
 		// 与 summary 路径不同，本分支在 budget == nil 时也按 maxBudget 门控——
 		// 完整消息可达数万 token，无约束注入会挤爆上下文。
-		payload, fullExpanded := "", false
+		payload, payloadCost, fullExpanded := "", 0, false
 		if summary.MessagesJSON != "" && !expandedSessions[summary.SessionID] {
 			headCost := tc.CountTokens(prefix + truncated)
-			remaining := maxBudget - tokenUsed - headCost
+			remaining := outcome.BudgetRemaining - headCost
 			if remaining > 0 {
 				// rune 预算 ≈ 2×token 预算：粗剪防格式化浪费，真门控靠下方 CountTokens 实测
 				if full, ok := formatFullMessages(summary.MessagesJSON, remaining*2); ok {
 					candidate := prefix + truncated + "\n\n--- Full messages ---\n" + full
-					if cost := tc.CountTokens(candidate); tokenUsed+cost <= maxBudget {
+					if cost := tc.CountTokens(candidate); canSpend(cost) {
 						payload = candidate
-						tokenUsed += cost
+						payloadCost = cost
 						fullExpanded = true
-						expandedSessions[summary.SessionID] = true
 					}
 				}
 			}
@@ -165,29 +204,35 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 			cost := tc.CountTokens(prefix + truncated)
 
 			// Budget 门控：超出预算则先按 1000→500 减半降级重试，降到底仍装不下才停止注入
-			if budget != nil && tokenUsed+cost > maxBudget {
+			if !canSpend(cost) {
 				fits := false
 				for _, level := range []int{1000, 500} {
 					truncated = truncateSummaryText(summary.SummaryText, level)
 					cost = tc.CountTokens(prefix + truncated)
-					if tokenUsed+cost <= maxBudget {
+					if canSpend(cost) {
 						fits = true
 						break
 					}
 				}
 				if !fits {
+					outcome.Discarded++
 					slog.Info("archive 注入预算耗尽",
-						"injected_count", i,
+						"injected_count", outcome.Injected,
 						"total_summaries", len(summaries),
-						"token_used", tokenUsed,
-						"max_budget", maxBudget,
+						"token_used", outcome.TokenCost,
+						"budget_remaining", outcome.BudgetRemaining,
 						"degraded_levels", "1000,500",
 					)
-					break
+					continue
 				}
 			}
-			tokenUsed += cost
 			payload = prefix + truncated
+			payloadCost = cost
+		}
+
+		spend(payloadCost)
+		if fullExpanded {
+			expandedSessions[summary.SessionID] = true
 		}
 
 		// 构造注入消息
@@ -196,6 +241,7 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 			Role:    "user",
 			Content: contentJSON,
 		})
+		outcome.Injected++
 
 		slog.Info("注入存档块",
 			"session_id", summary.SessionID,
@@ -206,26 +252,29 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 	}
 
 	if len(injected) == 0 {
-		return messages
+		return outcome
 	}
 
 	// 在 messages 开头（索引 0 之后、索引 1 之前）插入 archive blocks
 	result := make([]Message, 0, 1+len(injected)+len(messages)-1)
-	result = append(result, messages[0])            // 保留第一条消息
-	result = append(result, injected...)             // 插入 archive blocks
-	result = append(result, messages[1:]...)         // 其余消息
+	result = append(result, messages[0])     // 保留第一条消息
+	result = append(result, injected...)     // 插入 archive blocks
+	result = append(result, messages[1:]...) // 其余消息
 
+	budgetUsedPct := "0.0%"
+	if outcome.BudgetLimit > 0 {
+		budgetUsedPct = fmt.Sprintf("%.1f%%", float64(outcome.TokenCost)/float64(outcome.BudgetLimit)*100)
+	}
 	slog.Info("archive 注入完成",
 		"injected_blocks", len(injected),
-		"token_cost", tokenUsed,
-		"budget_used_pct", fmt.Sprintf("%.1f%%", float64(tokenUsed)/float64(maxBudget)*100),
+		"discarded_blocks", outcome.Discarded,
+		"token_cost", outcome.TokenCost,
+		"budget_limit", outcome.BudgetLimit,
+		"budget_remaining", outcome.BudgetRemaining,
+		"budget_used_pct", budgetUsedPct,
 	)
-	// Phase E: 记录重展开 token 支出
-	if budget != nil {
-		budget.SpendReExpansion(tokenUsed)
-	}
-
-	return result
+	outcome.Messages = result
+	return outcome
 }
 
 // ── 私有辅助函数 ──

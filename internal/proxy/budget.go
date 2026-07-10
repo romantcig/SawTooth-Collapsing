@@ -41,6 +41,15 @@ func (b *Budget) SpendReExpansion(tokens int) {
 	b.reExpansionSpent += tokens
 }
 
+// RemainingReExpansion 返回尚可消费的重展开预算，超支时饱和为 0。
+func (b *Budget) RemainingReExpansion() int {
+	remaining := b.ReExpansion - b.reExpansionSpent
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
 // CanSpendRetrieval 检查检索预算是否仍有余量容纳 tokens 个 token。
 func (b *Budget) CanSpendRetrieval(tokens int) bool {
 	return b.retrievalSpent+tokens <= b.Retrieval
