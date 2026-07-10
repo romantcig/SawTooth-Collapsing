@@ -372,14 +372,14 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Phase 4 Step 0: 保存原始 token 估算和消息数（SawtoothTrigger + frozen cutoff）
-		// originalMsgCount 必须在 reexpand 前保存——reexpand 会注入 archive block 增加消息数
+		// rawCutoff 必须在 reexpand 前保存——reexpand 会注入 archive block 增加消息数
 		// 对标 YesMem: cutoff := len(messages) 使用原始（未修改）消息数
 		rawEstimate := s.TokenCounter.CountMessagesTokens(messages)
-		originalMsgCount := len(messages)
+		rawCutoff := len(messages)
 
 		// Phase 6 Step 0: StripReminders (REMIND-04) — 在 Frozen.Get / SearchAndExpand 之前
 		// 移除旧消息中过期的 system-reminder / skill-hint，使 frozen prefix 的 boundary hash
-		// 与 reexpand 的关键词搜索都基于已清理消息。strip 不增删消息，originalMsgCount 不受影响。
+		// 与 reexpand 的关键词搜索都基于已清理消息。strip 不增删消息，rawCutoff 不受影响。
 		messages = StripReminders(messages)
 
 		// 保存 stripped 原始消息副本——frozen prefix 失效时需从原始消息重新压缩
@@ -389,23 +389,26 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 		// 保存 boundary 消息——用于 frozen prefix 验证（检测用户撤回/编辑）
 		// boundary = 原始请求中 frozen prefix 覆盖范围内的最后一条消息
-		var boundaryMsgForFrozen Message
-		if originalMsgCount > 0 && originalMsgCount <= len(originalMessages) {
-			boundaryMsgForFrozen = originalMessages[originalMsgCount-1]
+		var rawBoundary Message
+		if rawCutoff > 0 && rawCutoff <= len(originalMessages) {
+			rawBoundary = originalMessages[rawCutoff-1]
 		}
 
 		// Phase 4 Step 1: Frozen prefix retrieval (D-01)
-		var frozenCount int
+		var frozenRawCutoff int
+		var frozenPrefixLen int
 		var frozenTokens int // YesMem shouldInvalidateFrozen: 存储 frozen prefix 的 token 估算
 		if s.Frozen != nil {
 			result := s.Frozen.Get(sessionID, messages)
 			if result != nil {
-				frozenCount = result.Cutoff
+				frozenRawCutoff = result.Cutoff
+				frozenPrefixLen = len(result.Messages)
 				frozenTokens = result.Tokens
 				messages = append(result.Messages, messages[result.Cutoff:]...)
 				slog.Info("frozen prefix 命中并拼接",
 					"session_id", sessionID,
-					"frozen_count", result.Cutoff,
+					"raw_cutoff", result.Cutoff,
+					"frozen_prefix_len", frozenPrefixLen,
 					"frozen_tokens", result.Tokens,
 					LogGreen,
 				)
@@ -429,12 +432,12 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		// frozen prefix 存在时，若 frozen+tail 仍在阈值内则跳过压缩管线。
 		// 对标 YesMem proxy.go:1230: shouldInvalidateFrozen(combinedTokens, threshold)
 		needCompress := totalTokens >= threshold
-		if frozenCount > 0 && needCompress {
+		if frozenPrefixLen > 0 && needCompress {
 			// 用原始消息切片计算 tail tokens——防止 frozen prefix 替换后
-			// len(messages) < frozenCount 导致切片越界
+			// len(messages) < raw cutoff 导致切片越界
 			var tailTokens int
-			if frozenCount <= len(originalMessages) {
-				tailTokens = s.TokenCounter.CountMessagesTokens(originalMessages[frozenCount:])
+			if frozenRawCutoff <= len(originalMessages) {
+				tailTokens = s.TokenCounter.CountMessagesTokens(originalMessages[frozenRawCutoff:])
 			}
 			combinedTokens := frozenTokens + tailTokens
 			if combinedTokens <= threshold {
@@ -460,7 +463,8 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				// 对标 YesMem: frozen=nil 后 runStubCycle(messages) 使用原始未压缩消息
 				s.Frozen.Invalidate(sessionID)
 				messages = originalMessages
-				frozenCount = 0
+				frozenRawCutoff = 0
+				frozenPrefixLen = 0
 				// 在原始消息上重新执行 Reexpand（之前执行时 messages 还是 frozen+tail）
 				if s.Store != nil {
 					messages = SearchAndExpand(messages, s.Store, s.Config.Stubify.TokenThreshold, s.TokenCounter, reExpandBudget)
@@ -543,27 +547,6 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					s.DecayTracker.ClearSession(sessionID)
 				}
 
-				// SawtoothTrigger + Frozen.Store
-				// 注意: collapse 后的消息数已变，cutoff 和 boundary 必须用 collapse 后的值
-				collapseCutoff := len(collapsedMessages)
-				var collapseBoundary Message
-				if collapseCutoff > 0 && collapseCutoff <= len(collapsedMessages) {
-					collapseBoundary = collapsedMessages[collapseCutoff-1]
-				}
-				if s.Sawtooth != nil && s.Frozen != nil {
-					trigger := s.Sawtooth.ShouldTrigger(sessionID, rawEstimate)
-					if trigger != "" {
-						slog.Info("SawtoothTrigger 触发",
-							"session_id", sessionID,
-							"reason", trigger,
-							"raw_estimate", rawEstimate,
-							LogGreen,
-						)
-						compressedTokens := s.TokenCounter.CountMessagesTokens(collapsedMessages)
-						s.Frozen.Store(sessionID, collapsedMessages, collapseCutoff, collapseBoundary, compressedTokens, rawEstimate)
-					}
-				}
-
 				// 重建请求体
 				messages = collapsedMessages
 
@@ -588,14 +571,6 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 
-				s.applyCacheControl(messages, 0, sessionID)
-				newBody, err := rebuildBody(messages)
-				if err != nil {
-					slog.Error("重建折叠后请求体失败", "session_id", sessionID, "error", err)
-					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-					return
-				}
-
 				// Orphan repair
 				repaired, orphans := validateToolPairs(messages)
 				if orphans > 0 {
@@ -603,12 +578,33 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 						"session_id", sessionID,
 						"orphans_removed", orphans,
 					)
-					newBody, err = rebuildBody(repaired)
-					if err != nil {
-						slog.Error("重建修复后请求体失败", "session_id", sessionID, "error", err)
-						http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-						return
+					messages = repaired
+				}
+
+				// collapse 当轮的整个最终消息序列构成 frozen prefix。先完成所有会改变
+				// prefix 长度/内容的变换，再注入唯一 boundary breakpoint 并持久化。
+				frozenPrefixLen = len(messages)
+				s.applyCacheControl(messages, frozenPrefixLen, sessionID)
+
+				if s.Sawtooth != nil && s.Frozen != nil {
+					trigger := s.Sawtooth.ShouldTrigger(sessionID, rawEstimate)
+					if trigger != "" {
+						slog.Info("SawtoothTrigger 触发",
+							"session_id", sessionID,
+							"reason", trigger,
+							"raw_estimate", rawEstimate,
+							LogGreen,
+						)
+						compressedTokens := s.TokenCounter.CountMessagesTokens(messages)
+						s.Frozen.Store(sessionID, messages, rawCutoff, rawBoundary, compressedTokens, rawEstimate)
 					}
+				}
+
+				newBody, err := rebuildBody(messages)
+				if err != nil {
+					slog.Error("重建折叠后请求体失败", "session_id", sessionID, "error", err)
+					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+					return
 				}
 
 				r.Body = io.NopCloser(bytes.NewReader(newBody))
@@ -670,16 +666,16 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 						LogGreen,
 					)
 					compressedTokens := s.TokenCounter.CountMessagesTokens(decayedMessages)
-					s.Frozen.Store(sessionID, decayedMessages, originalMsgCount, boundaryMsgForFrozen, compressedTokens, rawEstimate)
+					s.Frozen.Store(sessionID, decayedMessages, rawCutoff, rawBoundary, compressedTokens, rawEstimate)
 				}
 			}
 
 			messages = decayedMessages
-			if s.EagerStub != nil && frozenCount > 0 {
+			if s.EagerStub != nil && frozenPrefixLen > 0 {
 				freshStubs := 0
 				stickyHits := 0
 				messagesAny := messagesToAny(messages)
-				messagesAny = EagerStubToolResults(messagesAny, frozenCount,
+				messagesAny = EagerStubToolResults(messagesAny, frozenPrefixLen,
 					func(text string) int { return s.TokenCounter.CountTokens(text) },
 					WithStubMemory(s.EagerStub, sessionID),
 					WithStubCounters(&stickyHits, &freshStubs),
@@ -693,7 +689,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					)
 				}
 			}
-			s.applyCacheControl(messages, frozenCount, sessionID)
+			s.applyCacheControl(messages, frozenPrefixLen, sessionID)
 			newBody, err := rebuildBody(messages)
 			if err != nil {
 				slog.Error("重建请求体失败", "session_id", sessionID, "error", err)
@@ -726,14 +722,14 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// 低于阈值但 frozen prefix 命中时仍需 cache_control 处理（D-09）
-			s.applyCacheControl(messages, frozenCount, sessionID)
+			s.applyCacheControl(messages, frozenPrefixLen, sessionID)
 
 			// Phase 5: Eager stubbing on fresh tail below threshold (EAGER-02)
-			if s.EagerStub != nil && frozenCount > 0 {
+			if s.EagerStub != nil && frozenPrefixLen > 0 {
 				freshStubs := 0
 				stickyHits := 0
 				messagesAny := messagesToAny(messages)
-				messagesAny = EagerStubToolResults(messagesAny, frozenCount,
+				messagesAny = EagerStubToolResults(messagesAny, frozenPrefixLen,
 					func(text string) int { return s.TokenCounter.CountTokens(text) },
 					WithStubMemory(s.EagerStub, sessionID),
 					WithStubCounters(&stickyHits, &freshStubs),
@@ -763,7 +759,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				}
 			} else {
 				// 重新 marshal（cache_control 可能改变了 content）
-				if frozenCount > 0 {
+				if frozenPrefixLen > 0 {
 					if newBody, err := rebuildBody(messages); err == nil {
 						r.Body = io.NopCloser(bytes.NewReader(newBody))
 					} else {
