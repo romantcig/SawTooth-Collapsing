@@ -41,8 +41,9 @@ Phase 08 (yesmem-gaps) 已完成 — 对齐 YesMem 压缩管线 4 缺口（B→C
 | 260709-vui | SummaryText 分段感知截断保留 Gotchas/Conclusion + 归档注入预算降级减半重试 | 2026-07-09 | df3baac, 438f903 | [260709-vui-searchandexpand-summarytext-gotchas-conc](./quick/260709-vui-searchandexpand-summarytext-gotchas-conc/) |
 | 260711-12v | 定制 slog.Handler，使终端日志颜色和短时间戳对齐 YesMem，并确保文件日志无 ANSI 编码 | 2026-07-11 | 22eaf65 | [260711-12v-slog-handler-yesmem-ansi](./quick/260711-12v-slog-handler-yesmem-ansi/) |
 | 260711-1he | 将 AGENTS.md 加入提交黑名单，审查剩余改动并在验证后提交推送 GitHub | 2026-07-11 | 01849d6 | [260711-1he-agents-md-github](./quick/260711-1he-agents-md-github/) |
+| 260711-32d | 将日志格式改为时间戳加方括号级别，并仅为级别文字着色 | 2026-07-11 | 21717fe | [260711-32d-log-level-prefix-color](./quick/260711-32d-log-level-prefix-color/) |
 
-Last activity: 2026-07-11 - Completed quick task 260711-1he: AGENTS.md 提交黑名单、剩余改动审查与发布收尾
+Last activity: 2026-07-11 - Completed quick task 260711-32d: 方括号日志级别与仅标签着色
 
 ---
 *Last updated: 2026-07-09*
