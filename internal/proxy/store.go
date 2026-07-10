@@ -20,6 +20,7 @@ type SQLiteStore struct {
 type ArchiveBlock struct {
 	ID              string         `json:"id"`
 	SessionID       string         `json:"session_id"`
+	ContentHash     string         `json:"content_hash"`
 	BlockRangeStart int            `json:"block_range_start"`
 	BlockRangeEnd   int            `json:"block_range_end"`
 	MessageCount    int            `json:"message_count"`
@@ -35,6 +36,7 @@ type ArchiveBlock struct {
 type ArchiveSummary struct {
 	ID              string `json:"id"`
 	SessionID       string `json:"session_id"`
+	ContentHash     string `json:"content_hash"`
 	BlockRangeStart int    `json:"block_range_start"`
 	BlockRangeEnd   int    `json:"block_range_end"`
 	MessageCount    int    `json:"message_count"`
@@ -241,18 +243,32 @@ func (s *SQLiteStore) SaveArchive(block ArchiveBlock) error {
 	if err != nil {
 		return fmt.Errorf("序列化消息失败: %w", err)
 	}
+	if block.ContentHash == "" {
+		block.ContentHash, err = archiveContentHash(block.Messages)
+		if err != nil {
+			return err
+		}
+	}
 
-	_, err = tx.Exec(
+	result, err := tx.Exec(
 		`INSERT INTO archive_blocks
 		 (id, session_id, block_range_start, block_range_end,
-		  message_count, estimated_tokens, messages_json, summary_text, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+		  message_count, estimated_tokens, messages_json, summary_text, created_at, content_hash)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
+		 ON CONFLICT DO NOTHING`,
 		block.ID, block.SessionID, block.BlockRangeStart, block.BlockRangeEnd,
 		block.MessageCount, block.EstimatedTokens,
-		string(messagesJSON), block.SummaryText,
+		string(messagesJSON), block.SummaryText, block.ContentHash,
 	)
 	if err != nil {
 		return fmt.Errorf("插入 archive_block 失败: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("读取 archive_block 插入结果失败: %w", err)
+	}
+	if inserted == 0 {
+		return tx.Commit()
 	}
 
 	// 逐条插入关键词（触发器自动同步 FTS5）
@@ -317,7 +333,7 @@ func (s *SQLiteStore) SearchArchives(query string, limit int) ([]ArchiveSummary,
 		     FROM archive_keywords_fts
 		     WHERE archive_keywords_fts MATCH ?
 		 )
-		 SELECT a.id, a.session_id, a.block_range_start, a.block_range_end,
+		 SELECT a.id, a.session_id, COALESCE(a.content_hash, ''), a.block_range_start, a.block_range_end,
 		        a.message_count, a.estimated_tokens, a.summary_text, a.messages_json, a.created_at
 		 FROM archive_blocks a
 		 JOIN archive_keywords k ON k.block_id = a.id
@@ -336,7 +352,7 @@ func (s *SQLiteStore) SearchArchives(query string, limit int) ([]ArchiveSummary,
 	for rows.Next() {
 		var summary ArchiveSummary
 		if err := rows.Scan(
-			&summary.ID, &summary.SessionID,
+			&summary.ID, &summary.SessionID, &summary.ContentHash,
 			&summary.BlockRangeStart, &summary.BlockRangeEnd,
 			&summary.MessageCount, &summary.EstimatedTokens,
 			&summary.SummaryText, &summary.MessagesJSON, &summary.CreatedAt,

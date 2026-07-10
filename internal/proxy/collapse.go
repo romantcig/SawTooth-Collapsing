@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -138,6 +139,7 @@ func buildArchiveBlock(messages []Message, cutoffIdx int, tc *TokenCounter, sess
 	}
 
 	estimatedTokens := tc.CountMessagesTokens(messages)
+	contentHash, _ := archiveContentHash(messages)
 
 	summaryText := formatArchiveBlockText(
 		1, cutoffIdx-1,
@@ -148,6 +150,7 @@ func buildArchiveBlock(messages []Message, cutoffIdx int, tc *TokenCounter, sess
 	block := ArchiveBlock{
 		ID:              uuid.Must(uuid.NewRandom()).String(),
 		SessionID:       sessionID,
+		ContentHash:     contentHash,
 		BlockRangeStart: 1,
 		BlockRangeEnd:   cutoffIdx - 1,
 		MessageCount:    cutoffIdx,
@@ -158,6 +161,16 @@ func buildArchiveBlock(messages []Message, cutoffIdx int, tc *TokenCounter, sess
 		CreatedAt:       "",
 	}
 	return block
+}
+
+// archiveContentHash 对项目稳定的 []Message JSON 表示计算 SHA-256 指纹。
+func archiveContentHash(messages []Message) (string, error) {
+	canonical, err := json.Marshal(messages)
+	if err != nil {
+		return "", fmt.Errorf("序列化 archive canonical messages 失败: %w", err)
+	}
+	sum := sha256.Sum256(canonical)
+	return fmt.Sprintf("%x", sum), nil
 }
 
 // blankFirstMessage 创建 messages 的 shallow copy，将第一条消息的 content
