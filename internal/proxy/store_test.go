@@ -1,10 +1,120 @@
 package proxy
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestSQLiteStoreMigrationPreservesLegacyDuplicateRows(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("打开旧库失败: %v", err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE archive_blocks (
+		id TEXT PRIMARY KEY,
+		session_id TEXT NOT NULL,
+		block_range_start INTEGER NOT NULL,
+		block_range_end INTEGER NOT NULL,
+		message_count INTEGER NOT NULL,
+		estimated_tokens INTEGER NOT NULL,
+		messages_json TEXT NOT NULL,
+		summary_text TEXT NOT NULL,
+		created_at TEXT NOT NULL
+	);
+	INSERT INTO archive_blocks VALUES
+		('legacy-a', 'session-1', 1, 2, 2, 10, '[{"role":"user","content":"a"}]', 'summary', '2026-01-01'),
+		('legacy-b', 'session-1', 1, 2, 2, 10, '[{"role":"user","content":"a"}]', 'summary', '2026-01-02');`)
+	if err != nil {
+		legacy.Close()
+		t.Fatalf("构造旧 schema 失败: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("关闭旧库失败: %v", err)
+	}
+
+	for open := 1; open <= 2; open++ {
+		store, err := NewSQLiteStore(dbPath)
+		if err != nil {
+			t.Fatalf("第 %d 次打开旧库失败: %v", open, err)
+		}
+
+		var count, nullHashes int
+		if err := store.db.QueryRow(`SELECT COUNT(*), COUNT(*) FILTER (WHERE content_hash IS NULL) FROM archive_blocks`).Scan(&count, &nullHashes); err != nil {
+			store.Close()
+			t.Fatalf("读取迁移后旧行失败: %v", err)
+		}
+		if count != 2 || nullHashes != 2 {
+			store.Close()
+			t.Fatalf("迁移改变旧行: count=%d null_hashes=%d, want 2/2", count, nullHashes)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("第 %d 次关闭迁移库失败: %v", open, err)
+		}
+	}
+}
+
+func TestNewSQLiteStoreMigrationErrorDoesNotDeleteDatabaseFiles(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "migration-error.db")
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("打开迁移错误 fixture 失败: %v", err)
+	}
+	legacy.SetMaxOpenConns(1)
+	if _, err := legacy.Exec(`PRAGMA journal_mode=WAL`); err != nil {
+		legacy.Close()
+		t.Fatalf("启用 WAL 失败: %v", err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE archive_blocks (
+		id TEXT PRIMARY KEY,
+		session_id TEXT NOT NULL,
+		block_range_start INTEGER NOT NULL,
+		block_range_end INTEGER NOT NULL,
+		message_count INTEGER NOT NULL,
+		estimated_tokens INTEGER NOT NULL,
+		messages_json TEXT NOT NULL,
+		summary_text TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		content_hash TEXT
+	);
+	INSERT INTO archive_blocks VALUES
+		('duplicate-a', 'session-1', 1, 2, 2, 10, '[]', 'summary', '2026-01-01', 'same-hash'),
+		('duplicate-b', 'session-1', 1, 2, 2, 10, '[]', 'summary', '2026-01-02', 'same-hash');`)
+	if err != nil {
+		legacy.Close()
+		t.Fatalf("构造迁移错误 fixture 失败: %v", err)
+	}
+	defer legacy.Close()
+
+	for _, path := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("迁移前文件不存在 %s: %v", path, err)
+		}
+	}
+
+	store, err := NewSQLiteStore(dbPath)
+	if store != nil {
+		store.Close()
+	}
+	if err == nil {
+		t.Fatal("唯一索引迁移应因重复非空 hash 失败")
+	}
+
+	for _, path := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("普通迁移错误删除了 %s: %v", path, err)
+		}
+	}
+	var count int
+	if err := legacy.QueryRow(`SELECT COUNT(*) FROM archive_blocks`).Scan(&count); err != nil {
+		t.Fatalf("迁移失败后读取原库失败: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("迁移失败后原库行数=%d, want 2", count)
+	}
+}
 
 // ---- SearchArchives 多词排序测试 ----
 
