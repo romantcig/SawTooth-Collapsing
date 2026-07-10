@@ -30,7 +30,8 @@ type ArchiveBlock struct {
 	Keywords         []KeywordEntry `json:"keywords"`
 }
 
-// ArchiveSummary SearchArchives 返回的轻量结果——不含 Messages 字段。
+// ArchiveSummary SearchArchives 返回的结果——不反序列化 Messages，
+// 原始 messages_json 以字符串携带，由重展开侧按需反序列化（预算允许时完整展开）。
 type ArchiveSummary struct {
 	ID              string `json:"id"`
 	SessionID       string `json:"session_id"`
@@ -39,6 +40,7 @@ type ArchiveSummary struct {
 	MessageCount    int    `json:"message_count"`
 	EstimatedTokens int    `json:"estimated_tokens"`
 	SummaryText     string `json:"summary_text"`
+	MessagesJSON    string `json:"messages_json"`
 	CreatedAt       string `json:"created_at"`
 }
 
@@ -268,7 +270,7 @@ func (s *SQLiteStore) SearchArchives(query string, limit int) ([]ArchiveSummary,
 		     WHERE archive_keywords_fts MATCH ?
 		 )
 		 SELECT a.id, a.session_id, a.block_range_start, a.block_range_end,
-		        a.message_count, a.estimated_tokens, a.summary_text, a.created_at
+		        a.message_count, a.estimated_tokens, a.summary_text, a.messages_json, a.created_at
 		 FROM archive_blocks a
 		 JOIN archive_keywords k ON k.block_id = a.id
 		 JOIN matched fts ON fts.rowid = k.id
@@ -289,7 +291,7 @@ func (s *SQLiteStore) SearchArchives(query string, limit int) ([]ArchiveSummary,
 			&summary.ID, &summary.SessionID,
 			&summary.BlockRangeStart, &summary.BlockRangeEnd,
 			&summary.MessageCount, &summary.EstimatedTokens,
-			&summary.SummaryText, &summary.CreatedAt,
+			&summary.SummaryText, &summary.MessagesJSON, &summary.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("扫描搜索结果失败: %w", err)
 		}

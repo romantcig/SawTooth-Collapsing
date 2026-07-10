@@ -124,6 +124,8 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 	}
 	tokenUsed := 0
 	var injected []Message
+	// 同 session 完整展开去重：一个 session 只完整展开一次，预算留给不同 session 的块
+	expandedSessions := make(map[string]bool)
 
 	for i, summary := range summaries {
 		// 分段感知截断到 2000 字符——优先保留 Gotchas/Conclusion
@@ -135,34 +137,61 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 		// 估算 token 消耗（含前缀 "[Retrieved archive #n — ...]\n\n"）
 		prefix := fmt.Sprintf("[Retrieved archive #%d — %d-%d, ~%d tokens]\n\n",
 			i+1, summary.BlockRangeStart, summary.BlockRangeEnd, summary.EstimatedTokens)
-		cost := tc.CountTokens(prefix + truncated)
 
-		// Budget 门控：超出预算则先按 1000→500 减半降级重试，降到底仍装不下才停止注入
-		if budget != nil && tokenUsed+cost > maxBudget {
-			fits := false
-			for _, level := range []int{1000, 500} {
-				truncated = truncateSummaryText(summary.SummaryText, level)
-				cost = tc.CountTokens(prefix + truncated)
-				if tokenUsed+cost <= maxBudget {
-					fits = true
+		// 完整展开尝试：messages_json 可用且剩余预算装得下时，摘要 header 后附
+		// 完整原始消息（LLM 先看摘要判断相关性，需要细节再往下翻）；
+		// JSON 损坏、预算不足、同 session 已展开——任一不满足即落回 summary_text 路径。
+		// 与 summary 路径不同，本分支在 budget == nil 时也按 maxBudget 门控——
+		// 完整消息可达数万 token，无约束注入会挤爆上下文。
+		payload, fullExpanded := "", false
+		if summary.MessagesJSON != "" && !expandedSessions[summary.SessionID] {
+			headCost := tc.CountTokens(prefix + truncated)
+			remaining := maxBudget - tokenUsed - headCost
+			if remaining > 0 {
+				// rune 预算 ≈ 2×token 预算：粗剪防格式化浪费，真门控靠下方 CountTokens 实测
+				if full, ok := formatFullMessages(summary.MessagesJSON, remaining*2); ok {
+					candidate := prefix + truncated + "\n\n--- Full messages ---\n" + full
+					if cost := tc.CountTokens(candidate); tokenUsed+cost <= maxBudget {
+						payload = candidate
+						tokenUsed += cost
+						fullExpanded = true
+						expandedSessions[summary.SessionID] = true
+					}
+				}
+			}
+		}
+
+		if payload == "" {
+			cost := tc.CountTokens(prefix + truncated)
+
+			// Budget 门控：超出预算则先按 1000→500 减半降级重试，降到底仍装不下才停止注入
+			if budget != nil && tokenUsed+cost > maxBudget {
+				fits := false
+				for _, level := range []int{1000, 500} {
+					truncated = truncateSummaryText(summary.SummaryText, level)
+					cost = tc.CountTokens(prefix + truncated)
+					if tokenUsed+cost <= maxBudget {
+						fits = true
+						break
+					}
+				}
+				if !fits {
+					slog.Info("archive 注入预算耗尽",
+						"injected_count", i,
+						"total_summaries", len(summaries),
+						"token_used", tokenUsed,
+						"max_budget", maxBudget,
+						"degraded_levels", "1000,500",
+					)
 					break
 				}
 			}
-			if !fits {
-				slog.Info("archive 注入预算耗尽",
-					"injected_count", i,
-					"total_summaries", len(summaries),
-					"token_used", tokenUsed,
-					"max_budget", maxBudget,
-					"degraded_levels", "1000,500",
-				)
-				break
-			}
+			tokenUsed += cost
+			payload = prefix + truncated
 		}
-		tokenUsed += cost
 
 		// 构造注入消息
-		contentJSON, _ := json.Marshal(prefix + truncated)
+		contentJSON, _ := json.Marshal(payload)
 		injected = append(injected, Message{
 			Role:    "user",
 			Content: contentJSON,
@@ -172,6 +201,7 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 			"session_id", summary.SessionID,
 			"block_id", summary.ID,
 			"range", fmt.Sprintf("%d-%d", summary.BlockRangeStart, summary.BlockRangeEnd),
+			"full_expansion", fullExpanded,
 		)
 	}
 
@@ -437,6 +467,113 @@ func truncateSummaryText(s string, maxRunes int) string {
 	}
 	flushOmitted()
 	return sb.String()
+}
+
+// 完整展开的消息级截断上限。
+const (
+	fullExpandMaxMsgRunes     = 2000 // 单条消息文本上限
+	fullExpandToolResultRunes = 200  // 单个 tool_result 上限——常含整页文件内容，狠截防止吃光预算
+)
+
+// formatFullMessages 将 archive 的 messages_json 反序列化为折叠前的原始消息，
+// 格式化为纯文本（"[role]: ..." 逐条拼接）。原始消息含 tool_use/tool_result
+// 配对结构，不能按原样插回消息数组（API 400），只能文本化后随注入消息携带。
+// 从后往前贪心装填 rune 预算（最近的对话最重要），输出按时间正序，
+// 装不下的头部消息以一行省略标注代替（标注行不计预算，真门控在调用方 CountTokens）。
+// JSON 损坏、"null" 或无有效文本时返回 ("", false)，调用方降级 summary_text。
+func formatFullMessages(messagesJSON string, maxRunes int) (string, bool) {
+	var msgs []Message
+	if err := json.Unmarshal([]byte(messagesJSON), &msgs); err != nil {
+		return "", false
+	}
+	if len(msgs) == 0 {
+		return "", false
+	}
+
+	var parts []string
+	used := 0
+	omitted := 0
+	for i := len(msgs) - 1; i >= 0; i-- {
+		text := formatMessageText(msgs[i])
+		if text == "" {
+			continue
+		}
+		line := "[" + msgs[i].Role + "]: " + truncateRunes(text, fullExpandMaxMsgRunes)
+		n := countRunes(line) + 1 // +1 为拼接换行
+		if used+n > maxRunes {
+			omitted = i + 1
+			break
+		}
+		used += n
+		parts = append(parts, line)
+	}
+	if len(parts) == 0 {
+		return "", false
+	}
+
+	// 反转回时间正序
+	for l, r := 0, len(parts)-1; l < r; l, r = l+1, r-1 {
+		parts[l], parts[r] = parts[r], parts[l]
+	}
+	result := strings.Join(parts, "\n")
+	if omitted > 0 {
+		result = fmt.Sprintf("[...%d earlier messages omitted...]\n", omitted) + result
+	}
+	return result, true
+}
+
+// formatMessageText 将单条消息的 content blocks 压成纯文本。
+// text 原样保留，tool_use 压成一行 "[tool: Name]"，tool_result 截断后带 "[result]" 前缀。
+// thinking 跳过——内部推理文本冗长且对召回无价值。
+func formatMessageText(msg Message) string {
+	blocks, _ := parseContent(msg.Content)
+	var sb strings.Builder
+	for _, b := range blocks {
+		var piece string
+		switch b.Type {
+		case "text":
+			piece = b.Text
+		case "tool_use":
+			piece = "[tool: " + b.Name + "]"
+		case "tool_result":
+			if t := toolResultText(b.Content); t != "" {
+				piece = "[result] " + truncateRunes(t, fullExpandToolResultRunes)
+			}
+		}
+		if piece == "" {
+			continue
+		}
+		if sb.Len() > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString(piece)
+	}
+	return sb.String()
+}
+
+// toolResultText 从 tool_result 的 Content(any) 提取文本。
+// API 形态两种：字符串，或嵌套 content blocks（[]any 内 map，取 type=="text" 的 text）。
+func toolResultText(content any) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []any:
+		var sb strings.Builder
+		for _, item := range c {
+			m, ok := item.(map[string]any)
+			if !ok || m["type"] != "text" {
+				continue
+			}
+			if txt, ok := m["text"].(string); ok && txt != "" {
+				if sb.Len() > 0 {
+					sb.WriteString("\n")
+				}
+				sb.WriteString(txt)
+			}
+		}
+		return sb.String()
+	}
+	return ""
 }
 
 // extractDSKeywords 从文本中提取所有 deep_search('...') 提示中的关键词。

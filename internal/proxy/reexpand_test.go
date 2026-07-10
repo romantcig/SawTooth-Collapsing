@@ -196,3 +196,294 @@ func TestSearchAndExpandBudgetExhaustedStopsInjection(t *testing.T) {
 		t.Fatalf("expected no injection with exhausted budget, got %d messages (want %d)", len(result), len(messages))
 	}
 }
+
+// ---- formatFullMessages 完整展开格式化测试 ----
+
+// mustJSON 将 []Message 序列化为 messages_json 字符串（复刻 SaveArchive 的写入形态）。
+func mustJSON(t *testing.T, msgs []Message) string {
+	t.Helper()
+	data, err := json.Marshal(msgs)
+	if err != nil {
+		t.Fatalf("marshal messages: %v", err)
+	}
+	return string(data)
+}
+
+// 正常路径：string content 与 blocks content 混合，输出 "[role]: 文本" 按时间正序。
+func TestFormatFullMessagesBasic(t *testing.T) {
+	msgs := []Message{
+		{Role: "user", Content: json.RawMessage(`"first question"`)},
+		{Role: "assistant", Content: json.RawMessage(`[{"type":"text","text":"second answer"}]`)},
+	}
+	got, ok := formatFullMessages(mustJSON(t, msgs), 100000)
+	if !ok {
+		t.Fatal("expected ok=true for valid messages")
+	}
+	wantUser := "[user]: first question"
+	wantAsst := "[assistant]: second answer"
+	if !strings.Contains(got, wantUser) || !strings.Contains(got, wantAsst) {
+		t.Errorf("missing formatted lines, got: %q", got)
+	}
+	if strings.Index(got, wantUser) > strings.Index(got, wantAsst) {
+		t.Errorf("messages should be in chronological order, got: %q", got)
+	}
+}
+
+// JSON 损坏、"null"（Messages 为 nil 入库形态）、空数组均返回 ok=false。
+func TestFormatFullMessagesInvalidInputs(t *testing.T) {
+	for _, tc := range []struct{ name, input string }{
+		{"corrupt", `{not valid json`},
+		{"null", `null`},
+		{"empty", `[]`},
+	} {
+		if got, ok := formatFullMessages(tc.input, 100000); ok {
+			t.Errorf("%s: expected ok=false, got ok=true with %q", tc.name, got)
+		}
+	}
+}
+
+// tool_use 压成一行，tool_result 两种形态（string / 嵌套 blocks）均提取，超长截到 200。
+func TestFormatFullMessagesToolBlocks(t *testing.T) {
+	longResult := strings.Repeat("x", 500)
+	msgs := []Message{
+		{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"a.go"}}]`)},
+		{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"t1","content":"` + longResult + `"}]`)},
+		{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"t2","content":[{"type":"text","text":"nested result text"}]}]`)},
+	}
+	got, ok := formatFullMessages(mustJSON(t, msgs), 100000)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if !strings.Contains(got, "[tool: Read]") {
+		t.Errorf("tool_use should compress to [tool: Name], got: %q", got)
+	}
+	if !strings.Contains(got, "nested result text") {
+		t.Errorf("nested tool_result text should be extracted, got: %q", got)
+	}
+	if strings.Contains(got, longResult) {
+		t.Error("500-rune tool_result should be truncated to 200")
+	}
+	if !strings.Contains(got, strings.Repeat("x", 200)+"…") {
+		t.Errorf("truncated tool_result should keep first 200 runes + ellipsis, got: %q", got)
+	}
+}
+
+// rune 预算不足时从后往前装填：最新消息保留，最旧消息省略并有标注，输出仍为正序。
+func TestFormatFullMessagesBudgetKeepsRecent(t *testing.T) {
+	pad := strings.Repeat("p", 90)
+	msgs := []Message{
+		{Role: "user", Content: json.RawMessage(`"oldest ` + pad + `"`)},
+		{Role: "assistant", Content: json.RawMessage(`"middle ` + pad + `"`)},
+		{Role: "user", Content: json.RawMessage(`"newest ` + pad + `"`)},
+	}
+	// 每行约 105 runes：预算 250 装下 newest+middle，oldest 装不下
+	got, ok := formatFullMessages(mustJSON(t, msgs), 250)
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+	if strings.Contains(got, "oldest") {
+		t.Errorf("oldest message should be dropped under budget, got: %q", got)
+	}
+	if !strings.Contains(got, "middle") || !strings.Contains(got, "newest") {
+		t.Errorf("recent messages should be kept, got: %q", got)
+	}
+	if !strings.Contains(got, "[...1 earlier messages omitted...]") {
+		t.Errorf("expected omission marker, got: %q", got)
+	}
+	if strings.Index(got, "middle") > strings.Index(got, "newest") {
+		t.Errorf("output should stay chronological, got: %q", got)
+	}
+}
+
+// ---- SearchAndExpand 完整展开集成测试 ----
+
+// seedFullExpandStore 播种一个带原始 Messages 的 archive block。
+// 原始消息含独特文本 "quokka"（summary 中不出现），用于断言完整展开确实注入了原文。
+func seedFullExpandStore(t *testing.T) (*SQLiteStore, []Message, *TokenCounter) {
+	t.Helper()
+
+	tc, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	block := ArchiveBlock{
+		ID: "block-full", SessionID: "s1",
+		BlockRangeStart: 1, BlockRangeEnd: 2,
+		MessageCount: 2, EstimatedTokens: 80,
+		Messages: []Message{
+			{Role: "user", Content: json.RawMessage(`"how does the quokka module parse flimflam input"`)},
+			{Role: "assistant", Content: json.RawMessage(`"the quokka module requires quoted flimflam everywhere"`)},
+		},
+		SummaryText: "archive summary about flimflam parsing",
+		Keywords:    []KeywordEntry{{Word: "flimflam", Source: "user_message"}},
+	}
+	if err := store.SaveArchive(block); err != nil {
+		t.Fatalf("SaveArchive failed: %v", err)
+	}
+
+	messages := []Message{
+		{Role: "user", Content: json.RawMessage(`"tell me about flimflam"`)},
+	}
+	return store, messages, tc
+}
+
+// injectedTextAt 取注入结果第 idx 条消息的字符串内容。
+func injectedTextAt(t *testing.T, result []Message, idx int) string {
+	t.Helper()
+	var text string
+	if err := json.Unmarshal(result[idx].Content, &text); err != nil {
+		t.Fatalf("unmarshal injected content at %d: %v", idx, err)
+	}
+	return text
+}
+
+// 预算充足 → 注入完整原始消息，summary header 与全文分隔符同时在场。
+func TestSearchAndExpandFullExpansion(t *testing.T) {
+	store, messages, tc := seedFullExpandStore(t)
+
+	budget := &Budget{ReExpansion: 100000}
+	result := SearchAndExpand(messages, store, 100000, tc, budget)
+	if len(result) != len(messages)+1 {
+		t.Fatalf("expected 1 injected message, got %d total (want %d)", len(result), len(messages)+1)
+	}
+	text := injectedTextAt(t, result, 1)
+	for _, want := range []string{
+		"[Retrieved archive #1",
+		"archive summary about flimflam parsing",
+		"--- Full messages ---",
+		"[user]: how does the quokka module parse flimflam input",
+		"[assistant]: the quokka module requires quoted flimflam everywhere",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("injected text missing %q, got: %q", want, text)
+		}
+	}
+}
+
+// 预算只够 summary → 完整展开被门控拒绝，降级注入纯 summary。
+func TestSearchAndExpandFullExpansionBudgetFallsBack(t *testing.T) {
+	store, messages, tc := seedFullExpandStore(t)
+
+	// 复刻注入循环的 summary 形态成本，预算设为略高于它——完整版必装不下
+	prefix := fmt.Sprintf("[Retrieved archive #%d — %d-%d, ~%d tokens]\n\n", 1, 1, 2, 80)
+	summaryCost := tc.CountTokens(prefix + truncateSummaryText("archive summary about flimflam parsing", 2000))
+	budget := &Budget{ReExpansion: summaryCost + 5}
+
+	result := SearchAndExpand(messages, store, 100000, tc, budget)
+	if len(result) != len(messages)+1 {
+		t.Fatalf("expected 1 injected message, got %d total (want %d)", len(result), len(messages)+1)
+	}
+	text := injectedTextAt(t, result, 1)
+	if strings.Contains(text, "--- Full messages ---") {
+		t.Errorf("full expansion should be rejected under tight budget, got: %q", text)
+	}
+	if !strings.Contains(text, "archive summary about flimflam parsing") {
+		t.Errorf("summary fallback should still inject, got: %q", text)
+	}
+}
+
+// messages_json 损坏 → 该块降级 summary，注入不中断。
+func TestSearchAndExpandFullExpansionCorruptJSONFallsBack(t *testing.T) {
+	store, messages, tc := seedFullExpandStore(t)
+
+	if _, err := store.db.Exec(`UPDATE archive_blocks SET messages_json = '{corrupt' WHERE id = 'block-full'`); err != nil {
+		t.Fatalf("corrupt messages_json: %v", err)
+	}
+
+	budget := &Budget{ReExpansion: 100000}
+	result := SearchAndExpand(messages, store, 100000, tc, budget)
+	if len(result) != len(messages)+1 {
+		t.Fatalf("expected 1 injected message, got %d total (want %d)", len(result), len(messages)+1)
+	}
+	text := injectedTextAt(t, result, 1)
+	if strings.Contains(text, "--- Full messages ---") {
+		t.Errorf("corrupt JSON should degrade to summary, got: %q", text)
+	}
+	if !strings.Contains(text, "archive summary about flimflam parsing") {
+		t.Errorf("summary fallback should still inject, got: %q", text)
+	}
+}
+
+// 同 session 两块命中 → 只有排名第一的块完整展开，第二块走 summary。
+func TestSearchAndExpandFullExpansionSameSessionOnce(t *testing.T) {
+	tc, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore failed: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	// block-first 匹配 flimflam+warbler 两词排前，block-second 只匹配 flimflam；
+	// 噪声块保证目标词 IDF 为正（同 store_test.go 的排序测试构造）
+	blocks := []ArchiveBlock{
+		{
+			ID: "block-first", SessionID: "s1",
+			BlockRangeStart: 1, BlockRangeEnd: 2,
+			MessageCount: 2, EstimatedTokens: 50,
+			Messages: []Message{
+				{Role: "user", Content: json.RawMessage(`"first block original text"`)},
+			},
+			SummaryText: "first summary",
+			Keywords: []KeywordEntry{
+				{Word: "flimflam", Source: "user_message"},
+				{Word: "warbler", Source: "user_message"},
+			},
+		},
+		{
+			ID: "block-second", SessionID: "s1",
+			BlockRangeStart: 3, BlockRangeEnd: 4,
+			MessageCount: 2, EstimatedTokens: 50,
+			Messages: []Message{
+				{Role: "user", Content: json.RawMessage(`"second block original text"`)},
+			},
+			SummaryText: "second summary",
+			Keywords:    []KeywordEntry{{Word: "flimflam", Source: "user_message"}},
+		},
+		{
+			ID: "block-noise", SessionID: "s2",
+			BlockRangeStart: 5, BlockRangeEnd: 6,
+			MessageCount: 2, EstimatedTokens: 50,
+			SummaryText: "noise",
+			Keywords: []KeywordEntry{
+				{Word: "gamma", Source: "user_message"},
+				{Word: "delta", Source: "user_message"},
+				{Word: "epsilon", Source: "user_message"},
+			},
+		},
+	}
+	for _, b := range blocks {
+		if err := store.SaveArchive(b); err != nil {
+			t.Fatalf("SaveArchive(%s) failed: %v", b.ID, err)
+		}
+	}
+
+	messages := []Message{
+		{Role: "user", Content: json.RawMessage(`"tell me about flimflam warbler"`)},
+	}
+	budget := &Budget{ReExpansion: 100000}
+	result := SearchAndExpand(messages, store, 100000, tc, budget)
+	if len(result) != len(messages)+2 {
+		t.Fatalf("expected 2 injected messages, got %d total (want %d)", len(result), len(messages)+2)
+	}
+
+	first := injectedTextAt(t, result, 1)
+	second := injectedTextAt(t, result, 2)
+	if !strings.Contains(first, "--- Full messages ---") || !strings.Contains(first, "first block original text") {
+		t.Errorf("top-ranked block should fully expand, got: %q", first)
+	}
+	if strings.Contains(second, "--- Full messages ---") {
+		t.Errorf("same-session second block should stay summary-only, got: %q", second)
+	}
+	if !strings.Contains(second, "second summary") {
+		t.Errorf("second block should inject its summary, got: %q", second)
+	}
+}
