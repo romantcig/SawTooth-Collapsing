@@ -29,7 +29,38 @@ const (
 
 type agentParentRelation string
 
-const agentParentRelationUnavailable agentParentRelation = "unavailable"
+const (
+	agentParentRelationUnavailable agentParentRelation = "unavailable"
+	agentParentRelationAvailable   agentParentRelation = "available"
+)
+
+type agentRole string
+
+const (
+	agentRoleMain     agentRole = "main"
+	agentRoleSubagent agentRole = "subagent"
+	agentRoleUnknown  agentRole = "unknown"
+)
+
+type agentClassificationReason string
+
+const (
+	agentReasonEmptyMessages      agentClassificationReason = "empty_messages"
+	agentReasonSDKTSCompatibility agentClassificationReason = "sdk_ts_compatibility"
+	agentReasonDeepSeekModel      agentClassificationReason = "deepseek_model"
+	agentReasonClaudeModel        agentClassificationReason = "claude_model"
+	agentReasonHaikuCompatibility agentClassificationReason = "haiku_compatibility"
+	agentReasonNoVerifiedMarker   agentClassificationReason = "no_verified_marker"
+)
+
+const parentSessionHeader = "X-Claude-Code-Parent-Session-Id"
+
+type agentClassification struct {
+	Role            agentRole
+	Reason          agentClassificationReason
+	ParentSessionID string
+	ParentAvailable bool
+}
 
 // agentRequestFeatures 只保存代理分类所需的脱敏事实。
 // 字段类型限定为布尔或受限枚举，避免 prompt、消息正文、凭证和完整 ID 进入日志或 fixture。
@@ -56,7 +87,13 @@ func extractAgentRequestFeatures(r *http.Request, bodyMap map[string]json.RawMes
 	_, features.ThinkingPresent = bodyMap["thinking"]
 	_, features.MetadataPresent = bodyMap["metadata"]
 	if r != nil {
-		features.SessionHeaderPresent = r.Header.Get("X-Claude-Code-Session-Id") != ""
+		sessionID := strings.TrimSpace(r.Header.Get("X-Claude-Code-Session-Id"))
+		parentID := strings.TrimSpace(r.Header.Get(parentSessionHeader))
+		features.SessionHeaderPresent = sessionID != ""
+		features.ParentMarkerPresent = parentID != ""
+		if sessionID != "" && parentID != "" && parentID != sessionID {
+			features.ParentRelation = agentParentRelationAvailable
+		}
 	}
 
 	systemRaw, ok := bodyMap["system"]
@@ -66,6 +103,33 @@ func extractAgentRequestFeatures(r *http.Request, bodyMap map[string]json.RawMes
 	features.SystemPresent = true
 	features.SystemShape, features.SDKTSMarkerPresent = inspectAgentSystem(systemRaw)
 	return features
+}
+
+func classifyAgentFeatures(features agentRequestFeatures) agentClassification {
+	switch {
+	case !features.MessagesPresent:
+		return agentClassification{Role: agentRoleUnknown, Reason: agentReasonEmptyMessages}
+	case features.SDKTSMarkerPresent:
+		return agentClassification{Role: agentRoleSubagent, Reason: agentReasonSDKTSCompatibility}
+	case features.ModelFamily == agentModelFamilyDeepSeek:
+		return agentClassification{Role: agentRoleMain, Reason: agentReasonDeepSeekModel}
+	case features.ModelFamily == agentModelFamilyClaudeHaiku:
+		return agentClassification{Role: agentRoleSubagent, Reason: agentReasonHaikuCompatibility}
+	case features.ModelFamily == agentModelFamilyClaude && features.ThinkingPresent:
+		return agentClassification{Role: agentRoleMain, Reason: agentReasonClaudeModel}
+	default:
+		return agentClassification{Role: agentRoleUnknown, Reason: agentReasonNoVerifiedMarker}
+	}
+}
+
+func classifyAgentRequest(r *http.Request, bodyMap map[string]json.RawMessage, messages []Message) agentClassification {
+	features := extractAgentRequestFeatures(r, bodyMap, messages)
+	classification := classifyAgentFeatures(features)
+	if features.ParentRelation == agentParentRelationAvailable {
+		classification.ParentSessionID = strings.TrimSpace(r.Header.Get(parentSessionHeader))
+		classification.ParentAvailable = true
+	}
+	return classification
 }
 
 func extractAgentModelFamily(raw json.RawMessage) agentModelFamily {
@@ -153,63 +217,10 @@ func extractSessionID(r *http.Request) string {
 	return sid
 }
 
-// isSubagent 检测当前请求是否来自 CC subagent。
-// Phase 5 实现三重检测（OR 逻辑）：
-//   Check A: system 字段包含 "cc_entrypoint=sdk-ts"（sdk-ts entrypoint）
-//   Check B: model 字段包含 "haiku"（Haiku 模型）
-//   Check C: 缺少 thinking 字段（无扩展思考）
-// 参数 bodyMap 是解析后的请求体 JSON，messages 是提取后的消息数组。
+// isSubagent 仅保留给旧调用点；主管线使用 agentClassification 三态结果。
 func isSubagent(bodyMap map[string]json.RawMessage, messages []Message) bool {
-	// 边缘情况：空消息不是 subagent
-	if len(messages) == 0 {
-		return false
-	}
-
-	// Check A — sdk-ts entrypoint（billing header 检测）
-	if systemRaw, ok := bodyMap["system"]; ok {
-		// 尝试解析为数组格式: [{"type": "text", "text": "cc_entrypoint=sdk-ts"}]
-		var systemArray []json.RawMessage
-		if err := json.Unmarshal(systemRaw, &systemArray); err == nil {
-			for _, elem := range systemArray {
-				var elemMap map[string]json.RawMessage
-				if err := json.Unmarshal(elem, &elemMap); err == nil {
-					if textRaw, ok := elemMap["text"]; ok {
-						var text string
-						if err := json.Unmarshal(textRaw, &text); err == nil {
-							if strings.Contains(text, "cc_entrypoint=sdk-ts") {
-								return true
-							}
-						}
-					}
-				}
-			}
-		} else {
-			// 字符串格式: "cc_entrypoint=sdk-ts ..."
-			var systemStr string
-			if err := json.Unmarshal(systemRaw, &systemStr); err == nil {
-				if strings.Contains(systemStr, "cc_entrypoint=sdk-ts") {
-					return true
-				}
-			}
-		}
-	}
-
-	// Check B — Haiku 模型
-	if modelRaw, ok := bodyMap["model"]; ok {
-		var model string
-		if err := json.Unmarshal(modelRaw, &model); err == nil {
-			if strings.Contains(model, "haiku") {
-				return true
-			}
-		}
-	}
-
-	// Check C — 无 thinking 字段（无扩展思考 = subagent）
-	if _, ok := bodyMap["thinking"]; !ok {
-		return true
-	}
-
-	return false
+	features := extractAgentRequestFeatures(nil, bodyMap, messages)
+	return classifyAgentFeatures(features).Role == agentRoleSubagent
 }
 
 // extractModelFromBody 从请求体 JSON 中提取 model 字段值。

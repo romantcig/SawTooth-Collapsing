@@ -435,14 +435,14 @@ func TestIsSubagent_CheckB_HaikuSubstring(t *testing.T) {
 	}
 }
 
-func TestIsSubagent_CheckC_NoThinking(t *testing.T) {
-	// Check C: 缺少 thinking 字段
+func TestIsSubagent_NoThinkingDoesNotDecideRole(t *testing.T) {
+	// 缺少 thinking 字段不能单独决定子代理身份。
 	bodyMap := map[string]json.RawMessage{
 		"model": json.RawMessage(`"claude-sonnet-4-20250514"`),
 	}
 	messages := []Message{{Role: "user", Content: json.RawMessage(`"hello"`)}}
-	if !isSubagent(bodyMap, messages) {
-		t.Error("无 thinking 字段应返回 true")
+	if isSubagent(bodyMap, messages) {
+		t.Error("无 thinking 字段不得单独判为 subagent")
 	}
 }
 
