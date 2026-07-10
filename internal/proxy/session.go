@@ -4,9 +4,123 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 )
+
+type agentModelFamily string
+
+const (
+	agentModelFamilyUnknown     agentModelFamily = "unknown"
+	agentModelFamilyDeepSeek    agentModelFamily = "deepseek"
+	agentModelFamilyClaude      agentModelFamily = "claude"
+	agentModelFamilyClaudeHaiku agentModelFamily = "claude_haiku"
+)
+
+type agentSystemShape string
+
+const (
+	agentSystemShapeMissing agentSystemShape = "missing"
+	agentSystemShapeString  agentSystemShape = "string"
+	agentSystemShapeArray   agentSystemShape = "array"
+	agentSystemShapeUnknown agentSystemShape = "unknown"
+)
+
+type agentParentRelation string
+
+const agentParentRelationUnavailable agentParentRelation = "unavailable"
+
+// agentRequestFeatures 只保存代理分类所需的脱敏事实。
+// 字段类型限定为布尔或受限枚举，避免 prompt、消息正文、凭证和完整 ID 进入日志或 fixture。
+type agentRequestFeatures struct {
+	ModelFamily          agentModelFamily    `json:"model_family"`
+	ThinkingPresent      bool                `json:"thinking_present"`
+	SystemPresent        bool                `json:"system_present"`
+	SystemShape          agentSystemShape    `json:"system_shape"`
+	SDKTSMarkerPresent   bool                `json:"sdk_ts_marker_present"`
+	MetadataPresent      bool                `json:"metadata_present"`
+	SessionHeaderPresent bool                `json:"session_header_present"`
+	ParentMarkerPresent  bool                `json:"parent_marker_present"`
+	ParentRelation       agentParentRelation `json:"parent_relation"`
+	MessagesPresent      bool                `json:"messages_present"`
+}
+
+func extractAgentRequestFeatures(r *http.Request, bodyMap map[string]json.RawMessage, messages []Message) agentRequestFeatures {
+	features := agentRequestFeatures{
+		ModelFamily:     extractAgentModelFamily(bodyMap["model"]),
+		SystemShape:     agentSystemShapeMissing,
+		ParentRelation:  agentParentRelationUnavailable,
+		MessagesPresent: len(messages) > 0,
+	}
+	_, features.ThinkingPresent = bodyMap["thinking"]
+	_, features.MetadataPresent = bodyMap["metadata"]
+	if r != nil {
+		features.SessionHeaderPresent = r.Header.Get("X-Claude-Code-Session-Id") != ""
+	}
+
+	systemRaw, ok := bodyMap["system"]
+	if !ok {
+		return features
+	}
+	features.SystemPresent = true
+	features.SystemShape, features.SDKTSMarkerPresent = inspectAgentSystem(systemRaw)
+	return features
+}
+
+func extractAgentModelFamily(raw json.RawMessage) agentModelFamily {
+	var model string
+	if len(raw) == 0 || json.Unmarshal(raw, &model) != nil {
+		return agentModelFamilyUnknown
+	}
+	model = strings.ToLower(model)
+	switch {
+	case strings.Contains(model, "deepseek"):
+		return agentModelFamilyDeepSeek
+	case strings.Contains(model, "claude") && strings.Contains(model, "haiku"):
+		return agentModelFamilyClaudeHaiku
+	case strings.Contains(model, "claude"):
+		return agentModelFamilyClaude
+	default:
+		return agentModelFamilyUnknown
+	}
+}
+
+func inspectAgentSystem(raw json.RawMessage) (agentSystemShape, bool) {
+	var systemString string
+	if json.Unmarshal(raw, &systemString) == nil {
+		return agentSystemShapeString, strings.Contains(systemString, "cc_entrypoint=sdk-ts")
+	}
+
+	var systemArray []json.RawMessage
+	if json.Unmarshal(raw, &systemArray) != nil {
+		return agentSystemShapeUnknown, false
+	}
+	for _, item := range systemArray {
+		var block struct {
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(item, &block) == nil && strings.Contains(block.Text, "cc_entrypoint=sdk-ts") {
+			return agentSystemShapeArray, true
+		}
+	}
+	return agentSystemShapeArray, false
+}
+
+func logAgentRequestFeatures(features agentRequestFeatures) {
+	slog.Debug("agent_features",
+		"model_family", features.ModelFamily,
+		"thinking_present", features.ThinkingPresent,
+		"system_present", features.SystemPresent,
+		"system_shape", features.SystemShape,
+		"sdk_ts_marker_present", features.SDKTSMarkerPresent,
+		"metadata_present", features.MetadataPresent,
+		"session_header_present", features.SessionHeaderPresent,
+		"parent_marker_present", features.ParentMarkerPresent,
+		"parent_relation", features.ParentRelation,
+		"messages_present", features.MessagesPresent,
+	)
+}
 
 // extractSessionID 从 HTTP 请求中提取 SessionID。
 // 优先读取 X-Claude-Code-Session-Id header，缺失时回退到 UUID v4。

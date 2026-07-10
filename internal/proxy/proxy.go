@@ -305,6 +305,8 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		logAgentRequestFeatures(extractAgentRequestFeatures(r, bodyMap, messages))
+
 		// Phase 5: Subagent detection (SUBAGENT-02)
 		// 子代理请求携带未压缩的超长消息历史。用主线 frozen prefix 替换前缀，
 		// 使远端 DeepSeek 缓存命中率对齐主线（95%+）。
