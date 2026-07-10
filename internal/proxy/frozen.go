@@ -20,17 +20,17 @@ type LoadFunc func(key string) (string, bool)
 // 桩化周期之间，冻结前缀被逐字节复用，使 API 缓存在前缀部分可命中。
 type FrozenStubs struct {
 	mu           sync.RWMutex
-	ttl          time.Duration    // eviction TTL —— 默认 30 分钟
+	ttl          time.Duration        // eviction TTL —— 默认 30 分钟
 	messages     map[string][]Message // threadID → 深拷贝的桩化消息
-	cutoff       map[string]int   // threadID → Store 时的原始消息总数
-	boundaryHash map[string]string // threadID → messages[cutoff-1] 的稳定 hash
-	prefixHash   map[string]string // threadID → 序列化后 frozen prefix 的 SHA-256 hash
+	cutoff       map[string]int       // threadID → Store 时的原始消息总数
+	boundaryHash map[string]string    // threadID → messages[cutoff-1] 的稳定 hash
+	prefixHash   map[string]string    // threadID → 序列化后 frozen prefix 的 SHA-256 hash
 	stubTime     map[string]time.Time
 	tokens       map[string]int // threadID → frozen stubs 的 token 估算
 	rawTokens    map[string]int // threadID → Store 时原始 token 估算（压缩前）
 	lastAccess   map[string]time.Time
-	persistFn    PersistFunc    // 可选：持久化 frozen 状态到 DB
-	loadFn       LoadFunc       // 可选：冷启动时从 DB 加载 frozen 状态
+	persistFn    PersistFunc     // 可选：持久化 frozen 状态到 DB
+	loadFn       LoadFunc        // 可选：冷启动时从 DB 加载 frozen 状态
 	loadedFromDB map[string]bool // threadID → 已尝试从 DB 加载
 }
 
@@ -236,6 +236,13 @@ func (f *FrozenStubs) Get(threadID string, currentMessages []Message) *FrozenRes
 	}
 }
 
+// LengthFor 返回 threadID 对应的 frozen prefix 消息数；条目不存在时返回 0。
+func (f *FrozenStubs) LengthFor(threadID string) int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return len(f.messages[threadID])
+}
+
 // UpdateMessages 用 newMsgs 覆盖已存储的 frozen prefix 并刷新 prefix hash。
 // 要求 newMsgs 长度与已有条目一致（防止同一管线内二次 sawtooth 触发）。
 // 返回是否成功更新。
@@ -262,7 +269,26 @@ func (f *FrozenStubs) UpdateMessages(threadID string, newMsgs []Message) bool {
 	f.messages[threadID] = fresh
 	f.prefixHash[threadID] = pHash
 	f.lastAccess[threadID] = time.Now()
+	cutoff := f.cutoff[threadID]
+	bHash := f.boundaryHash[threadID]
+	tokens := f.tokens[threadID]
+	rawTokens := f.rawTokens[threadID]
+	persistFn := f.persistFn
 	f.mu.Unlock()
+
+	if persistFn != nil {
+		fp := frozenPersisted{
+			Messages:     fresh,
+			Cutoff:       cutoff,
+			BoundaryHash: bHash,
+			PrefixHash:   pHash,
+			Tokens:       tokens,
+			RawTokens:    rawTokens,
+		}
+		if data, err := json.Marshal(fp); err == nil {
+			persistFn("frozen:"+threadID, string(data))
+		}
+	}
 
 	return true
 }
