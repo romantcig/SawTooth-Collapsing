@@ -250,6 +250,115 @@ func assertAllowedJSONKeys(t *testing.T, name string, values map[string]json.Raw
 	}
 }
 
+func TestDeepSeekAgentMatrix(t *testing.T) {
+	for _, name := range []string{"deepseek-main.json", "deepseek-subagent.json", "ambiguous.json"} {
+		fixture := loadAgentFeatureFixture(t, name)
+		for i, fixtureCase := range fixture.Cases {
+			got := classifyAgentFeatures(fixtureCase.Features)
+			if string(got.Role) != fixtureCase.ExpectedRole {
+				t.Errorf("%s case %d role = %q, want %q (reason=%q)", name, i, got.Role, fixtureCase.ExpectedRole, got.Reason)
+			}
+			if got.Reason == "" {
+				t.Errorf("%s case %d reason 为空", name, i)
+			}
+		}
+	}
+}
+
+func TestAgentClassificationCompatibilityPrecedence(t *testing.T) {
+	tests := []struct {
+		name     string
+		features agentRequestFeatures
+		wantRole agentRole
+		wantWhy  agentClassificationReason
+	}{
+		{
+			name: "sdk-ts marker 优先识别子代理",
+			features: agentRequestFeatures{
+				ModelFamily:        agentModelFamilyDeepSeek,
+				SDKTSMarkerPresent: true,
+				MessagesPresent:    true,
+			},
+			wantRole: agentRoleSubagent,
+			wantWhy:  agentReasonSDKTSCompatibility,
+		},
+		{
+			name: "DeepSeek 主代理缺 thinking 仍为 main",
+			features: agentRequestFeatures{
+				ModelFamily:     agentModelFamilyDeepSeek,
+				MessagesPresent: true,
+			},
+			wantRole: agentRoleMain,
+			wantWhy:  agentReasonDeepSeekModel,
+		},
+		{
+			name: "Haiku 仅作为兼容 fallback",
+			features: agentRequestFeatures{
+				ModelFamily:     agentModelFamilyClaudeHaiku,
+				ThinkingPresent: true,
+				MessagesPresent: true,
+			},
+			wantRole: agentRoleSubagent,
+			wantWhy:  agentReasonHaikuCompatibility,
+		},
+		{
+			name: "无稳定 marker 保持 unknown",
+			features: agentRequestFeatures{
+				ModelFamily:     agentModelFamilyUnknown,
+				MessagesPresent: true,
+			},
+			wantRole: agentRoleUnknown,
+			wantWhy:  agentReasonNoVerifiedMarker,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifyAgentFeatures(tt.features)
+			if got.Role != tt.wantRole || got.Reason != tt.wantWhy {
+				t.Fatalf("classification = %#v, want role=%q reason=%q", got, tt.wantRole, tt.wantWhy)
+			}
+		})
+	}
+}
+
+func TestAgentParentRelation(t *testing.T) {
+	const (
+		childID  = "11111111-1111-4111-8111-111111111111"
+		parentID = "22222222-2222-4222-8222-222222222222"
+	)
+	bodyMap := map[string]json.RawMessage{
+		"model":    json.RawMessage(`"deepseek-v4-pro"`),
+		"thinking": json.RawMessage(`{"type":"enabled"}`),
+	}
+	messages := []Message{{Role: "user", Content: json.RawMessage(`"hello"`)}}
+
+	tests := []struct {
+		name          string
+		parentHeader  string
+		wantAvailable bool
+		wantParentID  string
+	}{
+		{name: "显式 parent marker", parentHeader: parentID, wantAvailable: true, wantParentID: parentID},
+		{name: "缺少 parent marker"},
+		{name: "空白 parent marker", parentHeader: "   "},
+		{name: "parent 与 child 相同不可用", parentHeader: childID},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/v1/messages", nil)
+			req.Header.Set("X-Claude-Code-Session-Id", childID)
+			if tt.parentHeader != "" {
+				req.Header.Set("X-Claude-Code-Parent-Session-Id", tt.parentHeader)
+			}
+			got := classifyAgentRequest(req, bodyMap, messages)
+			if got.ParentAvailable != tt.wantAvailable || got.ParentSessionID != tt.wantParentID {
+				t.Fatalf("parent classification = %#v, want available=%v parent=%q", got, tt.wantAvailable, tt.wantParentID)
+			}
+		})
+	}
+}
+
 func TestIsSubagent_EmptyMessages(t *testing.T) {
 	// 边缘情况：空消息返回 false
 	bodyMap := map[string]json.RawMessage{

@@ -5,7 +5,7 @@
     {
       "expected_role": "unknown",
       "features": {
-        "model_family": "deepseek",
+        "model_family": "unknown",
         "thinking_present": true,
         "system_present": true,
         "system_shape": "array",
