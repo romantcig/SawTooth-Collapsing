@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -39,6 +40,57 @@ func TestRequestMetaConcurrentIDsUnique(t *testing.T) {
 	}
 	if len(seen) != requestCount {
 		t.Fatalf("唯一 request_id 数=%d，期望 %d", len(seen), requestCount)
+	}
+}
+
+func TestHandleMessagesDebugStages(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":196,"cache_creation_input_tokens":0,"cache_read_input_tokens":93056,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	dataDir := t.TempDir()
+	server.Config.Debug = DebugConfig{Enabled: true, FullBody: false, DataDir: dataDir}
+	raw := append([]Message{pipelinePersistentContextMessage(t, "DEBUG-STAGE-CLAUDE-MD-SECRET")}, pipelineMessages(4, 5)...)
+	servePipelineRequest(t, server, "debug-stage-session-secret", raw)
+
+	files := readDebugFactFiles(t, dataDir, "debug-stage-session-secret")
+	if len(files) != 3 {
+		t.Fatalf("facts 文件数=%d, want raw+forwarded+usage 共 3", len(files))
+	}
+	stageCounts := make(map[debugStage]int)
+	requestIDs := make(map[uint64]bool)
+	for _, data := range files {
+		if bytes.Contains(data, []byte("DEBUG-STAGE-CLAUDE-MD-SECRET")) || bytes.Contains(data, []byte("debug-stage-session-secret")) {
+			t.Fatalf("facts 泄漏正文或 session: %s", data)
+		}
+		var fact debugFact
+		if err := json.Unmarshal(data, &fact); err != nil {
+			t.Fatal(err)
+		}
+		stageCounts[fact.Stage]++
+		requestIDs[fact.RequestID] = true
+	}
+	for _, stage := range []debugStage{debugStageRawInbound, debugStageForwarded, debugStageResponseUsage} {
+		if stageCounts[stage] != 1 {
+			t.Fatalf("stage %q count=%d, want 1; all=%v", stage, stageCounts[stage], stageCounts)
+		}
+	}
+	if len(requestIDs) != 1 {
+		t.Fatalf("facts request_id 不一致: %v", requestIDs)
+	}
+
+	dir, _ := safeDebugSessionDir(dataDir, "debug-stage-session-secret")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), "-req.json") || strings.HasSuffix(entry.Name(), "-resp.json") {
+			t.Fatalf("full_body=false 仍写完整 body: %s", entry.Name())
+		}
 	}
 }
 
