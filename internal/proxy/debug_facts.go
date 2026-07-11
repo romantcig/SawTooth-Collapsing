@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -22,9 +24,12 @@ const (
 type debugError string
 
 const (
-	debugErrorInvalidJSON     debugError = "invalid_json"
-	debugErrorInvalidMessages debugError = "invalid_messages"
+	debugErrorInvalidJSON        debugError = "invalid_json"
+	debugErrorInvalidMessages    debugError = "invalid_messages"
+	debugErrorInvalidMediaBase64 debugError = "invalid_media_base64"
 )
+
+const maxDebugBase64Chars = 8 * 1024 * 1024
 
 // debugFact 是唯一允许写入默认 debug 文件的结构。
 // 所有字段均为时间、受限枚举、bool 或数字，不持有 header、正文或 session ID。
@@ -82,7 +87,14 @@ func (s *Server) writeRequestDebugFacts(meta *requestMeta, timestamp time.Time, 
 		if s.TokenCounter != nil {
 			fact.EstimatedTokens = s.TokenCounter.CountMessagesTokens(messages)
 		}
-		fact.ImageCount, fact.DocumentCount, fact.DecodedByteCount = debugMediaFacts(messages)
+		var invalidMediaBase64 bool
+		fact.ImageCount, fact.DocumentCount, fact.DecodedByteCount, invalidMediaBase64 = debugMediaFacts(messages)
+		if invalidMediaBase64 {
+			fact.DecodedByteCount = 0
+			if fact.Error == "" {
+				fact.Error = debugErrorInvalidMediaBase64
+			}
+		}
 		classification := classifyAgentRequest(request, bodyMap, messages)
 		fact.AgentRole = classification.Role
 		fact.AgentReason = classification.Reason
@@ -134,27 +146,29 @@ func (s *Server) writeDebugFact(sessionID string, timestamp time.Time, fact debu
 	}
 }
 
-func debugMediaFacts(messages []Message) (images, documents, decodedBytes int) {
+func debugMediaFacts(messages []Message) (images, documents, decodedBytes int, invalidBase64 bool) {
 	for _, message := range messages {
 		var content any
 		if json.Unmarshal(message.Content, &content) == nil {
-			i, d, b := debugMediaValueFacts(content)
+			i, d, b, invalid := debugMediaValueFacts(content)
 			images += i
 			documents += d
 			decodedBytes = saturatingAdd(decodedBytes, b)
+			invalidBase64 = invalidBase64 || invalid
 		}
 	}
-	return images, documents, decodedBytes
+	return images, documents, decodedBytes, invalidBase64
 }
 
-func debugMediaValueFacts(value any) (images, documents, decodedBytes int) {
+func debugMediaValueFacts(value any) (images, documents, decodedBytes int, invalidBase64 bool) {
 	switch typed := value.(type) {
 	case []any:
 		for _, item := range typed {
-			i, d, b := debugMediaValueFacts(item)
+			i, d, b, invalid := debugMediaValueFacts(item)
 			images += i
 			documents += d
 			decodedBytes = saturatingAdd(decodedBytes, b)
+			invalidBase64 = invalidBase64 || invalid
 		}
 	case map[string]any:
 		typeName, _ := typed["type"].(string)
@@ -166,34 +180,44 @@ func debugMediaValueFacts(value any) (images, documents, decodedBytes int) {
 				} else {
 					documents++
 				}
-				decodedBytes = decodedBase64Size(data)
+				if size, valid := validatedDecodedBase64Size(data); valid {
+					decodedBytes = saturatingAdd(decodedBytes, size)
+				} else {
+					invalidBase64 = true
+				}
 			}
 		}
 		if content, ok := typed["content"]; ok {
-			i, d, b := debugMediaValueFacts(content)
+			i, d, b, invalid := debugMediaValueFacts(content)
 			images += i
 			documents += d
 			decodedBytes = saturatingAdd(decodedBytes, b)
+			invalidBase64 = invalidBase64 || invalid
 		}
 	}
-	return images, documents, decodedBytes
+	return images, documents, decodedBytes, invalidBase64
 }
 
 func decodedBase64Size(data string) int {
-	data = strings.TrimSpace(data)
-	if data == "" {
-		return 0
-	}
-	size := len(data) / 4 * 3
-	if strings.HasSuffix(data, "==") {
-		size -= 2
-	} else if strings.HasSuffix(data, "=") {
-		size--
-	}
-	if size < 0 {
-		return 0
-	}
+	size, _ := validatedDecodedBase64Size(data)
 	return size
+}
+
+// validatedDecodedBase64Size 对受限长度的标准 base64 执行流式严格解码。
+// 只累计解码字节数，不保留 payload；空白、非法 padding 和超限输入均拒绝。
+func validatedDecodedBase64Size(data string) (int, bool) {
+	if data == "" || len(data) > maxDebugBase64Chars {
+		return 0, false
+	}
+	if strings.IndexAny(data, " \t\r\n") >= 0 {
+		return 0, false
+	}
+	decoder := base64.NewDecoder(base64.StdEncoding.Strict(), strings.NewReader(data))
+	decoded, err := io.CopyBuffer(io.Discard, decoder, make([]byte, 4096))
+	if err != nil || decoded < 0 || uint64(decoded) > uint64(^uint(0)>>1) {
+		return 0, false
+	}
+	return int(decoded), true
 }
 
 func saturatingAdd(left, right int) int {

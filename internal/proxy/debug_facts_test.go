@@ -139,6 +139,55 @@ func TestDebugFactsUsageUsesTotalInputTokens(t *testing.T) {
 	}
 }
 
+func TestDecodedBase64SizeValidatesInput(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want int
+	}{
+		{name: "valid exact count", data: "QUJDRA==", want: 4},
+		{name: "invalid character", data: "QUJD$A==", want: 0},
+		{name: "embedded newline", data: "QU\nJDRA==", want: 0},
+		{name: "invalid padding", data: "A===", want: 0},
+		{name: "oversized", data: strings.Repeat("A", 8*1024*1024+4), want: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := decodedBase64Size(tt.data); got != tt.want {
+				t.Fatalf("decodedBase64Size() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDebugFactsInvalidMediaBase64UsesRestrictedError(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.Debug = DebugConfig{Enabled: true, DataDir: dataDir}
+	s := NewServer(cfg)
+	meta := newRequestMeta(10, "invalid-media-session")
+	body := []byte(`{"model":"claude-test","messages":[{"role":"user","content":[
+		{"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJDRA=="}},
+		{"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD$A=="}}
+	]}]}`)
+
+	s.writeRequestDebugFacts(meta, time.Date(2026, 7, 12, 1, 2, 3, 4, time.UTC), debugStageRawInbound, body, nil)
+	files := readDebugFactFiles(t, dataDir, meta.RequestSessionID)
+	if len(files) != 1 {
+		t.Fatalf("facts 文件数=%d, want 1", len(files))
+	}
+	var fact debugFact
+	if err := json.Unmarshal(files[0], &fact); err != nil {
+		t.Fatal(err)
+	}
+	if fact.ImageCount != 2 || fact.DecodedByteCount != 0 {
+		t.Fatalf("invalid media facts=%+v", fact)
+	}
+	if fact.Error != debugError("invalid_media_base64") {
+		t.Fatalf("invalid media error=%q", fact.Error)
+	}
+}
+
 func TestDebugFullBodyDefaultsOff(t *testing.T) {
 	cfg := DefaultConfig()
 	if cfg.Debug.FullBody {
