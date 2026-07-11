@@ -23,6 +23,13 @@ func TestMessageUnknownFieldsRoundTrip(t *testing.T) {
 	assertJSONEquivalent(t, got, want)
 }
 
+func TestMessageRoundTripPlainSerializationCompatibility(t *testing.T) {
+	message := Message{Role: "user", Content: json.RawMessage(`"plain"`)}
+	if got, want := string(mustMarshalJSON(t, message)), `{"role":"user","content":"plain"}`; got != want {
+		t.Fatalf("plain message serialization changed\ngot:  %s\nwant: %s", got, want)
+	}
+}
+
 func TestMessageUnknownNullRemainsDistinctFromAbsent(t *testing.T) {
 	var withNull Message
 	if err := json.Unmarshal([]byte(`{"role":"user","content":"same","future":null}`), &withNull); err != nil {

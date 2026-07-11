@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"unicode/utf8"
 )
@@ -25,8 +27,90 @@ type ContentBlock struct {
 // Message 表示 Anthropic API 中的一条消息。
 // Content 可以是纯文本字符串或 ContentBlock 数组。
 type Message struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
+	Role        string          `json:"role"`
+	Content     json.RawMessage `json:"content"`
+	extraFields map[string]json.RawMessage
+}
+
+// UnmarshalJSON 提取代理会修改的 role/content，并原样保留所有未知消息级字段。
+func (m *Message) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+
+	var role string
+	if raw, ok := fields["role"]; ok {
+		if err := json.Unmarshal(raw, &role); err != nil {
+			return fmt.Errorf("解析 message.role: %w", err)
+		}
+	}
+
+	var content json.RawMessage
+	if raw, ok := fields["content"]; ok {
+		content = append(content, raw...)
+	}
+
+	delete(fields, "role")
+	delete(fields, "content")
+	var extras map[string]json.RawMessage
+	if len(fields) > 0 {
+		extras = make(map[string]json.RawMessage, len(fields))
+		for key, raw := range fields {
+			extras[key] = append(json.RawMessage(nil), raw...)
+		}
+	}
+
+	m.Role = role
+	m.Content = content
+	m.extraFields = extras
+	return nil
+}
+
+// MarshalJSON 只用当前值覆盖 role/content，其余消息级字段透明重放。
+// role/content 保持历史字段顺序，未知键排序后输出，保证 frozen hash 稳定。
+func (m Message) MarshalJSON() ([]byte, error) {
+	role, err := json.Marshal(m.Role)
+	if err != nil {
+		return nil, err
+	}
+	content, err := json.Marshal(m.Content)
+	if err != nil {
+		return nil, err
+	}
+
+	keys := make([]string, 0, len(m.extraFields))
+	for key := range m.extraFields {
+		if key != "role" && key != "content" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+
+	var result bytes.Buffer
+	result.WriteString(`{"role":`)
+	result.Write(role)
+	result.WriteString(`,"content":`)
+	result.Write(content)
+	for _, key := range keys {
+		encodedKey, marshalErr := json.Marshal(key)
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		raw := m.extraFields[key]
+		if len(raw) == 0 {
+			raw = json.RawMessage("null")
+		}
+		if !json.Valid(raw) {
+			return nil, fmt.Errorf("message 未知字段 %q 含非法 JSON", key)
+		}
+		result.WriteByte(',')
+		result.Write(encodedKey)
+		result.WriteByte(':')
+		result.Write(raw)
+	}
+	result.WriteByte('}')
+	return result.Bytes(), nil
 }
 
 // StubStats 记录 stub 操作前后的统计信息。
