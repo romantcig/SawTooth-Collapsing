@@ -1,8 +1,12 @@
 package proxy
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image/png"
+	"os"
 	"strings"
 	"testing"
 )
@@ -159,6 +163,65 @@ func TestCollapseOldMessagesLargeSessionReducesMessagesAndTokens(t *testing.T) {
 	}
 }
 
+func TestTokenCounterLargeScreenshotFixtureIsSanitizedAndVisualScale(t *testing.T) {
+	tc := mustTokenCounter(t)
+	message, imageData := loadLargeScreenshotFixture(t)
+	if len(imageData) != 491776 {
+		t.Fatalf("fixture base64 chars=%d, want 491776", len(imageData))
+	}
+	raw, err := base64.StdEncoding.DecodeString(imageData)
+	if err != nil {
+		t.Fatalf("fixture base64 无效: %v", err)
+	}
+	config, err := png.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("fixture PNG 无效: %v", err)
+	}
+	if config.Width != 1920 || config.Height != 897 {
+		t.Fatalf("fixture dimensions=%dx%d, want 1920x897", config.Width, config.Height)
+	}
+
+	got := tc.CountMessageTokens(message)
+	if got < 2277 || got > 2500 {
+		t.Fatalf("大截图估算=%d，期望视觉量级而非旧文本估算 344931", got)
+	}
+}
+
+func TestCalcCollapseCutoffLargeScreenshotRetainsSemanticTokenFloor(t *testing.T) {
+	tc := mustTokenCounter(t)
+	messages := collapseTextMessages(40, 5000)
+	messages[len(messages)-1], _ = loadLargeScreenshotFixture(t)
+
+	const threshold = 150000
+	const tokenFloor = 75000
+	const keepRecent = 8
+	if total := tc.CountMessagesTokens(messages); total <= threshold {
+		t.Fatalf("回归会话总 token=%d，必须超过 threshold=%d", total, threshold)
+	}
+
+	cutoff := CalcCollapseCutoff(messages, tokenFloor, tc, keepRecent)
+	if cutoff < 2 {
+		t.Fatalf("cutoff=%d，期望可折叠前缀", cutoff)
+	}
+	keepRecentBoundary := len(messages) - keepRecent
+	if cutoff >= keepRecentBoundary {
+		t.Fatalf("cutoff=%d 退化为 keep_recent 边界=%d，截图再次主导折叠", cutoff, keepRecentBoundary)
+	}
+	if retained := tc.CountMessagesTokens(messages[cutoff:]); retained < tokenFloor {
+		t.Fatalf("retained tail tokens=%d, want >=%d", retained, tokenFloor)
+	}
+}
+
+func TestCalcCollapseCutoffUsesTokenCounterSingleEntryPoint(t *testing.T) {
+	source, err := os.ReadFile("collapse.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(source, []byte("func countMessageTokens(")) {
+		t.Fatal("collapse.go 仍保留第二套 countMessageTokens 实现")
+	}
+}
+
 func TestCollapseOldMessagesRejectsMismatchedInputs(t *testing.T) {
 	tc := mustTokenCounter(t)
 	modified := collapseTextMessages(10001, 1)
@@ -238,6 +301,39 @@ func mustTokenCounter(t *testing.T) *TokenCounter {
 		t.Fatalf("NewTokenCounter: %v", err)
 	}
 	return tc
+}
+
+func loadLargeScreenshotFixture(t *testing.T) (Message, string) {
+	t.Helper()
+	raw, err := os.ReadFile("testdata/multimodal/large-screenshot-tool-result.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var block map[string]any
+	if err := json.Unmarshal(raw, &block); err != nil {
+		t.Fatal(err)
+	}
+	nested, ok := block["content"].([]any)
+	if !ok {
+		t.Fatal("fixture tool_result.content 不是数组")
+	}
+	var imageData string
+	for _, item := range nested {
+		semantic, ok := item.(map[string]any)
+		if !ok || semantic["type"] != "image" {
+			continue
+		}
+		source, _ := semantic["source"].(map[string]any)
+		imageData, _ = source["data"].(string)
+	}
+	if imageData == "" {
+		t.Fatal("fixture 缺少 image source.data")
+	}
+	content, err := json.Marshal([]any{block})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Message{Role: "user", Content: content}, imageData
 }
 
 func collapseTextMessages(count, words int) []Message {
