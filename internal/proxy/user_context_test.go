@@ -132,6 +132,15 @@ func TestPersistentUserContextNoContextPreservesHistory(t *testing.T) {
 	assertJSONEquivalent(t, mustMarshalJSON(t, PrependPersistentUserContext(history, nil)), mustMarshalJSON(t, messages))
 }
 
+func TestPersistentUserContextCollapseBlankGuard(t *testing.T) {
+	tc := mustTokenCounter(t)
+	context := persistentContextMessage("claudeMd", "FICTIONAL_BLANK_GUARD")
+	messages := append([]Message{context}, collapseTextMessages(3, 20)...)
+
+	blanked := blankFirstMessage(messages, tc)
+	assertJSONEquivalent(t, mustMarshalJSON(t, blanked[0]), mustMarshalJSON(t, context))
+}
+
 func persistentReminder(key, value string) string {
 	return "<system-reminder>\nAs you answer, use this context:\n# " + key + "\n" + value + "\n</system-reminder>"
 }

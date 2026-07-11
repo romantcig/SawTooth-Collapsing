@@ -141,6 +141,77 @@ func TestCollapseOldMessagesUsesOriginalArchiveAndModifiedRecentTail(t *testing.
 	}
 }
 
+func TestCollapseOldMessagesPersistentContextExcludedFromArchive(t *testing.T) {
+	tc := mustTokenCounter(t)
+	contextSentinel := "FICTIONAL_CONTEXT_SENTINEL"
+	var contextMessage Message
+	contextRaw := fmt.Sprintf(`{"role":"user","content":[{"type":"text","text":%q}],"isMeta":true,"agent_id":null}`, persistentReminder("claudeMd", contextSentinel))
+	if err := json.Unmarshal([]byte(contextRaw), &contextMessage); err != nil {
+		t.Fatalf("unmarshal context message: %v", err)
+	}
+	raw := append([]Message{contextMessage}, collapseTextMessages(8, 20)...)
+	history, context := DetachPersistentUserContext(raw)
+	if context == nil {
+		t.Fatal("expected detached context")
+	}
+
+	const cutoff = 5
+	collapsed, block := CollapseOldMessages(history, history, cutoff, tc, "session")
+	result := PrependPersistentUserContext(collapsed, context)
+	if len(result) != 1+2+len(history)-cutoff {
+		t.Fatalf("assembled message count = %d", len(result))
+	}
+	if !strings.Contains(string(result[0].Content), contextSentinel) {
+		t.Fatal("context is not first after assembly")
+	}
+	var blanked string
+	if err := json.Unmarshal(result[1].Content, &blanked); err != nil || !strings.Contains(blanked, "Earlier conversation archived") {
+		t.Fatalf("second message is not historical blank marker: %s", result[1].Content)
+	}
+	if persistentContextCount(result) != 1 {
+		t.Fatalf("context was not attached exactly once: %s", mustMarshalJSON(t, result))
+	}
+
+	archiveJSON := string(mustMarshalJSON(t, block.Messages))
+	if strings.Contains(block.SummaryText, contextSentinel) || strings.Contains(archiveJSON, contextSentinel) {
+		t.Fatal("persistent context leaked into archive summary or messages")
+	}
+	for _, keyword := range block.Keywords {
+		if strings.Contains(keyword.Word, contextSentinel) {
+			t.Fatal("persistent context leaked into archive keywords")
+		}
+	}
+	if block.MessageCount != cutoff || block.BlockRangeStart != 1 || block.BlockRangeEnd != cutoff-1 {
+		t.Fatalf("archive coordinates include detached context: %+v", block)
+	}
+	wantHash, err := archiveContentHash(history[:cutoff])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if block.ContentHash != wantHash {
+		t.Fatalf("archive hash = %s, want detached-history hash %s", block.ContentHash, wantHash)
+	}
+	for i := cutoff; i < len(history); i++ {
+		assertJSONEquivalent(t, mustMarshalJSON(t, result[3+i-cutoff]), mustMarshalJSON(t, history[i]))
+	}
+}
+
+func TestCollapseOldMessagesUnknownFieldsRemainInRecentTail(t *testing.T) {
+	tc := mustTokenCounter(t)
+	messages := collapseTextMessages(8, 20)
+	for i := 5; i < len(messages); i++ {
+		raw := fmt.Sprintf(`{"role":%q,"content":%q,"isMeta":true,"future_index":%d,"future_null":null}`, messages[i].Role, fmt.Sprintf("tail-%d", i), i)
+		if err := json.Unmarshal([]byte(raw), &messages[i]); err != nil {
+			t.Fatalf("unmarshal tail message %d: %v", i, err)
+		}
+	}
+
+	result, _ := CollapseOldMessages(messages, deepCopyMessages(messages), 5, tc, "session")
+	for i := 5; i < len(messages); i++ {
+		assertJSONEquivalent(t, mustMarshalJSON(t, result[2+i-5]), mustMarshalJSON(t, messages[i]))
+	}
+}
+
 func TestCollapseOldMessagesLargeSessionReducesMessagesAndTokens(t *testing.T) {
 	tc := mustTokenCounter(t)
 	messages := collapseTextMessages(320, 240)
