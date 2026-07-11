@@ -74,6 +74,91 @@ func toFloat64(v any) float64 {
 	}
 }
 
+// totalInputTokens 返回 Anthropic usage 占用的完整输入上下文。
+// cache creation/read 均占据 context window，因此与未缓存 input 一并计入；
+// output_tokens 属于输出空间，不参与 Sawtooth 上下文压力。
+func totalInputTokens(usage map[string]any) int {
+	if usage == nil {
+		return 0
+	}
+	total := 0
+	for _, field := range []string{"input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"} {
+		value := nonNegativeUsageToken(usage[field])
+		if value > math.MaxInt-total {
+			return math.MaxInt
+		}
+		total += value
+	}
+	return total
+}
+
+func nonNegativeUsageToken(value any) int {
+	maxInt := uint64(math.MaxInt)
+	switch number := value.(type) {
+	case int:
+		if number > 0 {
+			return number
+		}
+	case int8:
+		if number > 0 {
+			return int(number)
+		}
+	case int16:
+		if number > 0 {
+			return int(number)
+		}
+	case int32:
+		if number > 0 {
+			return int(number)
+		}
+	case int64:
+		if number > int64(math.MaxInt) {
+			return math.MaxInt
+		}
+		if number > 0 {
+			return int(number)
+		}
+	case uint:
+		if uint64(number) > maxInt {
+			return math.MaxInt
+		}
+		return int(number)
+	case uint8:
+		return int(number)
+	case uint16:
+		return int(number)
+	case uint32:
+		return int(number)
+	case uint64:
+		if number > maxInt {
+			return math.MaxInt
+		}
+		return int(number)
+	case float32:
+		return nonNegativeUsageFloat(float64(number))
+	case float64:
+		return nonNegativeUsageFloat(number)
+	case json.Number:
+		if integer, err := number.Int64(); err == nil {
+			return nonNegativeUsageToken(integer)
+		}
+		if floating, err := number.Float64(); err == nil {
+			return nonNegativeUsageFloat(floating)
+		}
+	}
+	return 0
+}
+
+func nonNegativeUsageFloat(number float64) int {
+	if math.IsNaN(number) || math.IsInf(number, 0) || number <= 0 {
+		return 0
+	}
+	if number >= float64(math.MaxInt) {
+		return math.MaxInt
+	}
+	return int(number)
+}
+
 // debugEntry debug 落盘 JSON 结构（D-04）。
 // metadata 字段 + body（原始 JSON 解析后的对象）。
 type debugEntry struct {
@@ -382,20 +467,21 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 
 	var eventBuf []string
 	var fullResponse strings.Builder
-	var sseInputTokens int // Phase 4: 从 message_start 事件提取的原始 input_tokens (D-04)
+	usageRecorded := false
 
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// Phase 4: 检测 message_start 事件，在 deflation 前提取 input_tokens (D-04)
-		if s.Sawtooth != nil && sseInputTokens == 0 &&
+		// message_start 的 usage 在 processSSEEvent deflation 前更新 Sawtooth。
+		if s.Sawtooth != nil && !usageRecorded &&
 			strings.HasPrefix(line, "data:") && strings.Contains(line, "message_start") {
 			dataStr := strings.TrimSpace(line[5:])
 			var data map[string]any
 			if json.Unmarshal([]byte(dataStr), &data) == nil {
 				if msg, ok := data["message"].(map[string]any); ok {
 					if usage, ok := msg["usage"].(map[string]any); ok {
-						sseInputTokens = int(toFloat64(usage["input_tokens"]))
+						s.Sawtooth.UpdateAfterResponse(sessionID, totalInputTokens(usage), messageCount)
+						usageRecorded = true
 					}
 				}
 			}
@@ -435,11 +521,6 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 
 	if err := scanner.Err(); err != nil {
 		logger.Warn("SSE 流读取错误", "error", err)
-	}
-
-	// Phase 4: 使用从 message_start 中提取的原始 input_tokens 更新 SawtoothTrigger (D-04)
-	if s.Sawtooth != nil && sseInputTokens > 0 {
-		s.Sawtooth.UpdateAfterResponse(sessionID, sseInputTokens, messageCount)
 	}
 
 	// 步骤 5: Debug 写 SSE 响应（完整拼接文本）
@@ -545,11 +626,10 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *re
 			// 解析失败，原样转发（T-02-05）
 			logger.Warn("无法解析上游 JSON 响应，原样转发", "error", err)
 		} else {
-			// Phase 4: 提取 input_tokens 用于 SawtoothTrigger（在 deflation 之前，D-04）
+			// 在客户端 usage deflation 之前，以完整输入空间更新 Sawtooth。
 			if s.Sawtooth != nil {
 				if usage, ok := body["usage"].(map[string]any); ok {
-					inputTokens := int(toFloat64(usage["input_tokens"]))
-					s.Sawtooth.UpdateAfterResponse(sessionID, inputTokens, messageCount)
+					s.Sawtooth.UpdateAfterResponse(sessionID, totalInputTokens(usage), messageCount)
 				}
 			}
 
