@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"compress/gzip"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -87,7 +88,11 @@ type debugEntry struct {
 // writeDebugFile 将请求/响应落盘到 data_dir/debug/{sessionID}/{timestamp}-{direction}.json（D-03）。
 // headers 参数仅在 req 方向传入（用于 redact Authorization）。
 func (s *Server) writeDebugFile(sessionID string, timestamp time.Time, direction string, body []byte, headers http.Header, model string, messageCount int) {
-	debugDir := filepath.Join(s.Config.Debug.DataDir, "debug", sessionID)
+	debugDir, ok := safeDebugSessionDir(s.Config.Debug.DataDir, sessionID)
+	if !ok {
+		slog.Warn("debug session 目录校验失败")
+		return
+	}
 	if err := os.MkdirAll(debugDir, 0755); err != nil {
 		slog.Warn("无法创建 debug 目录", "path", debugDir, "error", err)
 		return
@@ -139,6 +144,20 @@ func (s *Server) writeDebugFile(sessionID string, timestamp time.Time, direction
 	if err := os.WriteFile(filePath, data, 0644); err != nil {
 		slog.Warn("无法写入 debug 文件", "file", filePath, "error", err)
 	}
+}
+
+func safeDebugSessionDir(dataDir, sessionID string) (string, bool) {
+	root, err := filepath.Abs(filepath.Join(dataDir, "debug"))
+	if err != nil {
+		return "", false
+	}
+	sessionHash := fmt.Sprintf("%x", sha256.Sum256([]byte(sessionID)))
+	dir := filepath.Join(root, sessionHash)
+	rel, err := filepath.Rel(root, dir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", false
+	}
+	return dir, true
 }
 
 func isSensitiveDebugHeader(key string) bool {

@@ -27,7 +27,11 @@ func TestWriteDebugFileRedactsCredentialHeaders(t *testing.T) {
 	timestamp := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
 	s.writeDebugFile("session", timestamp, "req", []byte(`{"ok":true}`), headers, "model", 1)
 
-	data, err := os.ReadFile(filepath.Join(dataDir, "debug", "session", "2026-07-11T120000.000-req.json"))
+	debugDir, ok := safeDebugSessionDir(dataDir, "session")
+	if !ok {
+		t.Fatal("合法 session debug 目录校验失败")
+	}
+	data, err := os.ReadFile(filepath.Join(debugDir, "2026-07-11T120000.000-req.json"))
 	if err != nil {
 		t.Fatalf("读取 debug 文件: %v", err)
 	}
@@ -42,6 +46,29 @@ func TestWriteDebugFileRedactsCredentialHeaders(t *testing.T) {
 	}
 	if !bytes.Contains(entry.Headers, []byte("safe-value")) {
 		t.Fatalf("诊断 header 未保留: %s", entry.Headers)
+	}
+}
+
+func TestWriteDebugFileSessionPathCannotEscapeDebugRoot(t *testing.T) {
+	for _, sessionID := range []string{"../escape", `..\\escape`, `C:\\escape`, `\\\\server\\share\\escape`} {
+		t.Run(sessionID, func(t *testing.T) {
+			dataDir := t.TempDir()
+			s := NewServer(Config{Debug: DebugConfig{DataDir: dataDir}})
+			s.writeDebugFile(sessionID, time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC), "req", []byte(`{}`), nil, "model", 0)
+
+			debugDir, ok := safeDebugSessionDir(dataDir, sessionID)
+			if !ok {
+				t.Fatal("哈希后的 session 目录应通过根目录校验")
+			}
+			root, _ := filepath.Abs(filepath.Join(dataDir, "debug"))
+			rel, err := filepath.Rel(root, debugDir)
+			if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+				t.Fatalf("debug 目录逃逸: root=%s dir=%s rel=%s err=%v", root, debugDir, rel, err)
+			}
+			if _, err := os.Stat(filepath.Join(debugDir, "2026-07-11T120000.000-req.json")); err != nil {
+				t.Fatalf("debug 文件未写入哈希目录: %v", err)
+			}
+		})
 	}
 }
 
