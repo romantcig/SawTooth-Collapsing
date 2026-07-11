@@ -108,6 +108,11 @@ func (f *FrozenStubs) Store(threadID string, stubbed []Message, cutoff int, boun
 	bHash := stableBoundaryHash(boundaryMsg)
 
 	now := time.Now()
+	fp := frozenPersisted{
+		Messages: frozen, Cutoff: cutoff, BoundaryHash: bHash, PrefixHash: pHash,
+		Tokens: tokenEstimate, RawTokens: rawTokenEstimate,
+	}
+	persisted, _ := json.Marshal(fp)
 
 	f.mu.Lock()
 	f.messages[threadID] = frozen
@@ -119,22 +124,11 @@ func (f *FrozenStubs) Store(threadID string, stubbed []Message, cutoff int, boun
 	f.rawTokens[threadID] = rawTokenEstimate
 	f.lastAccess[threadID] = now
 	f.loadedFromDB[threadID] = true // 内存中的是最新权威数据
-	f.mu.Unlock()
-
-	// 跨重启留存：异步持久化到 DB
-	if f.persistFn != nil {
-		fp := frozenPersisted{
-			Messages:     frozen,
-			Cutoff:       cutoff,
-			BoundaryHash: bHash,
-			PrefixHash:   pHash,
-			Tokens:       tokenEstimate,
-			RawTokens:    rawTokenEstimate,
-		}
-		if data, err := json.Marshal(fp); err == nil {
-			f.persistFn("frozen:"+threadID, string(data))
-		}
+	// 持久化在同一临界区内执行，保证同一 thread 的内存与 SQLite 顺序一致。
+	if f.persistFn != nil && persisted != nil {
+		f.persistFn("frozen:"+threadID, string(persisted))
 	}
+	f.mu.Unlock()
 
 	slog.Info("frozen prefix 已存储",
 		"thread_id", threadID,
@@ -247,16 +241,6 @@ func (f *FrozenStubs) LengthFor(threadID string) int {
 // 要求 newMsgs 长度与已有条目一致（防止同一管线内二次 sawtooth 触发）。
 // 返回是否成功更新。
 func (f *FrozenStubs) UpdateMessages(threadID string, newMsgs []Message) bool {
-	f.mu.RLock()
-	existing, ok := f.messages[threadID]
-	f.mu.RUnlock()
-	if !ok {
-		return false
-	}
-	if len(newMsgs) != len(existing) {
-		return false
-	}
-
 	fresh := deepCopyMessages(newMsgs)
 	if fresh == nil {
 		return false
@@ -266,6 +250,11 @@ func (f *FrozenStubs) UpdateMessages(threadID string, newMsgs []Message) bool {
 	pHash := sha256hex(freshJSON)
 
 	f.mu.Lock()
+	existing, ok := f.messages[threadID]
+	if !ok || len(fresh) != len(existing) {
+		f.mu.Unlock()
+		return false
+	}
 	f.messages[threadID] = fresh
 	f.prefixHash[threadID] = pHash
 	f.lastAccess[threadID] = time.Now()
@@ -273,10 +262,7 @@ func (f *FrozenStubs) UpdateMessages(threadID string, newMsgs []Message) bool {
 	bHash := f.boundaryHash[threadID]
 	tokens := f.tokens[threadID]
 	rawTokens := f.rawTokens[threadID]
-	persistFn := f.persistFn
-	f.mu.Unlock()
-
-	if persistFn != nil {
+	if f.persistFn != nil {
 		fp := frozenPersisted{
 			Messages:     fresh,
 			Cutoff:       cutoff,
@@ -286,9 +272,10 @@ func (f *FrozenStubs) UpdateMessages(threadID string, newMsgs []Message) bool {
 			RawTokens:    rawTokens,
 		}
 		if data, err := json.Marshal(fp); err == nil {
-			persistFn("frozen:"+threadID, string(data))
+			f.persistFn("frozen:"+threadID, string(data))
 		}
 	}
+	f.mu.Unlock()
 
 	return true
 }

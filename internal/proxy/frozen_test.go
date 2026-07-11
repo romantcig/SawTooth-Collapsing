@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -143,6 +144,49 @@ func TestFrozenColdStartRejectsInvalidCutoff(t *testing.T) {
 				t.Fatalf("非法状态进入内存，长度=%d", got)
 			}
 		})
+	}
+}
+
+func TestFrozenConcurrentPersistenceKeepsStateOrder(t *testing.T) {
+	frozen := NewFrozenStubs()
+	raw := frozenTestMessages(4)
+	firstPersistStarted := make(chan struct{})
+	releaseFirstPersist := make(chan struct{})
+	var once sync.Once
+	var persisted string
+	frozen.SetPersistFunc(func(_ string, value string) {
+		once.Do(func() {
+			close(firstPersistStarted)
+			<-releaseFirstPersist
+		})
+		persisted = value
+	})
+
+	firstDone := make(chan struct{})
+	go func() {
+		frozen.Store("thread", raw[:1], 2, raw[1], 10, 20)
+		close(firstDone)
+	}()
+	<-firstPersistStarted
+	secondDone := make(chan struct{})
+	go func() {
+		frozen.Store("thread", raw[:2], 3, raw[2], 20, 30)
+		close(secondDone)
+	}()
+	close(releaseFirstPersist)
+	<-firstDone
+	<-secondDone
+
+	var got frozenPersisted
+	if err := json.Unmarshal([]byte(persisted), &got); err != nil {
+		t.Fatalf("解析最终持久化状态: %v", err)
+	}
+	if got.Cutoff != 3 || len(got.Messages) != 2 {
+		t.Fatalf("最终持久化状态过期: cutoff=%d messages=%d", got.Cutoff, len(got.Messages))
+	}
+	result := frozen.Get("thread", raw)
+	if result == nil || result.Cutoff != got.Cutoff || len(result.Messages) != len(got.Messages) {
+		t.Fatalf("内存与持久化状态不一致: result=%+v persisted=%+v", result, got)
 	}
 }
 
