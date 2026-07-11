@@ -31,6 +31,14 @@ func TestPersistentUserContextRecognizesStableKeys(t *testing.T) {
 			assertJSONEquivalent(t, got, []byte(raw))
 		})
 	}
+
+	t.Run("combined", func(t *testing.T) {
+		body := "<system-reminder>\n# claudeMd\nfictional-rule\n# currentDate\n2099-01-01\n# userEmail\nnone@example.invalid\n# attachedProject\nfictional-project\n</system-reminder>"
+		messages := []Message{{Role: "user", Content: mustMarshalJSON(t, []map[string]any{{"type": "text", "text": body}})}}
+		if context := ExtractPersistentUserContext(messages); context == nil {
+			t.Fatal("combined stable headings were not recognized")
+		}
+	})
 }
 
 func TestPersistentUserContextDetachMixedBlocksAndPrepend(t *testing.T) {
@@ -136,8 +144,8 @@ func persistentContextMessage(key, value string) Message {
 func persistentContextCount(messages []Message) int {
 	total := 0
 	for _, message := range messages {
-		for _, key := range []string{"claudeMd", "currentDate", "userEmail", "attachedProject"} {
-			total += strings.Count(string(message.Content), "# "+key)
+		if ExtractPersistentUserContext([]Message{message}) != nil {
+			total++
 		}
 	}
 	return total
