@@ -3,8 +3,30 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"sync"
 	"testing"
+	"time"
 )
+
+func TestApplyCacheControlConcurrentTTLUpdates(t *testing.T) {
+	s := NewServer(DefaultConfig())
+	s.Frozen = NewFrozenStubs()
+	s.Sawtooth = NewSawtoothTrigger(time.Minute, 1000, 500)
+	messages := []Message{{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"cached"}]`)}}
+
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.applyCacheControl(deepCopyMessages(messages), 1, "session")
+		}()
+	}
+	wg.Wait()
+	if s.cachedTTL == "" {
+		t.Fatal("并发 cache TTL 更新后未记录生效值")
+	}
+}
 
 func TestCacheFrozenFreezeRestorePrefixJSONBytesMatch(t *testing.T) {
 	raw := frozenTestMessages(302)

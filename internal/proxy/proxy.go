@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -137,6 +138,7 @@ type Server struct {
 	Frozen            *FrozenStubs     // Phase 4: frozen prefix 存储 (D-12)
 	Sawtooth          *SawtoothTrigger // Phase 4: 桩化周期触发 (D-03)
 	EagerStub         *EagerStubMemory // Phase 5: eager stub memory (EAGER-01)
+	cacheMu           sync.Mutex       // 保护 cachedTTL 的比较与下游 TTL 更新
 	cachedTTL         string           // 当前生效的 cache TTL（"ephemeral" 或 "1h"），用于检测切换
 	searchAndExpandFn func([]Message, *SQLiteStore, int, *TokenCounter, *Budget, *requestMeta) RecallOutcome
 	requestIdx        atomic.Uint64
@@ -837,6 +839,8 @@ func (s *Server) applyCacheControl(messages []Message, frozenCount int, sessionI
 				break
 			}
 		}
+		s.cacheMu.Lock()
+		defer s.cacheMu.Unlock()
 		if effectiveTTL != s.cachedTTL {
 			s.Frozen.UpdateTTL(SawtoothTTLForCacheTTL(effectiveTTL))
 			s.Sawtooth.SetPauseThreshold(CacheGapForTTL(effectiveTTL))
