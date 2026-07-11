@@ -44,6 +44,10 @@ func detachPersistentUserContext(messages []Message) ([]Message, *PersistentUser
 	history := make([]Message, 0, len(messages))
 	var authoritative *PersistentUserContext
 	for _, message := range messages {
+		if message.Role != "user" {
+			history = append(history, message)
+			continue
+		}
 		cleaned, keep, candidates := detachPersistentFromMessage(message)
 		if authoritative == nil && len(candidates) > 0 {
 			authoritative = &PersistentUserContext{Message: candidates[0]}

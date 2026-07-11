@@ -119,6 +119,38 @@ func TestPersistentUserContextSelectsEarliestAndRemovesDuplicates(t *testing.T) 
 	}
 }
 
+func TestPersistentUserContextIgnoresAssistantLookalikeBeforeUserContext(t *testing.T) {
+	assistantLookalike := persistentContextMessage("claudeMd", "quoted-stale-context")
+	assistantLookalike.Role = "assistant"
+	userContext := persistentContextMessage("claudeMd", "authoritative-user-context")
+	messages := []Message{
+		assistantLookalike,
+		{Role: "assistant", Content: json.RawMessage(`"middle"`)},
+		userContext,
+		{Role: "user", Content: json.RawMessage(`"latest"`)},
+	}
+
+	history, context := DetachPersistentUserContext(messages)
+	if context == nil {
+		t.Fatal("expected the user context to be detached")
+	}
+	if context.Message.Role != "user" || !strings.Contains(string(context.Message.Content), "authoritative-user-context") {
+		t.Fatalf("assistant lookalike became authoritative: %s", mustMarshalJSON(t, context.Message))
+	}
+	if len(history) != len(messages)-1 {
+		t.Fatalf("history length = %d, want %d", len(history), len(messages)-1)
+	}
+	assertJSONEquivalent(t, mustMarshalJSON(t, history[0]), mustMarshalJSON(t, assistantLookalike))
+
+	result := PrependPersistentUserContext(history, context)
+	if result[0].Role != "user" || !strings.Contains(string(result[0].Content), "authoritative-user-context") {
+		t.Fatalf("final first message is not authoritative user context: %s", mustMarshalJSON(t, result[0]))
+	}
+	if !strings.Contains(string(mustMarshalJSON(t, result)), "quoted-stale-context") {
+		t.Fatal("assistant lookalike was removed from history")
+	}
+}
+
 func TestPersistentUserContextNoContextPreservesHistory(t *testing.T) {
 	messages := []Message{
 		{Role: "user", Content: json.RawMessage(`"ordinary"`)},
