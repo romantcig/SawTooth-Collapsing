@@ -3,9 +3,123 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestMessageUnknownFieldsRoundTrip(t *testing.T) {
+	raw := []byte(`{"role":"user","content":"before","isMeta":true,"agent_id":"agent-7","future_object":{"enabled":true,"limit":17},"future_array":[1,null,{"mode":"strict"}],"future_null":null}`)
+
+	var message Message
+	if err := json.Unmarshal(raw, &message); err != nil {
+		t.Fatalf("unmarshal message: %v", err)
+	}
+	assertJSONEquivalent(t, mustMarshalJSON(t, message), raw)
+
+	message.Content = json.RawMessage(`"after"`)
+	got := mustMarshalJSON(t, message)
+	want := []byte(`{"role":"user","content":"after","isMeta":true,"agent_id":"agent-7","future_object":{"enabled":true,"limit":17},"future_array":[1,null,{"mode":"strict"}],"future_null":null}`)
+	assertJSONEquivalent(t, got, want)
+}
+
+func TestMessageUnknownNullRemainsDistinctFromAbsent(t *testing.T) {
+	var withNull Message
+	if err := json.Unmarshal([]byte(`{"role":"user","content":"same","future":null}`), &withNull); err != nil {
+		t.Fatalf("unmarshal explicit null: %v", err)
+	}
+	var absent Message
+	if err := json.Unmarshal([]byte(`{"role":"user","content":"same"}`), &absent); err != nil {
+		t.Fatalf("unmarshal absent field: %v", err)
+	}
+
+	var withNullObject map[string]json.RawMessage
+	if err := json.Unmarshal(mustMarshalJSON(t, withNull), &withNullObject); err != nil {
+		t.Fatalf("decode explicit-null result: %v", err)
+	}
+	if value, ok := withNullObject["future"]; !ok || string(value) != "null" {
+		t.Fatalf("explicit null not preserved: %s", mustMarshalJSON(t, withNull))
+	}
+
+	var absentObject map[string]json.RawMessage
+	if err := json.Unmarshal(mustMarshalJSON(t, absent), &absentObject); err != nil {
+		t.Fatalf("decode absent result: %v", err)
+	}
+	if _, ok := absentObject["future"]; ok {
+		t.Fatalf("absent field was synthesized: %s", mustMarshalJSON(t, absent))
+	}
+}
+
+func TestMessageUnknownFieldsSurviveDeepCopyAndAnyRoundTrip(t *testing.T) {
+	raw := []byte(`[{"role":"user","content":[{"type":"text","text":"keep"}],"isMeta":true,"agent_id":null,"future":{"items":[1,2,3]}}]`)
+	var messages []Message
+	if err := json.Unmarshal(raw, &messages); err != nil {
+		t.Fatalf("unmarshal messages: %v", err)
+	}
+
+	copied := deepCopyMessages(messages)
+	if copied == nil {
+		t.Fatal("deepCopyMessages returned nil")
+	}
+	assertJSONEquivalent(t, mustMarshalJSON(t, copied), raw)
+
+	roundTripped := anyToMessages(messagesToAny(messages))
+	assertJSONEquivalent(t, mustMarshalJSON(t, roundTripped), raw)
+}
+
+func TestMessageUnknownFieldsFrozenRoundTripAndHashSensitivity(t *testing.T) {
+	decode := func(raw string) Message {
+		t.Helper()
+		var message Message
+		if err := json.Unmarshal([]byte(raw), &message); err != nil {
+			t.Fatalf("unmarshal message: %v", err)
+		}
+		return message
+	}
+	withMetadata := decode(`{"role":"user","content":"prefix","isMeta":true,"future":null}`)
+	withoutMetadata := decode(`{"role":"user","content":"prefix"}`)
+	withJSON := mustMarshalJSON(t, []Message{withMetadata})
+	withoutJSON := mustMarshalJSON(t, []Message{withoutMetadata})
+	if sha256hex(withJSON) == sha256hex(withoutJSON) {
+		t.Fatal("frozen prefix hash ignored unknown message-level fields")
+	}
+
+	current := []Message{
+		withMetadata,
+		{Role: "assistant", Content: json.RawMessage(`"boundary"`)},
+	}
+	frozen := NewFrozenStubs()
+	frozen.Store("thread", current[:1], 2, current[1], 10, 20)
+	result := frozen.Get("thread", current)
+	if result == nil {
+		t.Fatal("expected frozen round-trip result")
+	}
+	assertJSONEquivalent(t, mustMarshalJSON(t, result.Messages), withJSON)
+}
+
+func mustMarshalJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal JSON: %v", err)
+	}
+	return data
+}
+
+func assertJSONEquivalent(t *testing.T, got, want []byte) {
+	t.Helper()
+	var gotValue any
+	if err := json.Unmarshal(got, &gotValue); err != nil {
+		t.Fatalf("decode got JSON: %v\n%s", err, got)
+	}
+	var wantValue any
+	if err := json.Unmarshal(want, &wantValue); err != nil {
+		t.Fatalf("decode want JSON: %v\n%s", err, want)
+	}
+	if !reflect.DeepEqual(gotValue, wantValue) {
+		t.Fatalf("JSON differs\ngot:  %s\nwant: %s", got, want)
+	}
+}
 
 // ---- buildToolUseKeywordMap tests ----
 
@@ -254,11 +368,11 @@ func TestExtractFallbackKeywordsEmptyInput(t *testing.T) {
 func TestExtractFallbackKeywordsAllFiltered(t *testing.T) {
 	// 所有字段都被过滤 → 只返回 tool name
 	input := map[string]any{
-		"thinking":       "thought content",
-		"signature":      "sig123",
-		"cache_control":  "ephemeral",
-		"short":          "ab",       // < 3 chars, filtered
-		"toolong":        strings.Repeat("x", 51), // > 50 chars, filtered
+		"thinking":      "thought content",
+		"signature":     "sig123",
+		"cache_control": "ephemeral",
+		"short":         "ab",                    // < 3 chars, filtered
+		"toolong":       strings.Repeat("x", 51), // > 50 chars, filtered
 	}
 	result := extractFallbackKeywords("MyTool", input)
 	if result != "MyTool" {
@@ -325,11 +439,11 @@ func TestSanitizeDSKeyword(t *testing.T) {
 		input    string
 		expected string
 	}{
-		{"Bash echo test", "Bash echo test"},                // 无特殊字符
-		{"Bash echo \"')\"", "Bash echo \" )\""},              // '') 被替换为 ' )'
-		{"grep ')' pattern ')", "grep  )' pattern  )"},        // 多处 '')
-		{"", ""},                                               // 空字符串
-		{"Read /app/main.go", "Read /app/main.go"},             // 正常路径
+		{"Bash echo test", "Bash echo test"},           // 无特殊字符
+		{"Bash echo \"')\"", "Bash echo \" )\""},       // '') 被替换为 ' )'
+		{"grep ')' pattern ')", "grep  )' pattern  )"}, // 多处 '')
+		{"", ""}, // 空字符串
+		{"Read /app/main.go", "Read /app/main.go"}, // 正常路径
 	}
 	for _, tt := range tests {
 		result := sanitizeDSKeyword(tt.input)
