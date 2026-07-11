@@ -118,6 +118,63 @@ func TestFrozenBoundaryHashCoversCompleteMessage(t *testing.T) {
 	}
 }
 
+func TestFrozenBoundaryIgnoresNonSemanticContentBlockShapeChanges(t *testing.T) {
+	t.Run("省略字段与显式 null 等价", func(t *testing.T) {
+		frozen := NewFrozenStubs()
+		current := frozenTestMessages(3)
+		current[1] = Message{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"tool-1","content":"same"}]`)}
+		frozen.Store("thread", current[:1], 2, current[1], 10, 20)
+
+		current[1].Content = json.RawMessage(`[{"type":"tool_result","tool_use_id":"tool-1","input":null,"content":"same"}]`)
+		if got := frozen.Get("thread", current); got == nil {
+			t.Fatal("仅出现无语义的 input:null 后 frozen boundary 不应失效")
+		}
+	})
+
+	t.Run("真实 tool_result 内容编辑仍失效", func(t *testing.T) {
+		frozen := NewFrozenStubs()
+		current := frozenTestMessages(3)
+		current[1] = Message{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"tool-1","content":"before"}]`)}
+		frozen.Store("thread", current[:1], 2, current[1], 10, 20)
+
+		current[1].Content = json.RawMessage(`[{"type":"tool_result","tool_use_id":"tool-1","input":null,"content":"after"}]`)
+		if got := frozen.Get("thread", current); got != nil {
+			t.Fatal("真实 tool_result 内容编辑后 frozen boundary 仍命中")
+		}
+	})
+
+	t.Run("未知扩展字段显式 null 保持语义敏感", func(t *testing.T) {
+		frozen := NewFrozenStubs()
+		current := frozenTestMessages(3)
+		current[1] = Message{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"tool-1","content":"same"}]`)}
+		frozen.Store("thread", current[:1], 2, current[1], 10, 20)
+
+		current[1].Content = json.RawMessage(`[{"type":"tool_result","tool_use_id":"tool-1","content":"same","future_semantic":null}]`)
+		if got := frozen.Get("thread", current); got != nil {
+			t.Fatal("未知扩展字段从 absent 变为显式 null 后 frozen boundary 仍命中")
+		}
+	})
+}
+
+func TestStableBoundaryHashPreservesUnprovenNullAndUnknownFields(t *testing.T) {
+	base := Message{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","content":["same",null]}]`)}
+	withArrayValue := Message{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","content":["same","changed"]}]`)}
+	if stableBoundaryHash(base) == stableBoundaryHash(withArrayValue) {
+		t.Fatal("数组中的 null 被错误规范化或忽略")
+	}
+
+	withUnknownNonNull := Message{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","content":["same",null],"future_semantic":"value"}]`)}
+	if stableBoundaryHash(base) == stableBoundaryHash(withUnknownNonNull) {
+		t.Fatal("未知非 null 扩展字段被错误规范化或忽略")
+	}
+
+	toolUseAbsentInput := Message{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","id":"tool-1","name":"Read"}]`)}
+	toolUseNullInput := Message{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","id":"tool-1","name":"Read","input":null}]`)}
+	if stableBoundaryHash(toolUseAbsentInput) == stableBoundaryHash(toolUseNullInput) {
+		t.Fatal("tool_use 的显式 input:null 被错误视为字段省略")
+	}
+}
+
 func TestFrozenColdStartRejectsInvalidCutoff(t *testing.T) {
 	current := frozenTestMessages(3)
 	prefix := deepCopyMessages(current[:1])

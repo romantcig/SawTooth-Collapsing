@@ -25,6 +25,42 @@ func TestCalcCollapseCutoffRespectsTokenFloorAndKeepRecent(t *testing.T) {
 	}
 }
 
+func TestCalcCollapseCutoffRejectsDegenerateFirstMessageOnlyCollapse(t *testing.T) {
+	tc := mustTokenCounter(t)
+	messages := collapseTextMessages(3, 20)
+	tokenFloor := tc.CountMessagesTokens(messages[1:])
+
+	if cutoff := CalcCollapseCutoff(messages, tokenFloor, tc, 0); cutoff != -1 {
+		t.Fatalf("cutoff = %d, want -1；仅折叠首条消息不会缩短消息数组", cutoff)
+	}
+}
+
+func TestCalcCollapseCutoffFinalGuardAfterBoundaryAdjustments(t *testing.T) {
+	tc := mustTokenCounter(t)
+
+	t.Run("keepRecent 将 cutoff 压回 1", func(t *testing.T) {
+		messages := collapseTextMessages(4, 20)
+		tokenFloor := tc.CountMessagesTokens(messages[2:])
+		if cutoff := CalcCollapseCutoff(messages, tokenFloor, tc, 3); cutoff != -1 {
+			t.Fatalf("cutoff = %d, want -1 after keepRecent adjustment", cutoff)
+		}
+	})
+
+	t.Run("tool pair 后退将 cutoff 压回 1", func(t *testing.T) {
+		messages := collapseTextMessages(4, 20)
+		messages[1] = Message{Role: "assistant", Content: rebuildContent([]ContentBlock{{
+			Type: "tool_use", ID: "tool-1", Name: "Read", Input: map[string]any{},
+		}}, true)}
+		messages[2] = Message{Role: "user", Content: rebuildContent([]ContentBlock{{
+			Type: "tool_result", ToolUseID: "tool-1", Content: "ok",
+		}}, true)}
+		tokenFloor := tc.CountMessagesTokens(messages[2:])
+		if cutoff := CalcCollapseCutoff(messages, tokenFloor, tc, 2); cutoff != -1 {
+			t.Fatalf("cutoff = %d, want -1 after tool-pair retreat", cutoff)
+		}
+	})
+}
+
 func TestCalcCollapseCutoffKeepsToolPairWithoutViolatingKeepRecent(t *testing.T) {
 	tc := mustTokenCounter(t)
 	messages := collapseTextMessages(8, 40)

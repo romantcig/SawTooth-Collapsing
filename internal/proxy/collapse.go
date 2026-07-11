@@ -40,7 +40,9 @@ func CalcCollapseCutoff(messages []Message, tokenFloor int, tc *TokenCounter, ke
 		}
 	}
 
-	if cutoff < 1 {
+	// cutoff=1 只会 blank 首条消息并再插入它的 archive，消息数反而增加，
+	// 且摘要范围退化为 1–0；至少需要归档首条之外的一条历史消息。
+	if cutoff < 2 {
 		return -1
 	}
 
@@ -69,6 +71,9 @@ func CalcCollapseCutoff(messages []Message, tokenFloor int, tc *TokenCounter, ke
 		} else if cutoff > 1 && messages[cutoff-1].Role == "assistant" && hasToolUseContent(messages[cutoff-1].Content) {
 			cutoff--
 		}
+	}
+	if cutoff < 2 {
+		return -1
 	}
 
 	return cutoff

@@ -449,11 +449,35 @@ func stableBoundaryHash(msg Message) string {
 		data, _ := json.Marshal(msg)
 		return sha256hex(data)
 	}
+	content = normalizeBoundaryContent(content)
 	canonical, _ := json.Marshal(struct {
 		Role    string `json:"role"`
 		Content any    `json:"content"`
 	}{Role: msg.Role, Content: content})
 	return sha256hex(canonical)
+}
+
+// normalizeBoundaryContent 只消除 ContentBlock typed round-trip 已确证产生的
+// 非语义差异：text/thinking/tool_result 块本身不使用 input，但 ContentBlock.Input
+// 缺少 omitempty 会把省略字段重编码为 input:null。未知字段、数组 null 和 tool_use
+// 的 input 均保持原样，避免把未来协议中的显式 null 与 absent 混同。
+func normalizeBoundaryContent(content any) any {
+	blocks, ok := content.([]any)
+	if !ok {
+		return content
+	}
+	for _, block := range blocks {
+		object, ok := block.(map[string]any)
+		if !ok || object["input"] != nil {
+			continue
+		}
+		typeName, _ := object["type"].(string)
+		switch typeName {
+		case "text", "thinking", "tool_result":
+			delete(object, "input")
+		}
+	}
+	return blocks
 }
 
 // sha256hex 返回 data 的十六进制编码 SHA-256 hash。
