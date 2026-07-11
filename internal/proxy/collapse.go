@@ -33,7 +33,7 @@ func CalcCollapseCutoff(messages []Message, tokenFloor int, tc *TokenCounter, ke
 	kept := 0
 	cutoff := -1
 	for i := n - 1; i >= 1; i-- {
-		kept += countMessageTokens(messages[i], tc)
+		kept += tc.CountMessageTokens(messages[i])
 		if kept >= tokenFloor {
 			cutoff = i
 			break
@@ -210,7 +210,7 @@ func blankFirstMessage(messages []Message, tc *TokenCounter) []Message {
 	archivedCount := len(messages) - 1
 	archivedTokens := 0
 	for i := 1; i < len(messages); i++ {
-		archivedTokens += countMessageTokens(messages[i], tc)
+		archivedTokens += tc.CountMessageTokens(messages[i])
 	}
 
 	placeholder := fmt.Sprintf(
@@ -226,35 +226,6 @@ func blankFirstMessage(messages []Message, tc *TokenCounter) []Message {
 }
 
 // ── 私有辅助函数 ──
-
-// countMessageTokens 对单条消息估算 token 数。
-// 计入所有 block 类型（text, thinking, tool_use, tool_result），对齐 CountMessagesTokens。
-func countMessageTokens(msg Message, tc *TokenCounter) int {
-	total := perMessageOverhead + tc.CountTokens(msg.Role)
-	blocks, _ := parseContent(msg.Content)
-	for _, b := range blocks {
-		switch b.Type {
-		case "text":
-			total += tc.CountTokens(b.Text)
-		case "thinking":
-			total += tc.CountTokens(b.Thinking)
-		case "tool_use":
-			total += tc.CountTokens(b.Name)
-			if b.Input != nil {
-				if data, err := json.Marshal(b.Input); err == nil {
-					total += tc.CountTokens(string(data))
-				}
-			}
-		case "tool_result":
-			total += countToolResultTokens(b.Content, tc)
-		default:
-			if data, err := json.Marshal(b); err == nil {
-				total += tc.CountTokens(string(data))
-			}
-		}
-	}
-	return total
-}
 
 // hasToolResultContent 检查消息的 content 中是否包含 tool_result 类型的 block。
 func hasToolResultContent(content json.RawMessage) bool {
