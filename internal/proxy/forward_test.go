@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,28 @@ import (
 	"testing"
 	"time"
 )
+
+type failingDebugFile struct {
+	file     *os.File
+	writeErr error
+	closeErr error
+}
+
+func (f *failingDebugFile) Write(data []byte) (int, error) {
+	if f.writeErr != nil {
+		n, _ := f.file.Write(data[:len(data)/2])
+		return n, f.writeErr
+	}
+	return f.file.Write(data)
+}
+
+func (f *failingDebugFile) Close() error {
+	err := f.file.Close()
+	if f.closeErr != nil {
+		return f.closeErr
+	}
+	return err
+}
 
 func TestWriteDebugFileRedactsCredentialHeaders(t *testing.T) {
 	dataDir := t.TempDir()
@@ -96,6 +119,34 @@ func TestWriteDebugFileUsesRequestIDToPreventCollisions(t *testing.T) {
 	}
 	if entries[0].Name() == entries[1].Name() {
 		t.Fatalf("并发请求文件名冲突: %s", entries[0].Name())
+	}
+}
+
+func TestWriteDebugEntryFileRemovesPartialFileOnFailure(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		writeErr error
+		closeErr error
+	}{
+		{name: "write error", writeErr: errors.New("injected write error")},
+		{name: "close error", closeErr: errors.New("injected close error")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			filePath := filepath.Join(t.TempDir(), "entry.json")
+			err := writeDebugEntryFile(filePath, []byte(`{"complete":true}`), func(name string, flag int, perm os.FileMode) (debugWriteCloser, error) {
+				file, err := os.OpenFile(name, flag, perm)
+				if err != nil {
+					return nil, err
+				}
+				return &failingDebugFile{file: file, writeErr: tt.writeErr, closeErr: tt.closeErr}, nil
+			})
+			if err == nil {
+				t.Fatal("注入失败后应返回错误")
+			}
+			if _, statErr := os.Stat(filePath); !os.IsNotExist(statErr) {
+				t.Fatalf("失败后残留截断 debug 文件: %v", statErr)
+			}
+		})
 	}
 }
 

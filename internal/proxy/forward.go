@@ -85,6 +85,13 @@ type debugEntry struct {
 	Body         json.RawMessage `json:"body"`
 }
 
+type debugWriteCloser interface {
+	Write([]byte) (int, error)
+	Close() error
+}
+
+type debugFileOpener func(string, int, os.FileMode) (debugWriteCloser, error)
+
 // writeDebugFile 将请求/响应落盘到 data_dir/debug/{sessionID}/{timestamp}-{direction}.json（D-03）。
 // headers 参数仅在 req 方向传入（用于 redact Authorization）。
 func (s *Server) writeDebugFile(sessionID string, requestID uint64, timestamp time.Time, direction string, body []byte, headers http.Header, model string, messageCount int) {
@@ -141,19 +148,32 @@ func (s *Server) writeDebugFile(sessionID string, requestID uint64, timestamp ti
 		return
 	}
 
-	file, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
+	if err := writeDebugEntryFile(filePath, data, func(name string, flag int, perm os.FileMode) (debugWriteCloser, error) {
+		return os.OpenFile(name, flag, perm)
+	}); err != nil {
 		slog.Warn("无法写入 debug 文件", "file", filePath, "error", err)
-		return
 	}
-	if _, err := file.Write(data); err != nil {
+}
+
+func writeDebugEntryFile(filePath string, data []byte, openFile debugFileOpener) error {
+	file, err := openFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	n, writeErr := file.Write(data)
+	if writeErr == nil && n != len(data) {
+		writeErr = io.ErrShortWrite
+	}
+	if writeErr != nil {
 		_ = file.Close()
-		slog.Warn("无法写入 debug 文件", "file", filePath, "error", err)
-		return
+		_ = os.Remove(filePath)
+		return writeErr
 	}
 	if err := file.Close(); err != nil {
-		slog.Warn("无法关闭 debug 文件", "file", filePath, "error", err)
+		_ = os.Remove(filePath)
+		return err
 	}
+	return nil
 }
 
 func safeDebugSessionDir(dataDir, sessionID string) (string, bool) {
