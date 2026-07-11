@@ -205,6 +205,11 @@ func blankFirstMessage(messages []Message, tc *TokenCounter) []Message {
 	if len(result) == 0 {
 		return result
 	}
+	// Collapse 的正常输入应已 detach 持久 user context；包内直接调用若违反
+	// 该边界，fail-safe 保留首消息，避免把本轮 CLAUDE.md 等规则替换成占位符。
+	if ExtractPersistentUserContext(result[:1]) != nil {
+		return result
+	}
 
 	// 计算折叠消息的 N 和 X
 	archivedCount := len(messages) - 1
