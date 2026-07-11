@@ -2,14 +2,17 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: Clean slate
-last_updated: "2026-07-09"
+status: in_progress
+stopped_at: Completed 07.1-08-PLAN.md
+last_updated: "2026-07-11T00:19:41.660Z"
+last_activity: 2026-07-10
 progress:
   total_phases: 8
-  completed_phases: 8
-  total_plans: 13
-  completed_plans: 13
-  percent: 100
+  completed_phases: 1
+  total_plans: 10
+  completed_plans: 9
+  percent: 13
+current_phase: 07.1
 ---
 
 # State: Sawtooth Proxy
@@ -44,7 +47,56 @@ Phase 08 (yesmem-gaps) 已完成 — 对齐 YesMem 压缩管线 4 缺口（B→C
 | 260711-32d | 将日志格式改为时间戳加方括号级别，并仅为级别文字着色 | 2026-07-11 | 21717fe | [260711-32d-log-level-prefix-color](./quick/260711-32d-log-level-prefix-color/) |
 | 260711-4e0 | 修复上游 Base URL 尾斜杠导致请求路径错误，并添加回归测试 | 2026-07-11 | 1fa804d | [260711-4e0-base-url](./quick/260711-4e0-base-url/) |
 
-Last activity: 2026-07-11 - Completed quick task 260711-4e0: 修复上游 Base URL 尾斜杠导致请求路径错误
+Last activity: 2026-07-10
 
 ---
 *Last updated: 2026-07-09*
+
+## Accumulated Context
+
+### Roadmap Evolution
+
+- Phase 07.1 inserted after Phase 7: Frozen、Archive 召回与多 Agent 隔离修复 (URGENT)
+
+## Performance Metrics
+
+| Phase | Plan | Duration | Notes |
+|-------|------|----------|-------|
+| Phase 07.1-frozen-archive-agent P01 | 1min | 2 tasks | 6 files |
+| Phase 07.1-frozen-archive-agent P02 | 9 min | 2 tasks | 5 files |
+| Phase 07.1-frozen-archive-agent P03 | 13min | 2 tasks | 2 files |
+| Phase 07.1-frozen-archive-agent P04 | 27min | 2 tasks | 6 files |
+| Phase 07.1-frozen-archive-agent P05 | 8min | 2 tasks | 4 files |
+| Phase 07.1-frozen-archive-agent P06 | 27min | 2 tasks | 6 files |
+| Phase 07.1-frozen-archive-agent P07 | 24min | 2 tasks | 5 files |
+| Phase 07.1-frozen-archive-agent P08 | 11min | 2 tasks | 8 files |
+
+## Decisions
+
+- [Phase 07.1-frozen-archive-agent]: 当前没有可验证的 parent header；parent marker 保持 false、关系保持 unavailable，不猜测父 session。 — 防止跨 session 错配和敏感 ID 进入诊断。
+- [Phase 07.1-frozen-archive-agent]: sdk-ts 只作为兼容 marker，thinking 只记录存在性；Plan 01 不改变现有代理身份判断。 — 分类重写由 Plan 07 基于 fixture 证据完成。
+- [Phase 07.1-frozen-archive-agent]: LengthFor 只返回 frozen prefix 消息数，FrozenResult.Cutoff 继续保留原始请求坐标。 — 防止 raw cutoff 与压缩后 prefix length 再次混用。
+- [Phase 07.1-frozen-archive-agent]: UpdateMessages 仅允许等长覆盖，并保留 cutoff、boundary 与 token 元数据持久化新 bytes/hash。 — 保证冷启动恢复与 Freeze turn 已发送前缀一致。
+- [Phase 07.1-frozen-archive-agent]: tool pair 与 keepRecent 冲突时，无法整对折叠则后退 cutoff 保留整对。 — 同时避免孤立 tool_result 和 recent tail 缩短。
+- [Phase 07.1-frozen-archive-agent]: FrozenResult.Cutoff 只用于原始 history 的 boundary 验证与 fresh tail 切片；cache、EagerStub 和 snapshot 边界使用 frozen prefix length。 — 防止 raw cutoff 与压缩后 prefix length 再次混用。
+- [Phase 07.1-frozen-archive-agent]: collapse 当轮先完成 EagerStub 与 orphan repair，再注入 cache breakpoint 并 Store 最终发送 prefix bytes。 — 保证 freeze 与 restore 的上游 prefix JSON bytes 一致。
+- [Phase 07.1-frozen-archive-agent]: RecallOutcome 只统计实际进入返回 Messages 的候选，预算不足候选计入 Discarded。 — 保证日志、TokenCost 与最终 wire body 一致。
+- [Phase 07.1-frozen-archive-agent]: 共享 Budget 逐候选使用 RemainingReExpansion 即时门控和扣费，nil Budget 使用 tokenThreshold/10 本地硬上限。 — 阻止单请求累计超支并保持 nil 路径同等安全。
+- [Phase 07.1-frozen-archive-agent]: HandleMessages 在 Frozen 最终判定后执行唯一一次 Archive 召回。 — 消除失效路径的二次搜索、重复副作用和虚假注入记录。
+- [Phase 07.1-frozen-archive-agent]: 保留随机 UUID 作为 Archive 引用 ID，以 session、range 与 canonical messages SHA-256 作为新写入逻辑身份。 — 避免破坏现有外键与搜索引用，同时停止以随机 ID 作为幂等边界。
+- [Phase 07.1-frozen-archive-agent]: 历史行 content_hash 保持 NULL，不回填、不删除；partial unique index 只约束非空新 hash。 — 允许已有重复旧库无损原地打开。
+- [Phase 07.1-frozen-archive-agent]: SaveArchive 由 SQLite ON CONFLICT DO NOTHING 与 RowsAffected 决定是否写关键词。 — 以数据库唯一约束消除并发 SELECT-then-INSERT 竞态。
+- [Phase 07.1-frozen-archive-agent]: Archive 召回只接受显式信号，并使用同 session 2 词、跨 session 3 词或精确路径完全匹配门槛。 — 阻止普通 tool/公共词触发跨会话信息污染。
+- [Phase 07.1-frozen-archive-agent]: 召回候选在预算前按 content hash 与 80% 区间重叠去重，且每请求全局最多一次完整展开。 — 避免同一历史以 full 与重复 summary 多次污染上下文。
+- [Phase 07.1-frozen-archive-agent]: sdk-ts marker 优先识别可靠子代理；DeepSeek 模型族作为主代理证据，missing-thinking 不再决定身份；没有受支持 marker 时返回 unknown。 — 避免 missing-thinking 假阳性，同时让每个身份结论具有受限 reason。
+- [Phase 07.1-frozen-archive-agent]: parent Frozen 只接受显式 X-Claude-Code-Parent-Session-Id、非空且非自引用关系，并继续通过 Frozen.Get 校验 cutoff、boundary 和 prefix hash。 — 防止 child session 猜测或误用任意会话 Frozen。
+- [Phase 07.1-frozen-archive-agent]: subagent/unknown 无 Frozen 替换时直接转发原 body bytes，只有 parent Frozen 实际替换前缀后才重序列化。 — 保持 DeepSeek/OpenAI 请求前缀 bytes 稳定并减少无意义变换。
+- [Phase 07.1-frozen-archive-agent]: request_id 使用 Server 内 atomic.Uint64 从 1 单调分配，并通过 request-scoped logger 固定 request_id/request_session_id。 — 在不修改日志格式器或增加 goroutine 缓冲的前提下，使并发请求链可独立审计。
+- [Phase 07.1-frozen-archive-agent]: 入口与上游发送分别使用 original_message_count 和 forwarded_message_count，Archive 来源只使用 source_session_id。 — 消除处理前后计数和当前/来源 session 的语义混淆。
+- [Phase 07.1-frozen-archive-agent]: 显式 Archive 召回尝试只输出一次基于最终 RecallOutcome 的 Info 汇总，逐块与预算降级明细降为 Debug。 — 保证日志描述最终发送状态并限制 Info 日志量。
+
+## Session
+
+**Last session:** 2026-07-11T00:19:41.648Z
+**Stopped at:** Completed 07.1-08-PLAN.md
+**Resume file:** None
