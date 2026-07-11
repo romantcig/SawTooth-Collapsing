@@ -190,6 +190,40 @@ func TestFrozenConcurrentPersistenceKeepsStateOrder(t *testing.T) {
 	}
 }
 
+func TestFrozenBoundaryInvalidationDeletesPersistedStateOnce(t *testing.T) {
+	persisted := make(map[string]string)
+	source := NewFrozenStubs()
+	source.SetPersistFunc(func(key, value string) { persisted[key] = value })
+	current := frozenTestMessages(3)
+	source.Store("thread", current[:1], 2, current[1], 10, 20)
+
+	loadCalls := 0
+	deleteCalls := 0
+	restored := NewFrozenStubs()
+	restored.SetLoadFunc(func(key string) (string, bool) {
+		loadCalls++
+		value, ok := persisted[key]
+		return value, ok
+	})
+	restored.SetDeleteFunc(func(key string) {
+		deleteCalls++
+		delete(persisted, key)
+	})
+	current[1].Content = mustMarshal("edited boundary")
+	if got := restored.Get("thread", current); got != nil {
+		t.Fatal("boundary 不匹配时不应返回 frozen")
+	}
+	if _, ok := persisted["frozen:thread"]; ok {
+		t.Fatal("boundary 不匹配后持久化 frozen 状态未删除")
+	}
+	if got := restored.Get("thread", current); got != nil {
+		t.Fatal("重复 Get 不应恢复已失效 frozen")
+	}
+	if loadCalls != 1 || deleteCalls != 1 {
+		t.Fatalf("失效状态重复加载或删除: load=%d delete=%d", loadCalls, deleteCalls)
+	}
+}
+
 func frozenTestMessages(count int) []Message {
 	messages := make([]Message, count)
 	for i := range messages {

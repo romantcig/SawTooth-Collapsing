@@ -364,6 +364,23 @@ func TestSQLiteStoreCloseCheckpointErrorPreservesCompanions(t *testing.T) {
 	}
 }
 
+func TestSQLiteStoreDeleteState(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "delete-state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.PersistState("frozen:thread", "value"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteState("frozen:thread"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.LoadState("frozen:thread"); ok {
+		t.Fatal("DeleteState 后仍能加载状态")
+	}
+}
+
 // ---- NewSQLiteStore 损坏自动恢复测试 ----
 
 // 场景：主 DB 文件是纯文本假数据库（模拟磁盘损坏/外部篡改），

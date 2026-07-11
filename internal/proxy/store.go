@@ -319,6 +319,14 @@ func (s *SQLiteStore) LoadState(key string) (string, bool) {
 	return value, true
 }
 
+// DeleteState 删除持久化状态键，用于移除已确认失效或损坏的 frozen 快照。
+func (s *SQLiteStore) DeleteState(key string) error {
+	if _, err := s.db.Exec(`DELETE FROM frozen_state WHERE key = ?`, key); err != nil {
+		return fmt.Errorf("删除状态失败 key=%s: %w", key, err)
+	}
+	return nil
+}
+
 // SearchArchives 通过 FTS5 MATCH + bm25() 搜索匹配的 archive 摘要（D-07, D-11）。
 // query 应当已经过 buildFTS5Query 清洗——所有 token 已双引号包裹（phrase literal），
 // 参数化查询 ? 防止 SQL 注入，双引号包裹防止 FTS5 语法注入。

@@ -16,6 +16,9 @@ type PersistFunc func(key, value string)
 // 返回 value 和是否找到。
 type LoadFunc func(key string) (string, bool)
 
+// DeleteFunc 删除外部存储中的指定状态键。
+type DeleteFunc func(key string)
+
 // FrozenStubs 存储每个 thread 的冻结桩化消息前缀，用于缓存优化。
 // 桩化周期之间，冻结前缀被逐字节复用，使 API 缓存在前缀部分可命中。
 type FrozenStubs struct {
@@ -31,6 +34,7 @@ type FrozenStubs struct {
 	lastAccess   map[string]time.Time
 	persistFn    PersistFunc     // 可选：持久化 frozen 状态到 DB
 	loadFn       LoadFunc        // 可选：冷启动时从 DB 加载 frozen 状态
+	deleteFn     DeleteFunc      // 可选：失效时删除 DB 中的 frozen 状态
 	loadedFromDB map[string]bool // threadID → 已尝试从 DB 加载
 }
 
@@ -85,6 +89,13 @@ func (f *FrozenStubs) SetLoadFunc(fn LoadFunc) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.loadFn = fn
+}
+
+// SetDeleteFunc 设置 frozen 状态失效时的持久化删除回调。
+func (f *FrozenStubs) SetDeleteFunc(fn DeleteFunc) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleteFn = fn
 }
 
 // Store 冻结指定 thread 的桩化消息。
@@ -314,7 +325,11 @@ func (f *FrozenStubs) InvalidateWithLogger(logger *slog.Logger, threadID string)
 	delete(f.tokens, threadID)
 	delete(f.rawTokens, threadID)
 	delete(f.lastAccess, threadID)
-	delete(f.loadedFromDB, threadID)
+	// 已知坏状态失效后保留“本进程已加载”标记，防止删除失败时反复恢复。
+	f.loadedFromDB[threadID] = true
+	if f.deleteFn != nil {
+		f.deleteFn("frozen:" + threadID)
+	}
 	logger.Warn("frozen prefix 已失效", "thread_id", threadID)
 }
 
@@ -375,9 +390,11 @@ func (f *FrozenStubs) loadFrozenFromDB(logger *slog.Logger, threadID string) {
 
 	var fp frozenPersisted
 	if err := json.Unmarshal([]byte(raw), &fp); err != nil {
+		f.InvalidateWithLogger(logger, threadID)
 		return
 	}
 	if len(fp.Messages) == 0 || fp.Cutoff <= 0 || fp.BoundaryHash == "" || fp.PrefixHash == "" || fp.Tokens < 0 || fp.RawTokens < 0 {
+		f.InvalidateWithLogger(logger, threadID)
 		return
 	}
 
@@ -385,6 +402,7 @@ func (f *FrozenStubs) loadFrozenFromDB(logger *slog.Logger, threadID string) {
 	frozenJSON, _ := json.Marshal(fp.Messages)
 	if sha256hex(frozenJSON) != fp.PrefixHash {
 		logger.Warn("从 DB 恢复的 frozen 状态 hash 不匹配，丢弃", "thread_id", threadID)
+		f.InvalidateWithLogger(logger, threadID)
 		return
 	}
 

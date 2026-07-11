@@ -77,6 +77,9 @@ func main() {
 		_ = store.PersistState(key, value) // best-effort，忽略错误
 	})
 	frozenStore.SetLoadFunc(store.LoadState)
+	frozenStore.SetDeleteFunc(func(key string) {
+		_ = store.DeleteState(key) // best-effort，内存标记仍防止当前进程重复加载
+	})
 	if cfg.Frozen.Enabled {
 		srv.Frozen = frozenStore
 	}
@@ -88,7 +91,7 @@ func main() {
 	sawtoothTrigger := proxy.NewSawtoothTrigger(
 		proxy.CacheGapForTTL(cfg.Cache.CacheTTL), // Phase 8 D7: 从 cache_ttl 推导（替代硬编码 330s）
 		cfg.Stubify.TokenThreshold,               // tokenThreshold (D-03: 复用 stubify)
-		cfg.Stubify.TokenThreshold/2,              // tokenMinimum (D-03: threshold/2)
+		cfg.Stubify.TokenThreshold/2,             // tokenMinimum (D-03: threshold/2)
 	)
 	sawtoothTrigger.SetPersistFunc(func(key, value string) {
 		_ = store.PersistState(key, value) // best-effort，忽略错误
