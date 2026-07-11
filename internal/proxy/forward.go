@@ -333,6 +333,9 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 	)
 
 	timestamp := time.Now()
+	// 未进入结构化压缩管线（未初始化或解析降级）时，当前 body 同时是 raw inbound。
+	// 正常管线已在任何变换前写入 raw，requestMeta 的 once 会阻止最终 body 覆盖它。
+	s.writeRequestDebugFacts(meta, timestamp, debugStageRawInbound, body, r)
 	s.writeRequestDebugFacts(meta, timestamp, debugStageForwarded, body, r)
 
 	// 步骤 2: Debug 写请求体
