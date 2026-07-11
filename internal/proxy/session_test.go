@@ -396,9 +396,6 @@ func TestAgentContextStrongFeatures(t *testing.T) {
 			if got.Role != tt.role || string(got.Reason) != tt.reason {
 				t.Fatalf("classification = %#v, want role=%q reason=%q", got, tt.role, tt.reason)
 			}
-			if got.ParentAvailable || got.ParentSessionID != "" {
-				t.Fatalf("分类结果不得暴露 parent ID: %#v", got)
-			}
 		})
 	}
 }

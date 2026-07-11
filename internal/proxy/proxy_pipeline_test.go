@@ -187,8 +187,15 @@ func testHandleMessagesDirectAgentBypass(t *testing.T, _ ...string) {
 	if len(forwardedBodies) != 1 {
 		t.Fatalf("forward calls = %d, want 1", len(forwardedBodies))
 	}
-	if !bytes.Equal(forwardedBodies[0], body) {
-		t.Fatalf("direct-forward body changed\ngot:  %s\nwant: %s", forwardedBodies[0], body)
+	var forwarded struct {
+		Messages []Message `json:"messages"`
+	}
+	if err := json.Unmarshal(forwardedBodies[0], &forwarded); err != nil {
+		t.Fatalf("decode forwarded subagent body: %v", err)
+	}
+	assertPersistentContext(t, forwarded.Messages, "subagent-current")
+	if len(forwarded.Messages) != len(messages) {
+		t.Fatalf("subagent message count=%d, want %d", len(forwarded.Messages), len(messages))
 	}
 }
 

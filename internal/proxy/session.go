@@ -64,13 +64,9 @@ const (
 
 var billingSubagentMarkerPattern = regexp.MustCompile(`(?i)(?:^|[\s,;])cc_is_subagent\s*=\s*true(?:$|[\s,;])`)
 
-const parentSessionHeader = "X-Claude-Code-Parent-Session-Id"
-
 type agentClassification struct {
-	Role            agentRole
-	Reason          agentClassificationReason
-	ParentSessionID string
-	ParentAvailable bool
+	Role   agentRole
+	Reason agentClassificationReason
 }
 
 // agentRequestFeatures 只保存代理分类所需的脱敏事实。

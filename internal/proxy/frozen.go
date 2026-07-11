@@ -98,10 +98,10 @@ func (f *FrozenStubs) SetDeleteFunc(fn DeleteFunc) {
 	f.deleteFn = fn
 }
 
-// Store 冻结指定 thread 的桩化消息。
+// Store 冻结指定 thread 的 detached historical prefix。
 // 深拷贝消息并计算 boundary/prefix hash 用于验证。
-// cutoff 是原始消息总数（第一条未桩化消息的索引）。
-// boundaryMsg 是 originalMessages[cutoff-1]，用于 boundary 验证。
+// cutoff 是 detached history 总数（第一条未桩化历史消息的索引）。
+// boundaryMsg 是 historicalMessages[cutoff-1]，用于 boundary 验证。
 func (f *FrozenStubs) Store(threadID string, stubbed []Message, cutoff int, boundaryMsg Message, tokenEstimate int, rawTokenEstimate int) {
 	f.StoreWithLogger(slog.Default(), threadID, stubbed, cutoff, boundaryMsg, tokenEstimate, rawTokenEstimate)
 }
@@ -112,6 +112,10 @@ func (f *FrozenStubs) StoreWithLogger(logger *slog.Logger, threadID string, stub
 	}
 	if cutoff <= 0 || tokenEstimate < 0 || rawTokenEstimate < 0 {
 		logger.Warn("frozen 状态元数据非法，跳过存储", "thread_id", threadID, "cutoff", cutoff)
+		return
+	}
+	if ExtractPersistentUserContext(stubbed) != nil {
+		logger.Warn("frozen prefix 包含 persistent user context，拒绝存储", "thread_id", threadID)
 		return
 	}
 	frozen := deepCopyMessages(stubbed)
@@ -267,6 +271,9 @@ func (f *FrozenStubs) LengthFor(threadID string) int {
 // 要求 newMsgs 长度与已有条目一致（防止同一管线内二次 sawtooth 触发）。
 // 返回是否成功更新。
 func (f *FrozenStubs) UpdateMessages(threadID string, newMsgs []Message) bool {
+	if ExtractPersistentUserContext(newMsgs) != nil {
+		return false
+	}
 	fresh := deepCopyMessages(newMsgs)
 	if fresh == nil {
 		return false
@@ -393,7 +400,7 @@ func (f *FrozenStubs) loadFrozenFromDB(logger *slog.Logger, threadID string) {
 		f.InvalidateWithLogger(logger, threadID)
 		return
 	}
-	if len(fp.Messages) == 0 || fp.Cutoff <= 0 || fp.BoundaryHash == "" || fp.PrefixHash == "" || fp.Tokens < 0 || fp.RawTokens < 0 {
+	if len(fp.Messages) == 0 || fp.Cutoff <= 0 || fp.BoundaryHash == "" || fp.PrefixHash == "" || fp.Tokens < 0 || fp.RawTokens < 0 || ExtractPersistentUserContext(fp.Messages) != nil {
 		f.InvalidateWithLogger(logger, threadID)
 		return
 	}

@@ -321,62 +321,14 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		features := extractAgentRequestFeatures(r, bodyMap, messages)
 		logAgentRequestFeatures(meta.Logger, features)
 		classification := classifyAgentRequest(r, bodyMap, messages)
-
-		// 可靠子代理与身份不明请求必须在 Archive/压缩/持久化副作用前返回。
-		// 子代理仅在请求提供显式 parent 关联时读取父 session Frozen；unknown
-		// 不读取任何 Frozen，避免把不可信身份映射为另一会话。
-		if classification.Role == agentRoleSubagent || classification.Role == agentRoleUnknown {
-			meta.Logger.Info("Agent 请求安全直通",
-				"model", extractModelFromBody(body),
-				"message_count", len(messages),
-				"agent_role", classification.Role,
-				"agent_reason", classification.Reason,
-				"parent_available", classification.ParentAvailable,
-				LogDim,
-			)
-
-			frozenReplaced := false
-			if classification.Role == agentRoleSubagent && classification.ParentAvailable && s.Frozen != nil {
-				frozenResult := s.Frozen.GetWithLogger(meta.Logger, classification.ParentSessionID, messages)
-				if frozenResult != nil && frozenResult.Cutoff > 0 {
-					if frozenResult.Cutoff <= len(messages) {
-						messages = append(frozenResult.Messages, messages[frozenResult.Cutoff:]...)
-					} else {
-						messages = frozenResult.Messages
-					}
-					frozenReplaced = true
-				}
-			} else if classification.Role == agentRoleSubagent && !classification.ParentAvailable {
-				meta.Logger.Debug("parent_frozen_unavailable",
-					"agent_reason", classification.Reason,
-				)
-			}
-
-			if frozenReplaced {
-				msgBytes, err := json.Marshal(messages)
-				if err == nil {
-					bodyMap["messages"] = json.RawMessage(msgBytes)
-					if newBody, marshalErr := json.Marshal(bodyMap); marshalErr == nil {
-						r.Body = io.NopCloser(bytes.NewReader(newBody))
-					} else {
-						meta.Logger.Warn("Agent 请求体重建失败，回退原样转发", "error", marshalErr)
-						r.Body = io.NopCloser(bytes.NewReader(body))
-					}
-				} else {
-					meta.Logger.Warn("Agent 消息序列化失败，回退原样转发", "error", err)
-					r.Body = io.NopCloser(bytes.NewReader(body))
-				}
-			} else {
-				r.Body = io.NopCloser(bytes.NewReader(body))
-			}
-
-			s.forwardRaw(w, r, meta)
-			return
+		rawMessages := messages
+		historyMessages, currentContext := DetachPersistentUserContext(rawMessages)
+		finalizeMessages := func(history []Message) []Message {
+			return PrependPersistentUserContext(history, currentContext)
 		}
-
-		// 辅助函数：将处理后的 messages 写回 bodyMap 并 marshal
-		rebuildBody := func(msgs []Message) ([]byte, error) {
-			data, err := json.Marshal(msgs)
+		// 所有结构化管线出口只通过此 finalizer 重附加本轮权威 context。
+		rebuildBody := func(history []Message) ([]byte, error) {
+			data, err := json.Marshal(finalizeMessages(history))
 			if err != nil {
 				return nil, err
 			}
@@ -384,11 +336,37 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			return json.Marshal(bodyMap)
 		}
 
+		// 可靠子代理必须在 Frozen、Archive、压缩和持久化副作用前透明返回。
+		// agentContext.parentSessionId 只参与分类，绝不作为另一个 session 的状态键。
+		if classification.Role == agentRoleSubagent {
+			meta.Logger.Info("Agent 请求安全直通",
+				"model", extractModelFromBody(body),
+				"message_count", len(rawMessages),
+				"agent_role", classification.Role,
+				"agent_reason", classification.Reason,
+				LogDim,
+			)
+			newBody, err := rebuildBody(historyMessages)
+			if err != nil {
+				meta.Logger.Warn("Agent 请求体透明重建失败，回退原样转发", "error", err)
+				newBody = body
+			}
+			r.Body = io.NopCloser(bytes.NewReader(newBody))
+			s.forwardRaw(w, r, meta)
+			return
+		}
+		messages = historyMessages
+
 		// Phase 4 Step 0: 保存原始 token 估算和消息数（SawtoothTrigger + frozen cutoff）
 		// rawCutoff 必须在 reexpand 前保存——reexpand 会注入 archive block 增加消息数
 		// 对标 YesMem: cutoff := len(messages) 使用原始（未修改）消息数
-		rawEstimate := s.TokenCounter.CountMessagesTokens(messages)
+		rawEstimate := s.TokenCounter.CountMessagesTokens(rawMessages)
 		rawCutoff := len(messages)
+		historyEstimate := s.TokenCounter.CountMessagesTokens(messages)
+		contextTokens := rawEstimate - historyEstimate
+		if contextTokens < 0 {
+			contextTokens = 0
+		}
 
 		// Phase 6 Step 0: StripReminders (REMIND-04) — 在 Frozen.Get / SearchAndExpand 之前
 		// 移除旧消息中过期的 system-reminder / skill-hint，使 frozen prefix 的 boundary hash
@@ -438,7 +416,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 先基于 frozen+tail 判定 frozen 是否仍有效，确定本请求唯一的权威基础消息。
-		totalTokens := s.TokenCounter.CountMessagesTokens(messages)
+		totalTokens := contextTokens + s.TokenCounter.CountMessagesTokens(messages)
 		threshold := s.Config.Stubify.TokenThreshold
 
 		// ── YesMem shouldInvalidateFrozen ──
@@ -452,7 +430,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			if frozenRawCutoff <= len(originalMessages) {
 				tailTokens = s.TokenCounter.CountMessagesTokens(originalMessages[frozenRawCutoff:])
 			}
-			combinedTokens := frozenTokens + tailTokens
+			combinedTokens := contextTokens + frozenTokens + tailTokens
 			if combinedTokens <= threshold {
 				needCompress = false
 				meta.Logger.Info("frozen prefix 仍在阈值内，跳过压缩",
@@ -477,7 +455,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				frozenRawCutoff = 0
 				frozenPrefixLen = 0
 				// 重新计算 totalTokens（基于原始未压缩消息）
-				totalTokens = s.TokenCounter.CountMessagesTokens(messages)
+				totalTokens = contextTokens + s.TokenCounter.CountMessagesTokens(messages)
 			}
 		}
 
@@ -491,7 +469,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 召回后的消息才是最终压缩输入；Frozen 失效分支不再重跑召回。
-		totalTokens = s.TokenCounter.CountMessagesTokens(messages)
+		totalTokens = contextTokens + s.TokenCounter.CountMessagesTokens(messages)
 		needCompress = totalTokens >= threshold
 		if needCompress {
 			// 提取 pivot text：使用最新一条 user 消息的内容文本
@@ -766,16 +744,10 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					r.Body = io.NopCloser(bytes.NewReader(body))
 				}
 			} else {
-				// 重新 marshal（cache_control 可能改变了 content）
-				if frozenPrefixLen > 0 || recallOutcome.Injected > 0 {
-					if newBody, err := rebuildBody(messages); err == nil {
-						r.Body = io.NopCloser(bytes.NewReader(newBody))
-					} else {
-						meta.Logger.Warn("marshal cache_control 处理后 body 失败", "error", err)
-						r.Body = io.NopCloser(bytes.NewReader(body))
-					}
+				if newBody, err := rebuildBody(messages); err == nil {
+					r.Body = io.NopCloser(bytes.NewReader(newBody))
 				} else {
-					// 无 frozen prefix，原样恢复 body
+					meta.Logger.Warn("marshal final messages 失败", "error", err)
 					r.Body = io.NopCloser(bytes.NewReader(body))
 				}
 			}
