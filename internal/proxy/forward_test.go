@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -25,13 +26,13 @@ func TestWriteDebugFileRedactsCredentialHeaders(t *testing.T) {
 		"X-Diagnostic":        {"safe-value"},
 	}
 	timestamp := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
-	s.writeDebugFile("session", timestamp, "req", []byte(`{"ok":true}`), headers, "model", 1)
+	s.writeDebugFile("session", 1, timestamp, "req", []byte(`{"ok":true}`), headers, "model", 1)
 
 	debugDir, ok := safeDebugSessionDir(dataDir, "session")
 	if !ok {
 		t.Fatal("合法 session debug 目录校验失败")
 	}
-	data, err := os.ReadFile(filepath.Join(debugDir, "2026-07-11T120000.000-req.json"))
+	data, err := os.ReadFile(filepath.Join(debugDir, "2026-07-11T120000.000000000-1-req.json"))
 	if err != nil {
 		t.Fatalf("读取 debug 文件: %v", err)
 	}
@@ -54,7 +55,7 @@ func TestWriteDebugFileSessionPathCannotEscapeDebugRoot(t *testing.T) {
 		t.Run(sessionID, func(t *testing.T) {
 			dataDir := t.TempDir()
 			s := NewServer(Config{Debug: DebugConfig{DataDir: dataDir}})
-			s.writeDebugFile(sessionID, time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC), "req", []byte(`{}`), nil, "model", 0)
+			s.writeDebugFile(sessionID, 1, time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC), "req", []byte(`{}`), nil, "model", 0)
 
 			debugDir, ok := safeDebugSessionDir(dataDir, sessionID)
 			if !ok {
@@ -65,10 +66,36 @@ func TestWriteDebugFileSessionPathCannotEscapeDebugRoot(t *testing.T) {
 			if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
 				t.Fatalf("debug 目录逃逸: root=%s dir=%s rel=%s err=%v", root, debugDir, rel, err)
 			}
-			if _, err := os.Stat(filepath.Join(debugDir, "2026-07-11T120000.000-req.json")); err != nil {
+			if _, err := os.Stat(filepath.Join(debugDir, "2026-07-11T120000.000000000-1-req.json")); err != nil {
 				t.Fatalf("debug 文件未写入哈希目录: %v", err)
 			}
 		})
+	}
+}
+
+func TestWriteDebugFileUsesRequestIDToPreventCollisions(t *testing.T) {
+	dataDir := t.TempDir()
+	s := NewServer(Config{Debug: DebugConfig{DataDir: dataDir}})
+	timestamp := time.Date(2026, 7, 11, 12, 0, 0, 123, time.UTC)
+	var wg sync.WaitGroup
+	for _, requestID := range []uint64{41, 42} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.writeDebugFile("session", requestID, timestamp, "req", []byte(`{"request":true}`), nil, "model", 1)
+		}()
+	}
+	wg.Wait()
+	debugDir, _ := safeDebugSessionDir(dataDir, "session")
+	entries, err := os.ReadDir(debugDir)
+	if err != nil {
+		t.Fatalf("读取 debug 目录: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("并发 debug 文件数=%d, want 2", len(entries))
+	}
+	if entries[0].Name() == entries[1].Name() {
+		t.Fatalf("并发请求文件名冲突: %s", entries[0].Name())
 	}
 }
 

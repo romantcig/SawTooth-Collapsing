@@ -87,7 +87,7 @@ type debugEntry struct {
 
 // writeDebugFile 将请求/响应落盘到 data_dir/debug/{sessionID}/{timestamp}-{direction}.json（D-03）。
 // headers 参数仅在 req 方向传入（用于 redact Authorization）。
-func (s *Server) writeDebugFile(sessionID string, timestamp time.Time, direction string, body []byte, headers http.Header, model string, messageCount int) {
+func (s *Server) writeDebugFile(sessionID string, requestID uint64, timestamp time.Time, direction string, body []byte, headers http.Header, model string, messageCount int) {
 	debugDir, ok := safeDebugSessionDir(s.Config.Debug.DataDir, sessionID)
 	if !ok {
 		slog.Warn("debug session 目录校验失败")
@@ -99,8 +99,8 @@ func (s *Server) writeDebugFile(sessionID string, timestamp time.Time, direction
 	}
 
 	// 文件安全的时间戳格式（RFC3339 中冒号替换为连字符）
-	tsSafe := timestamp.Format("2006-01-02T150405.000")
-	filename := fmt.Sprintf("%s-%s.json", tsSafe, direction)
+	tsSafe := timestamp.Format("2006-01-02T150405.000000000")
+	filename := fmt.Sprintf("%s-%d-%s.json", tsSafe, requestID, direction)
 	filePath := filepath.Join(debugDir, filename)
 
 	// 解析 body 为 JSON 对象（若解析失败则存为字符串）
@@ -141,8 +141,18 @@ func (s *Server) writeDebugFile(sessionID string, timestamp time.Time, direction
 		return
 	}
 
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
+	file, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
 		slog.Warn("无法写入 debug 文件", "file", filePath, "error", err)
+		return
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		slog.Warn("无法写入 debug 文件", "file", filePath, "error", err)
+		return
+	}
+	if err := file.Close(); err != nil {
+		slog.Warn("无法关闭 debug 文件", "file", filePath, "error", err)
 	}
 }
 
@@ -221,7 +231,7 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 
 	// 步骤 2: Debug 写请求体
 	if s.Config.Debug.Enabled {
-		s.writeDebugFile(sessionID, timestamp, "req", body, r.Header, model, messageCount)
+		s.writeDebugFile(sessionID, meta.ID, timestamp, "req", body, r.Header, model, messageCount)
 	}
 
 	// 步骤 3: 创建上游请求
@@ -291,7 +301,7 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 
 		// Debug 写非 2xx 响应
 		if s.Config.Debug.Enabled {
-			s.writeDebugFile(sessionID, timestamp, "resp", respBody, nil, model, messageCount)
+			s.writeDebugFile(sessionID, meta.ID, timestamp, "resp", respBody, nil, model, messageCount)
 		}
 		return
 	}
@@ -414,7 +424,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 
 	// 步骤 5: Debug 写 SSE 响应（完整拼接文本）
 	if s.Config.Debug.Enabled {
-		s.writeDebugFile(sessionID, timestamp, "resp", []byte(fullResponse.String()), nil, model, messageCount)
+		s.writeDebugFile(sessionID, meta.ID, timestamp, "resp", []byte(fullResponse.String()), nil, model, messageCount)
 	}
 }
 
@@ -543,6 +553,6 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *re
 
 	// 步骤 5: Debug 写 JSON 响应
 	if s.Config.Debug.Enabled {
-		s.writeDebugFile(sessionID, timestamp, "resp", respBody, nil, model, messageCount)
+		s.writeDebugFile(sessionID, meta.ID, timestamp, "resp", respBody, nil, model, messageCount)
 	}
 }
