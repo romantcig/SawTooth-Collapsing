@@ -412,6 +412,13 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		if s.Frozen != nil {
 			result := s.Frozen.Get(sessionID, messages)
 			if result != nil {
+				if result.Cutoff <= 0 || result.Cutoff > len(messages) {
+					meta.Logger.Warn("frozen cutoff 非法，忽略状态", "cutoff", result.Cutoff, "message_count", len(messages))
+					s.Frozen.Invalidate(sessionID)
+					result = nil
+				}
+			}
+			if result != nil {
 				frozenRawCutoff = result.Cutoff
 				frozenPrefixLen = len(result.Messages)
 				frozenTokens = result.Tokens

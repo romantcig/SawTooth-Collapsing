@@ -92,6 +92,10 @@ func (f *FrozenStubs) SetLoadFunc(fn LoadFunc) {
 // cutoff 是原始消息总数（第一条未桩化消息的索引）。
 // boundaryMsg 是 originalMessages[cutoff-1]，用于 boundary 验证。
 func (f *FrozenStubs) Store(threadID string, stubbed []Message, cutoff int, boundaryMsg Message, tokenEstimate int, rawTokenEstimate int) {
+	if cutoff <= 0 || tokenEstimate < 0 || rawTokenEstimate < 0 {
+		slog.Warn("frozen 状态元数据非法，跳过存储", "thread_id", threadID, "cutoff", cutoff)
+		return
+	}
 	frozen := deepCopyMessages(stubbed)
 	if frozen == nil {
 		slog.Warn("frozen prefix 深拷贝失败，跳过存储", "thread_id", threadID)
@@ -163,13 +167,14 @@ func (f *FrozenStubs) Get(threadID string, currentMessages []Message) *FrozenRes
 	}
 	cutoff := f.cutoff[threadID]
 	pHash := f.prefixHash[threadID]
+	bHash := f.boundaryHash[threadID]
 	tokens := f.tokens[threadID]
 	rawTokens := f.rawTokens[threadID]
 	f.mu.RUnlock()
 
-	// 验证 1：当前消息数不足（消息被删除了）
-	if len(currentMessages) < cutoff {
-		slog.Warn("frozen prefix 验证失败：当前消息数不足",
+	// 验证 1：持久化元数据与当前消息边界必须可安全切片。
+	if cutoff <= 0 || cutoff > len(currentMessages) || bHash == "" || tokens < 0 || rawTokens < 0 {
+		slog.Warn("frozen prefix 验证失败：状态元数据非法",
 			"thread_id", threadID,
 			"current", len(currentMessages),
 			"cutoff", cutoff,
@@ -191,19 +196,14 @@ func (f *FrozenStubs) Get(threadID string, currentMessages []Message) *FrozenRes
 	// 验证 3：boundary hash 不匹配（用户编辑了 frozen 范围内的消息）
 	// sawtooth-proxy 在 Get 之前运行 StripReminders，CC 注入不会误触发
 	if cutoff > 0 && cutoff <= len(currentMessages) {
-		f.mu.RLock()
-		storedBHash := f.boundaryHash[threadID]
-		f.mu.RUnlock()
-		if storedBHash != "" {
-			currentBHash := stableBoundaryHash(currentMessages[cutoff-1])
-			if currentBHash != storedBHash {
-				slog.Warn("frozen prefix 验证失败：boundary 已变化（用户可能编辑了消息）",
-					"thread_id", threadID,
-					"cutoff", cutoff,
-				)
-				f.Invalidate(threadID)
-				return nil
-			}
+		currentBHash := stableBoundaryHash(currentMessages[cutoff-1])
+		if currentBHash != bHash {
+			slog.Warn("frozen prefix 验证失败：boundary 已变化（用户可能编辑了消息）",
+				"thread_id", threadID,
+				"cutoff", cutoff,
+			)
+			f.Invalidate(threadID)
+			return nil
 		}
 	}
 
@@ -368,7 +368,7 @@ func (f *FrozenStubs) loadFrozenFromDB(threadID string) {
 	if err := json.Unmarshal([]byte(raw), &fp); err != nil {
 		return
 	}
-	if len(fp.Messages) == 0 || fp.PrefixHash == "" {
+	if len(fp.Messages) == 0 || fp.Cutoff <= 0 || fp.BoundaryHash == "" || fp.PrefixHash == "" || fp.Tokens < 0 || fp.RawTokens < 0 {
 		return
 	}
 

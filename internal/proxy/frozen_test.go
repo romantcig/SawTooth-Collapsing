@@ -117,6 +117,35 @@ func TestFrozenBoundaryHashCoversCompleteMessage(t *testing.T) {
 	}
 }
 
+func TestFrozenColdStartRejectsInvalidCutoff(t *testing.T) {
+	current := frozenTestMessages(3)
+	prefix := deepCopyMessages(current[:1])
+	prefixJSON, err := json.Marshal(prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cutoff := range []int{-1, 0, 4} {
+		t.Run(fmt.Sprintf("cutoff=%d", cutoff), func(t *testing.T) {
+			persisted, err := json.Marshal(frozenPersisted{
+				Messages: prefix, Cutoff: cutoff,
+				BoundaryHash: stableBoundaryHash(current[1]),
+				PrefixHash:   sha256hex(prefixJSON), Tokens: 10, RawTokens: 20,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			frozen := NewFrozenStubs()
+			frozen.SetLoadFunc(func(string) (string, bool) { return string(persisted), true })
+			if got := frozen.Get("thread", current); got != nil {
+				t.Fatalf("非法 cutoff=%d 不应恢复 frozen", cutoff)
+			}
+			if got := frozen.LengthFor("thread"); got != 0 {
+				t.Fatalf("非法状态进入内存，长度=%d", got)
+			}
+		})
+	}
+}
+
 func frozenTestMessages(count int) []Message {
 	messages := make([]Message, count)
 	for i := range messages {
