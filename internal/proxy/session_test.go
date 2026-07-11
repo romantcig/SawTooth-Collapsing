@@ -159,13 +159,13 @@ func TestAgentFeatureFixtures(t *testing.T) {
 	}{
 		{"deepseek-main.json", 2, []string{"main", "main"}},
 		{"deepseek-subagent.json", 1, []string{"subagent"}},
-		{"ambiguous.json", 2, []string{"unknown", "unknown"}},
+		{"ambiguous.json", 2, []string{"subagent", "main"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fixture := loadAgentFeatureFixture(t, tt.name)
-			if fixture.SchemaVersion != 1 {
-				t.Fatalf("schema_version = %d, want 1", fixture.SchemaVersion)
+			if fixture.SchemaVersion != 2 {
+				t.Fatalf("schema_version = %d, want 2", fixture.SchemaVersion)
 			}
 			if len(fixture.Cases) != tt.caseCount {
 				t.Fatalf("cases = %d, want %d", len(fixture.Cases), tt.caseCount)
@@ -186,17 +186,12 @@ func TestAgentFeatureFixtures(t *testing.T) {
 		t.Fatal("missing-thinking 的 main 变体不得被标记为 subagent")
 	}
 
-	subagent := loadAgentFeatureFixture(t, "deepseek-subagent.json")
-	features := subagent.Cases[0].Features
-	if !features.ThinkingPresent || !features.SDKTSMarkerPresent {
-		t.Fatal("DeepSeek subagent fixture 必须包含 thinking 和已知 sdk-ts marker")
-	}
-
-	ambiguous := loadAgentFeatureFixture(t, "ambiguous.json")
-	for i, fixtureCase := range ambiguous.Cases {
-		if fixtureCase.Features.ParentRelation != agentParentRelationUnavailable {
-			t.Errorf("ambiguous case %d parent_relation = %q, want unavailable", i, fixtureCase.Features.ParentRelation)
-		}
+	mainFeatures := main.Cases[0].Features
+	subagentFeatures := loadAgentFeatureFixture(t, "deepseek-subagent.json").Cases[0].Features
+	if mainFeatures.ModelFamily != subagentFeatures.ModelFamily ||
+		mainFeatures.ThinkingPresent != subagentFeatures.ThinkingPresent ||
+		mainFeatures.SDKTSMarkerPresent != subagentFeatures.SDKTSMarkerPresent {
+		t.Fatal("main/subagent fixture 必须保持相同 model、thinking 和 sdk-ts，只由强特征区分")
 	}
 }
 
@@ -204,10 +199,9 @@ func TestAgentFixtureSchemaRejectsSensitivePayload(t *testing.T) {
 	allowedTopLevel := map[string]bool{"schema_version": true, "evidence": true, "cases": true}
 	allowedCase := map[string]bool{"expected_role": true, "features": true}
 	allowedFeatures := map[string]bool{
-		"model_family": true, "thinking_present": true, "system_present": true,
-		"system_shape": true, "sdk_ts_marker_present": true, "metadata_present": true,
-		"session_header_present": true, "parent_marker_present": true,
-		"parent_relation": true, "messages_present": true,
+		"model_family": true, "thinking_present": true, "sdk_ts_marker_present": true,
+		"billing_subagent_marker": true, "agent_context_type": true,
+		"parent_session_present": true, "messages_present": true,
 	}
 	for _, name := range []string{"deepseek-main.json", "deepseek-subagent.json", "ambiguous.json"} {
 		data, err := os.ReadFile(filepath.Join("testdata", "agent_features", name))
@@ -215,7 +209,10 @@ func TestAgentFixtureSchemaRejectsSensitivePayload(t *testing.T) {
 			t.Fatalf("读取 fixture %s 失败: %v", name, err)
 		}
 		lower := strings.ToLower(string(data))
-		for _, forbidden := range []string{"authorization", "api_key", "prompt", "messages\"", "body\"", "system\""} {
+		for _, forbidden := range []string{
+			"authorization", "api_key", "prompt", "\"headers\"", "\"body\"", "\"messages\"",
+			"\"parent_session_id\"", "\"session_id\"", "\"system\"",
+		} {
 			if strings.Contains(lower, forbidden) {
 				t.Fatalf("fixture %s 包含敏感载荷键 %q", name, forbidden)
 			}
@@ -273,14 +270,14 @@ func TestAgentClassificationCompatibilityPrecedence(t *testing.T) {
 		wantWhy  agentClassificationReason
 	}{
 		{
-			name: "sdk-ts marker 优先识别子代理",
+			name: "sdk-ts marker 不再识别子代理",
 			features: agentRequestFeatures{
 				ModelFamily:        agentModelFamilyDeepSeek,
 				SDKTSMarkerPresent: true,
 				MessagesPresent:    true,
 			},
-			wantRole: agentRoleSubagent,
-			wantWhy:  agentReasonSDKTSCompatibility,
+			wantRole: agentRoleMain,
+			wantWhy:  agentClassificationReason("no_subagent_marker"),
 		},
 		{
 			name: "DeepSeek 主代理缺 thinking 仍为 main",
@@ -289,26 +286,26 @@ func TestAgentClassificationCompatibilityPrecedence(t *testing.T) {
 				MessagesPresent: true,
 			},
 			wantRole: agentRoleMain,
-			wantWhy:  agentReasonDeepSeekModel,
+			wantWhy:  agentClassificationReason("no_subagent_marker"),
 		},
 		{
-			name: "Haiku 仅作为兼容 fallback",
+			name: "Haiku 不再识别子代理",
 			features: agentRequestFeatures{
 				ModelFamily:     agentModelFamilyClaudeHaiku,
 				ThinkingPresent: true,
 				MessagesPresent: true,
 			},
-			wantRole: agentRoleSubagent,
-			wantWhy:  agentReasonHaikuCompatibility,
+			wantRole: agentRoleMain,
+			wantWhy:  agentClassificationReason("no_subagent_marker"),
 		},
 		{
-			name: "无稳定 marker 保持 unknown",
+			name: "无强特征按 main",
 			features: agentRequestFeatures{
 				ModelFamily:     agentModelFamilyUnknown,
 				MessagesPresent: true,
 			},
-			wantRole: agentRoleUnknown,
-			wantWhy:  agentReasonNoVerifiedMarker,
+			wantRole: agentRoleMain,
+			wantWhy:  agentClassificationReason("no_subagent_marker"),
 		},
 	}
 
@@ -322,38 +319,65 @@ func TestAgentClassificationCompatibilityPrecedence(t *testing.T) {
 	}
 }
 
-func TestAgentParentRelation(t *testing.T) {
-	const (
-		childID  = "11111111-1111-4111-8111-111111111111"
-		parentID = "22222222-2222-4222-8222-222222222222"
-	)
-	bodyMap := map[string]json.RawMessage{
-		"model":    json.RawMessage(`"deepseek-v4-pro"`),
-		"thinking": json.RawMessage(`{"type":"enabled"}`),
-	}
-	messages := []Message{{Role: "user", Content: json.RawMessage(`"hello"`)}}
-
+func TestAgentBillingMarker(t *testing.T) {
 	tests := []struct {
-		name          string
-		parentHeader  string
-		wantAvailable bool
-		wantParentID  string
+		name   string
+		header string
+		role   agentRole
 	}{
-		{name: "显式 parent marker", parentHeader: parentID, wantAvailable: true, wantParentID: parentID},
-		{name: "缺少 parent marker"},
-		{name: "空白 parent marker", parentHeader: "   "},
-		{name: "parent 与 child 相同不可用", parentHeader: childID},
+		{name: "单 token", header: "cc_is_subagent=true", role: agentRoleSubagent},
+		{name: "大小写和空白", header: " Cc_Is_SubAgent = TRUE ", role: agentRoleSubagent},
+		{name: "逗号多 token", header: "cch=12345, cc_is_subagent=true, cc_version=2.1.199", role: agentRoleSubagent},
+		{name: "分号多 token", header: "cch=12345;cc_is_subagent = true", role: agentRoleSubagent},
+		{name: "false", header: "cc_is_subagent=false", role: agentRoleMain},
+		{name: "相似键", header: "not_cc_is_subagent=true", role: agentRoleMain},
+		{name: "畸形", header: "cc_is_subagent", role: agentRoleMain},
+		{name: "缺失", role: agentRoleMain},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest("POST", "/v1/messages", nil)
-			req.Header.Set("X-Claude-Code-Session-Id", childID)
-			if tt.parentHeader != "" {
-				req.Header.Set("X-Claude-Code-Parent-Session-Id", tt.parentHeader)
+			if tt.header != "" {
+				req.Header.Set("x-anthropic-billing-header", tt.header)
 			}
-			got := classifyAgentRequest(req, bodyMap, messages)
-			if got.ParentAvailable != tt.wantAvailable || got.ParentSessionID != tt.wantParentID {
-				t.Fatalf("parent classification = %#v, want available=%v parent=%q", got, tt.wantAvailable, tt.wantParentID)
+			bodyMap := map[string]json.RawMessage{"model": json.RawMessage(`"deepseek-v4-pro"`)}
+			got := classifyAgentRequest(req, bodyMap, []Message{{Role: "user", Content: json.RawMessage(`"hello"`)}})
+			if got.Role != tt.role {
+				t.Fatalf("role = %q, want %q (reason=%q)", got.Role, tt.role, got.Reason)
+			}
+		})
+	}
+}
+
+func TestAgentContextStrongFeatures(t *testing.T) {
+	tests := []struct {
+		name    string
+		context json.RawMessage
+		role    agentRole
+		reason  string
+	}{
+		{name: "agentType subagent", context: json.RawMessage(`{"agentType":"subagent"}`), role: agentRoleSubagent, reason: "agent_context_type"},
+		{name: "agentType 大小写空白", context: json.RawMessage(`{"agentType":" SubAgent "}`), role: agentRoleSubagent, reason: "agent_context_type"},
+		{name: "parentSessionId", context: json.RawMessage(`{"parentSessionId":"parent-secret"}`), role: agentRoleSubagent, reason: "agent_context_parent"},
+		{name: "空 parent", context: json.RawMessage(`{"parentSessionId":"   "}`), role: agentRoleMain, reason: "no_subagent_marker"},
+		{name: "main", context: json.RawMessage(`{"agentType":"main"}`), role: agentRoleMain, reason: "no_subagent_marker"},
+		{name: "畸形对象", context: json.RawMessage(`{"agentType":`), role: agentRoleMain, reason: "no_subagent_marker"},
+		{name: "非对象", context: json.RawMessage(`"subagent"`), role: agentRoleMain, reason: "no_subagent_marker"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bodyMap := map[string]json.RawMessage{
+				"model":        json.RawMessage(`"same-model"`),
+				"thinking":     json.RawMessage(`{"type":"enabled"}`),
+				"system":       json.RawMessage(`"cc_entrypoint=sdk-ts"`),
+				"agentContext": tt.context,
+			}
+			got := classifyAgentRequest(httptest.NewRequest("POST", "/v1/messages", nil), bodyMap, []Message{{Role: "user", Content: json.RawMessage(`"hello"`)}})
+			if got.Role != tt.role || string(got.Reason) != tt.reason {
+				t.Fatalf("classification = %#v, want role=%q reason=%q", got, tt.role, tt.reason)
+			}
+			if got.ParentAvailable || got.ParentSessionID != "" {
+				t.Fatalf("分类结果不得暴露 parent ID: %#v", got)
 			}
 		})
 	}

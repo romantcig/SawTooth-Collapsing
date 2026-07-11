@@ -1,19 +1,16 @@
 {
-  "schema_version": 1,
-  "evidence": "sdk_ts_compatibility_marker",
+  "schema_version": 2,
+  "evidence": "cc_billing_subagent_marker",
   "cases": [
     {
       "expected_role": "subagent",
       "features": {
         "model_family": "deepseek",
         "thinking_present": true,
-        "system_present": true,
-        "system_shape": "array",
         "sdk_ts_marker_present": true,
-        "metadata_present": true,
-        "session_header_present": true,
-        "parent_marker_present": false,
-        "parent_relation": "unavailable",
+        "billing_subagent_marker": true,
+        "agent_context_type": "main",
+        "parent_session_present": false,
         "messages_present": true
       }
     }

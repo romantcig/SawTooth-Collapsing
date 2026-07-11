@@ -1,19 +1,16 @@
 {
-  "schema_version": 1,
-  "evidence": "synthetic_deepseek_request_shape",
+  "schema_version": 2,
+  "evidence": "cc_strong_markers_absent",
   "cases": [
     {
       "expected_role": "main",
       "features": {
         "model_family": "deepseek",
         "thinking_present": true,
-        "system_present": true,
-        "system_shape": "array",
-        "sdk_ts_marker_present": false,
-        "metadata_present": true,
-        "session_header_present": true,
-        "parent_marker_present": false,
-        "parent_relation": "unavailable",
+        "sdk_ts_marker_present": true,
+        "billing_subagent_marker": false,
+        "agent_context_type": "main",
+        "parent_session_present": false,
         "messages_present": true
       }
     },
@@ -22,13 +19,10 @@
       "features": {
         "model_family": "deepseek",
         "thinking_present": false,
-        "system_present": true,
-        "system_shape": "array",
         "sdk_ts_marker_present": false,
-        "metadata_present": true,
-        "session_header_present": true,
-        "parent_marker_present": false,
-        "parent_relation": "unavailable",
+        "billing_subagent_marker": false,
+        "agent_context_type": "missing",
+        "parent_session_present": false,
         "messages_present": true
       }
     }

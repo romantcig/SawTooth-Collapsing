@@ -1,34 +1,28 @@
 {
-  "schema_version": 1,
-  "evidence": "no_verified_parent_or_role_marker",
+  "schema_version": 2,
+  "evidence": "cc_agent_context_markers",
   "cases": [
     {
-      "expected_role": "unknown",
+      "expected_role": "subagent",
       "features": {
         "model_family": "unknown",
-        "thinking_present": true,
-        "system_present": true,
-        "system_shape": "array",
+        "thinking_present": false,
         "sdk_ts_marker_present": false,
-        "metadata_present": true,
-        "session_header_present": true,
-        "parent_marker_present": false,
-        "parent_relation": "unavailable",
+        "billing_subagent_marker": false,
+        "agent_context_type": "subagent",
+        "parent_session_present": false,
         "messages_present": true
       }
     },
     {
-      "expected_role": "unknown",
+      "expected_role": "main",
       "features": {
         "model_family": "unknown",
-        "thinking_present": false,
-        "system_present": false,
-        "system_shape": "missing",
-        "sdk_ts_marker_present": false,
-        "metadata_present": false,
-        "session_header_present": false,
-        "parent_marker_present": false,
-        "parent_relation": "unavailable",
+        "thinking_present": true,
+        "sdk_ts_marker_present": true,
+        "billing_subagent_marker": false,
+        "agent_context_type": "malformed",
+        "parent_session_present": false,
         "messages_present": true
       }
     }
