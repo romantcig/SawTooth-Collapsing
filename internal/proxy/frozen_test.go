@@ -231,6 +231,45 @@ func TestStableBoundaryHashPreservesUnprovenNullAndUnknownFields(t *testing.T) {
 	}
 }
 
+func TestFrozenBoundaryHashIncludesMessageUnknownFieldStates(t *testing.T) {
+	decode := func(raw string) Message {
+		t.Helper()
+		var message Message
+		if err := json.Unmarshal([]byte(raw), &message); err != nil {
+			t.Fatalf("unmarshal boundary message: %v", err)
+		}
+		return message
+	}
+	baseBoundary := decode(`{"role":"assistant","content":[{"type":"text","text":"same"}]}`)
+	tests := []struct {
+		name     string
+		boundary Message
+	}{
+		{name: "explicit null", boundary: decode(`{"role":"assistant","content":[{"type":"text","text":"same"}],"future":null}`)},
+		{name: "non-null value", boundary: decode(`{"role":"assistant","content":[{"type":"text","text":"same"}],"future":{"mode":"strict"}}`)},
+		{name: "known metadata", boundary: decode(`{"role":"assistant","content":[{"type":"text","text":"same"}],"isMeta":true}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if stableBoundaryHash(baseBoundary) == stableBoundaryHash(tt.boundary) {
+				t.Fatal("message-level boundary field state did not affect hash")
+			}
+
+			current := []Message{
+				{Role: "user", Content: json.RawMessage(`"prefix"`)},
+				baseBoundary,
+				{Role: "user", Content: json.RawMessage(`"tail"`)},
+			}
+			frozen := NewFrozenStubs()
+			frozen.Store("thread", current[:1], 2, current[1], 10, 20)
+			current[1] = tt.boundary
+			if got := frozen.Get("thread", current); got != nil {
+				t.Fatal("Frozen.Get accepted a boundary with different message-level fields")
+			}
+		})
+	}
+}
+
 func TestFrozenColdStartRejectsInvalidCutoff(t *testing.T) {
 	current := frozenTestMessages(3)
 	prefix := deepCopyMessages(current[:1])

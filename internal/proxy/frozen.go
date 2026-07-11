@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -451,17 +452,33 @@ func deepCopyMessages(msgs []Message) []Message {
 
 // stableBoundaryHash 对 StripReminders 后的完整 boundary message 计算规范 JSON hash。
 func stableBoundaryHash(msg Message) string {
-	var content any
-	if err := json.Unmarshal(msg.Content, &content); err != nil {
+	canonicalMessage, err := canonicalMessageForHash(msg, normalizeBoundaryContent)
+	if err != nil {
 		data, _ := json.Marshal(msg)
 		return sha256hex(data)
 	}
-	content = normalizeBoundaryContent(content)
-	canonical, _ := json.Marshal(struct {
-		Role    string `json:"role"`
-		Content any    `json:"content"`
-	}{Role: msg.Role, Content: content})
+	canonical, _ := json.Marshal(canonicalMessage)
 	return sha256hex(canonical)
+}
+
+// canonicalMessageForHash 将完整消息解码为可确定性序列化的 JSON 对象。
+// normalizeContent 只能修改 content；未知消息级字段的 absent/null/value 状态
+// 全部保留并参与完整性指纹。
+func canonicalMessageForHash(msg Message, normalizeContent func(any) any) (map[string]any, error) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var canonical map[string]any
+	if err := decoder.Decode(&canonical); err != nil {
+		return nil, err
+	}
+	if content, ok := canonical["content"]; ok && normalizeContent != nil {
+		canonical["content"] = normalizeContent(content)
+	}
+	return canonical, nil
 }
 
 // normalizeBoundaryContent 只消除 ContentBlock typed round-trip 已确证产生的
