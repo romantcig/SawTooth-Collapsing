@@ -404,7 +404,10 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		// boundary = 原始请求中 frozen prefix 覆盖范围内的最后一条消息
 		var rawBoundary Message
 		if rawCutoff > 0 && rawCutoff <= len(originalMessages) {
-			rawBoundary = originalMessages[rawCutoff-1]
+			boundaryCopy := deepCopyMessages(originalMessages[rawCutoff-1 : rawCutoff])
+			if len(boundaryCopy) == 1 {
+				rawBoundary = boundaryCopy[0]
+			}
 		}
 
 		// Phase 4 Step 1: Frozen prefix retrieval (D-01)

@@ -303,7 +303,7 @@ func TestHandleMessagesCollapseFreezeLifecycle(t *testing.T) {
 		t.Fatalf("freeze request breakpoint count = %d, want 1", got)
 	}
 
-	result := server.Frozen.Get("thread-freeze", raw)
+	result := server.Frozen.Get("thread-freeze", StripReminders(raw))
 	if result == nil {
 		t.Fatal("expected frozen result to validate against the raw request boundary")
 	}
