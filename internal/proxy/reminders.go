@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"regexp"
 	"strings"
 )
@@ -120,11 +121,64 @@ func stripRemindersFromBlocksWithChange(blocks []ContentBlock) ([]ContentBlock, 
 	return result, changed
 }
 
+// stripRemindersFromContent 使用 RawMessage 逐 block 改写，避免 ContentBlock
+// 封闭结构在一次 reminder 删除时截断未来字段。
+func stripRemindersFromContent(content json.RawMessage) (json.RawMessage, bool) {
+	var text string
+	if err := json.Unmarshal(content, &text); err == nil {
+		stripped := stripRemindersFromText(text)
+		if stripped == text || stripped == "" {
+			return content, false
+		}
+		rebuilt, err := json.Marshal(stripped)
+		if err != nil {
+			return content, false
+		}
+		return rebuilt, true
+	}
+
+	var blocks []json.RawMessage
+	if err := json.Unmarshal(content, &blocks); err != nil {
+		return content, false
+	}
+	result := make([]json.RawMessage, 0, len(blocks))
+	changed := false
+	for _, rawBlock := range blocks {
+		blockType, blockText, ok := rawTextBlock(rawBlock)
+		if !ok || blockType != "text" {
+			result = append(result, rawBlock)
+			continue
+		}
+		stripped := stripRemindersFromText(blockText)
+		if stripped == blockText {
+			result = append(result, rawBlock)
+			continue
+		}
+		changed = true
+		if stripped == "" {
+			continue
+		}
+		rebuilt, ok := replaceRawTextBlock(rawBlock, stripped)
+		if !ok {
+			return content, false
+		}
+		result = append(result, rebuilt)
+	}
+	if !changed || len(result) == 0 {
+		return content, false
+	}
+	rebuilt, err := json.Marshal(result)
+	if err != nil {
+		return content, false
+	}
+	return rebuilt, true
+}
+
 // StripReminders 移除旧消息中过期的 system-reminder / skill-hint 标签（REMIND-01/02/03）。
 //
 // 行为约定：
 //   - 最后一条 user 消息完整保留，不被改写（REMIND-03）。
-//   - 其余消息走 parseContent → stripRemindersFromBlocks → rebuildContent。
+//   - 其余消息按 RawMessage block 逐项改写，只替换目标 text 字段。
 //   - 不增删消息条数；tool_use/tool_result block 数与配对不变（REMIND-04）。
 //   - SessionStart 与四种持久 user context 原样保留。
 //   - 只删除明确临时 reminder，未知或畸形内容 fail-safe 保留。
@@ -149,18 +203,9 @@ func StripReminders(messages []Message) []Message {
 		if i == lastUserIdx {
 			continue // 末条 user 完整保留（REMIND-03）
 		}
-		blocks, isArray := parseContent(result[i].Content)
-		stripped, changed := stripRemindersFromBlocksWithChange(blocks)
-		if !changed {
-			continue
+		if stripped, changed := stripRemindersFromContent(result[i].Content); changed {
+			result[i].Content = stripped
 		}
-		// 空内容防护：若 strip 后所有 text block 均被清空，整条消息保持原样，
-		// 防止产出空 content [] 或 "" 触发 Anthropic API 400 错误。
-		// 参考：anthropics/claude-code #54314 — 空 text block 会永久破坏 session。
-		if len(stripped) == 0 {
-			continue
-		}
-		result[i].Content = rebuildContent(stripped, isArray)
 	}
 
 	return result

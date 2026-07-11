@@ -204,4 +204,32 @@ func TestStripReminders(t *testing.T) {
 			t.Fatal("畸形 reminder 不应被删除")
 		}
 	})
+
+	t.Run("实际删除保留content block未知字段", func(t *testing.T) {
+		original := json.RawMessage(`[
+			{"type":"text","text":"ordinary before\n<system-reminder>noise</system-reminder>\nordinary after","future_text":{"mode":"strict"}},
+			{"type":"tool_result","tool_use_id":"tool-1","content":"result","future_tool":null}
+		]`)
+		input := []Message{
+			{Role: "assistant", Content: original},
+			{Role: "user", Content: json.RawMessage(`"latest"`)},
+		}
+		out := StripReminders(input)
+		if strings.Contains(allText(t, out[0]), "<system-reminder>") {
+			t.Fatal("explicit temporary reminder was not removed")
+		}
+		var blocks []map[string]json.RawMessage
+		if err := json.Unmarshal(out[0].Content, &blocks); err != nil {
+			t.Fatalf("decode stripped blocks: %v", err)
+		}
+		if len(blocks) != 2 {
+			t.Fatalf("block count = %d, want 2", len(blocks))
+		}
+		if string(blocks[0]["future_text"]) != `{"mode":"strict"}` {
+			t.Fatalf("modified text block lost unknown field: %s", out[0].Content)
+		}
+		if value, ok := blocks[1]["future_tool"]; !ok || string(value) != "null" {
+			t.Fatalf("unmodified tool_result lost unknown field: %s", out[0].Content)
+		}
+	})
 }
