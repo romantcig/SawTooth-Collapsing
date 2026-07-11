@@ -107,13 +107,13 @@ func (s *Server) writeDebugFile(sessionID string, timestamp time.Time, direction
 		bodyJSON, _ = json.Marshal(string(body))
 	}
 
-	// 构建 headers JSON，redact Authorization（T-02-02）
+	// 构建 headers JSON，认证与会话凭证一律脱敏（T-02-02）。
 	var headersJSON json.RawMessage
 	if headers != nil {
 		headersMap := make(map[string]string)
 		for key, values := range headers {
 			val := strings.Join(values, ", ")
-			if strings.EqualFold(key, "Authorization") {
+			if isSensitiveDebugHeader(key) {
 				val = "[REDACTED]"
 			}
 			headersMap[key] = val
@@ -138,6 +138,15 @@ func (s *Server) writeDebugFile(sessionID string, timestamp time.Time, direction
 
 	if err := os.WriteFile(filePath, data, 0644); err != nil {
 		slog.Warn("无法写入 debug 文件", "file", filePath, "error", err)
+	}
+}
+
+func isSensitiveDebugHeader(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "authorization", "proxy-authorization", "x-api-key", "anthropic-api-key", "cookie", "set-cookie":
+		return true
+	default:
+		return false
 	}
 }
 

@@ -2,12 +2,48 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestWriteDebugFileRedactsCredentialHeaders(t *testing.T) {
+	dataDir := t.TempDir()
+	s := NewServer(Config{Debug: DebugConfig{DataDir: dataDir}})
+	headers := http.Header{
+		"Authorization":       {"Bearer auth-secret"},
+		"Proxy-Authorization": {"Basic proxy-secret"},
+		"X-Api-Key":           {"api-secret"},
+		"Anthropic-Api-Key":   {"anthropic-secret"},
+		"Cookie":              {"session=cookie-secret"},
+		"X-Diagnostic":        {"safe-value"},
+	}
+	timestamp := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	s.writeDebugFile("session", timestamp, "req", []byte(`{"ok":true}`), headers, "model", 1)
+
+	data, err := os.ReadFile(filepath.Join(dataDir, "debug", "session", "2026-07-11T120000.000-req.json"))
+	if err != nil {
+		t.Fatalf("读取 debug 文件: %v", err)
+	}
+	for _, secret := range []string{"auth-secret", "proxy-secret", "api-secret", "anthropic-secret", "cookie-secret"} {
+		if bytes.Contains(data, []byte(secret)) {
+			t.Fatalf("debug 文件泄漏凭证 %q: %s", secret, data)
+		}
+	}
+	var entry debugEntry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatalf("解析 debug 文件: %v", err)
+	}
+	if !bytes.Contains(entry.Headers, []byte("safe-value")) {
+		t.Fatalf("诊断 header 未保留: %s", entry.Headers)
+	}
+}
 
 func TestForwardRawTargetTrailingSlash(t *testing.T) {
 	receivedURI := make(chan string, 1)
