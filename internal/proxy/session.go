@@ -171,8 +171,11 @@ func inspectAgentSystem(raw json.RawMessage) (agentSystemShape, bool) {
 	return agentSystemShapeArray, false
 }
 
-func logAgentRequestFeatures(features agentRequestFeatures) {
-	slog.Debug("agent_features",
+func logAgentRequestFeatures(logger *slog.Logger, features agentRequestFeatures) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Debug("agent_features",
 		"model_family", features.ModelFamily,
 		"thinking_present", features.ThinkingPresent,
 		"system_present", features.SystemPresent,

@@ -92,13 +92,20 @@ func (f *FrozenStubs) SetLoadFunc(fn LoadFunc) {
 // cutoff 是原始消息总数（第一条未桩化消息的索引）。
 // boundaryMsg 是 originalMessages[cutoff-1]，用于 boundary 验证。
 func (f *FrozenStubs) Store(threadID string, stubbed []Message, cutoff int, boundaryMsg Message, tokenEstimate int, rawTokenEstimate int) {
+	f.StoreWithLogger(slog.Default(), threadID, stubbed, cutoff, boundaryMsg, tokenEstimate, rawTokenEstimate)
+}
+
+func (f *FrozenStubs) StoreWithLogger(logger *slog.Logger, threadID string, stubbed []Message, cutoff int, boundaryMsg Message, tokenEstimate int, rawTokenEstimate int) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	if cutoff <= 0 || tokenEstimate < 0 || rawTokenEstimate < 0 {
-		slog.Warn("frozen 状态元数据非法，跳过存储", "thread_id", threadID, "cutoff", cutoff)
+		logger.Warn("frozen 状态元数据非法，跳过存储", "thread_id", threadID, "cutoff", cutoff)
 		return
 	}
 	frozen := deepCopyMessages(stubbed)
 	if frozen == nil {
-		slog.Warn("frozen prefix 深拷贝失败，跳过存储", "thread_id", threadID)
+		logger.Warn("frozen prefix 深拷贝失败，跳过存储", "thread_id", threadID)
 		return
 	}
 
@@ -130,7 +137,7 @@ func (f *FrozenStubs) Store(threadID string, stubbed []Message, cutoff int, boun
 	}
 	f.mu.Unlock()
 
-	slog.Info("frozen prefix 已存储",
+	logger.Info("frozen prefix 已存储",
 		"thread_id", threadID,
 		"cutoff", cutoff,
 		"prefix_hash", pHash[:min(16, len(pHash))],
@@ -143,6 +150,13 @@ func (f *FrozenStubs) Store(threadID string, stubbed []Message, cutoff int, boun
 //
 //	(2) frozen prefix 在内存中未被意外修改（SHA-256 hash 验证）。
 func (f *FrozenStubs) Get(threadID string, currentMessages []Message) *FrozenResult {
+	return f.GetWithLogger(slog.Default(), threadID, currentMessages)
+}
+
+func (f *FrozenStubs) GetWithLogger(logger *slog.Logger, threadID string, currentMessages []Message) *FrozenResult {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	f.mu.RLock()
 	_, ok := f.messages[threadID]
 	loaded := f.loadedFromDB[threadID]
@@ -150,13 +164,14 @@ func (f *FrozenStubs) Get(threadID string, currentMessages []Message) *FrozenRes
 
 	// 冷启动 lazy-load：首次访问时尝试从 DB 恢复
 	if !ok && !loaded {
-		f.loadFrozenFromDB(threadID)
+		f.loadFrozenFromDB(logger, threadID)
 	}
 
 	f.mu.RLock()
 	msgs, ok := f.messages[threadID]
 	if !ok {
 		f.mu.RUnlock()
+		logger.Debug("frozen prefix 未命中", "thread_id", threadID)
 		return nil
 	}
 	cutoff := f.cutoff[threadID]
@@ -168,22 +183,22 @@ func (f *FrozenStubs) Get(threadID string, currentMessages []Message) *FrozenRes
 
 	// 验证 1：持久化元数据与当前消息边界必须可安全切片。
 	if cutoff <= 0 || cutoff > len(currentMessages) || bHash == "" || tokens < 0 || rawTokens < 0 {
-		slog.Warn("frozen prefix 验证失败：状态元数据非法",
+		logger.Warn("frozen prefix 验证失败：状态元数据非法",
 			"thread_id", threadID,
 			"current", len(currentMessages),
 			"cutoff", cutoff,
 		)
-		f.Invalidate(threadID)
+		f.InvalidateWithLogger(logger, threadID)
 		return nil
 	}
 
 	// 验证 2：prefix hash 不匹配（内存被意外修改）
 	frozenJSON, _ := json.Marshal(msgs)
 	if sha256hex(frozenJSON) != pHash {
-		slog.Warn("frozen prefix 验证失败：hash 不匹配",
+		logger.Warn("frozen prefix 验证失败：hash 不匹配",
 			"thread_id", threadID,
 		)
-		f.Invalidate(threadID)
+		f.InvalidateWithLogger(logger, threadID)
 		return nil
 	}
 
@@ -192,11 +207,11 @@ func (f *FrozenStubs) Get(threadID string, currentMessages []Message) *FrozenRes
 	if cutoff > 0 && cutoff <= len(currentMessages) {
 		currentBHash := stableBoundaryHash(currentMessages[cutoff-1])
 		if currentBHash != bHash {
-			slog.Warn("frozen prefix 验证失败：boundary 已变化（用户可能编辑了消息）",
+			logger.Warn("frozen prefix 验证失败：boundary 已变化（用户可能编辑了消息）",
 				"thread_id", threadID,
 				"cutoff", cutoff,
 			)
-			f.Invalidate(threadID)
+			f.InvalidateWithLogger(logger, threadID)
 			return nil
 		}
 	}
@@ -204,10 +219,10 @@ func (f *FrozenStubs) Get(threadID string, currentMessages []Message) *FrozenRes
 	// 深拷贝——防止下游（cache_control inject 等）原地修改 frozen 数据
 	copied := deepCopyMessages(msgs)
 	if copied == nil {
-		slog.Warn("frozen prefix 验证失败：深拷贝失败",
+		logger.Warn("frozen prefix 验证失败：深拷贝失败",
 			"thread_id", threadID,
 		)
-		f.Invalidate(threadID)
+		f.InvalidateWithLogger(logger, threadID)
 		return nil
 	}
 
@@ -216,7 +231,7 @@ func (f *FrozenStubs) Get(threadID string, currentMessages []Message) *FrozenRes
 	f.lastAccess[threadID] = time.Now()
 	f.mu.Unlock()
 
-	slog.Info("frozen prefix 命中",
+	logger.Info("frozen prefix 命中",
 		"thread_id", threadID,
 		"cutoff", cutoff,
 		"frozen_tokens", tokens,
@@ -282,6 +297,13 @@ func (f *FrozenStubs) UpdateMessages(threadID string, newMsgs []Message) bool {
 
 // Invalidate 删除指定 thread 的 frozen stubs。
 func (f *FrozenStubs) Invalidate(threadID string) {
+	f.InvalidateWithLogger(slog.Default(), threadID)
+}
+
+func (f *FrozenStubs) InvalidateWithLogger(logger *slog.Logger, threadID string) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.messages, threadID)
@@ -293,7 +315,7 @@ func (f *FrozenStubs) Invalidate(threadID string) {
 	delete(f.rawTokens, threadID)
 	delete(f.lastAccess, threadID)
 	delete(f.loadedFromDB, threadID)
-	slog.Warn("frozen prefix 已失效", "thread_id", threadID)
+	logger.Warn("frozen prefix 已失效", "thread_id", threadID)
 }
 
 // UpdateTTL 动态更新 FrozenStubs 的 eviction TTL。
@@ -332,7 +354,7 @@ func (f *FrozenStubs) Evict() int {
 
 // loadFrozenFromDB 尝试从 DB 恢复指定 thread 的 frozen stubs。
 // 每个 thread 在冷启动时仅调用一次（由 Get 触发 lazy-load）。
-func (f *FrozenStubs) loadFrozenFromDB(threadID string) {
+func (f *FrozenStubs) loadFrozenFromDB(logger *slog.Logger, threadID string) {
 	f.mu.Lock()
 	if f.loadedFromDB[threadID] {
 		f.mu.Unlock()
@@ -362,7 +384,7 @@ func (f *FrozenStubs) loadFrozenFromDB(threadID string) {
 	// 验证 prefix hash 与存储的消息一致
 	frozenJSON, _ := json.Marshal(fp.Messages)
 	if sha256hex(frozenJSON) != fp.PrefixHash {
-		slog.Warn("从 DB 恢复的 frozen 状态 hash 不匹配，丢弃", "thread_id", threadID)
+		logger.Warn("从 DB 恢复的 frozen 状态 hash 不匹配，丢弃", "thread_id", threadID)
 		return
 	}
 
@@ -382,7 +404,7 @@ func (f *FrozenStubs) loadFrozenFromDB(threadID string) {
 	f.stubTime[threadID] = now
 	f.lastAccess[threadID] = now
 
-	slog.Info("从 SQLite 恢复 frozen 状态",
+	logger.Info("从 SQLite 恢复 frozen 状态",
 		"thread_id", threadID,
 		"cutoff", fp.Cutoff,
 		"tokens", fp.Tokens,

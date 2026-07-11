@@ -319,7 +319,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 
 		features := extractAgentRequestFeatures(r, bodyMap, messages)
-		logAgentRequestFeatures(features)
+		logAgentRequestFeatures(meta.Logger, features)
 		classification := classifyAgentRequest(r, bodyMap, messages)
 
 		// 可靠子代理与身份不明请求必须在 Archive/压缩/持久化副作用前返回。
@@ -337,7 +337,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 			frozenReplaced := false
 			if classification.Role == agentRoleSubagent && classification.ParentAvailable && s.Frozen != nil {
-				frozenResult := s.Frozen.Get(classification.ParentSessionID, messages)
+				frozenResult := s.Frozen.GetWithLogger(meta.Logger, classification.ParentSessionID, messages)
 				if frozenResult != nil && frozenResult.Cutoff > 0 {
 					if frozenResult.Cutoff <= len(messages) {
 						messages = append(frozenResult.Messages, messages[frozenResult.Cutoff:]...)
@@ -412,11 +412,11 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		var frozenPrefixLen int
 		var frozenTokens int // YesMem shouldInvalidateFrozen: 存储 frozen prefix 的 token 估算
 		if s.Frozen != nil {
-			result := s.Frozen.Get(sessionID, messages)
+			result := s.Frozen.GetWithLogger(meta.Logger, sessionID, messages)
 			if result != nil {
 				if result.Cutoff <= 0 || result.Cutoff > len(messages) {
 					meta.Logger.Warn("frozen cutoff 非法，忽略状态", "cutoff", result.Cutoff, "message_count", len(messages))
-					s.Frozen.Invalidate(sessionID)
+					s.Frozen.InvalidateWithLogger(meta.Logger, sessionID)
 					result = nil
 				}
 			}
@@ -469,7 +469,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				)
 				// frozen prefix 失效——清除并从原始消息重新压缩
 				// 对标 YesMem: frozen=nil 后 runStubCycle(messages) 使用原始未压缩消息
-				s.Frozen.Invalidate(sessionID)
+				s.Frozen.InvalidateWithLogger(meta.Logger, sessionID)
 				messages = originalMessages
 				frozenRawCutoff = 0
 				frozenPrefixLen = 0
@@ -608,7 +608,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 							LogGreen,
 						)
 						compressedTokens := s.TokenCounter.CountMessagesTokens(messages)
-						s.Frozen.Store(sessionID, messages, rawCutoff, rawBoundary, compressedTokens, rawEstimate)
+						s.Frozen.StoreWithLogger(meta.Logger, sessionID, messages, rawCutoff, rawBoundary, compressedTokens, rawEstimate)
 					}
 				}
 
@@ -675,7 +675,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 						LogGreen,
 					)
 					compressedTokens := s.TokenCounter.CountMessagesTokens(decayedMessages)
-					s.Frozen.Store(sessionID, decayedMessages, rawCutoff, rawBoundary, compressedTokens, rawEstimate)
+					s.Frozen.StoreWithLogger(meta.Logger, sessionID, decayedMessages, rawCutoff, rawBoundary, compressedTokens, rawEstimate)
 				}
 			}
 

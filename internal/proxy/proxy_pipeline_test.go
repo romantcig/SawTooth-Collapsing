@@ -122,13 +122,18 @@ func TestConcurrentRequestLogsReconstructable(t *testing.T) {
 			}
 		}
 		got := chain.String()
-		for _, event := range []string{"请求进入", "Archive 召回汇总", "上游请求发送"} {
+		for _, event := range []string{"请求进入", "agent_features", "frozen prefix 未命中", "Archive 召回汇总", "上游请求发送"} {
 			if !strings.Contains(got, event) {
 				t.Fatalf("%s(request_id=%s) 缺少 %s:\n%s", sessionID, requestID, event, got)
 			}
 		}
 		if !strings.Contains(got, "request_session_id="+sessionID) {
 			t.Fatalf("request_id=%s 混入其他 session:\n%s", requestID, got)
+		}
+	}
+	for _, line := range lines {
+		if (strings.Contains(line, "agent_features") || strings.Contains(line, "frozen prefix")) && !strings.Contains(line, "request_id=") {
+			t.Fatalf("Agent/Frozen 事件缺少 request_id: %s", line)
 		}
 	}
 }

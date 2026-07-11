@@ -110,7 +110,7 @@ func TestAgentDiagnosticRedaction(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 
-	logAgentRequestFeatures(extractAgentRequestFeatures(req, bodyMap, messages))
+	logAgentRequestFeatures(slog.Default(), extractAgentRequestFeatures(req, bodyMap, messages))
 	got := output.String()
 	for _, secret := range []string{secretSystem, secretMessage, secretAuth, secretSession} {
 		if strings.Contains(got, secret) {
