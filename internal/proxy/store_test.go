@@ -279,6 +279,91 @@ func TestSQLiteStoreCloseRemovesWALCompanions(t *testing.T) {
 	}
 }
 
+func TestSQLiteStoreCloseBusyPreservesCommittedWALData(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "close-busy.db")
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistState("before-reader", "one"); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader.SetMaxOpenConns(1)
+	tx, err := reader.Begin()
+	if err != nil {
+		reader.Close()
+		t.Fatal(err)
+	}
+	var value string
+	if err := tx.QueryRow(`SELECT value FROM frozen_state WHERE key = 'before-reader'`).Scan(&value); err != nil {
+		_ = tx.Rollback()
+		reader.Close()
+		t.Fatal(err)
+	}
+	if err := store.PersistState("committed-in-wal", "must-survive"); err != nil {
+		_ = tx.Rollback()
+		reader.Close()
+		t.Fatal(err)
+	}
+
+	if err := store.Close(); err == nil {
+		_ = tx.Rollback()
+		reader.Close()
+		t.Fatal("活跃 reader 下 TRUNCATE checkpoint 应报告 busy")
+	}
+	if _, err := os.Stat(dbPath + "-wal"); err != nil {
+		_ = tx.Rollback()
+		reader.Close()
+		t.Fatalf("busy checkpoint 后 WAL 未保留: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		reader.Close()
+		t.Fatal(err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got, ok := reopened.LoadState("committed-in-wal"); !ok || got != "must-survive" {
+		t.Fatalf("busy checkpoint 后已提交 WAL 数据丢失: got=%q ok=%v", got, ok)
+	}
+}
+
+func TestSQLiteStoreCloseCheckpointErrorPreservesCompanions(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "close-error.db")
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.WriteFile(dbPath+suffix, []byte("preserve"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err == nil {
+		t.Fatal("已关闭 DB 的 checkpoint 应返回错误")
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		data, err := os.ReadFile(dbPath + suffix)
+		if err != nil || string(data) != "preserve" {
+			t.Fatalf("checkpoint error 后伴生文件未保留 %s: data=%q err=%v", suffix, data, err)
+		}
+	}
+}
+
 // ---- NewSQLiteStore 损坏自动恢复测试 ----
 
 // 场景：主 DB 文件是纯文本假数据库（模拟磁盘损坏/外部篡改），

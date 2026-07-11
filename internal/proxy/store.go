@@ -3,6 +3,7 @@ package proxy
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -387,19 +388,21 @@ func (s *SQLiteStore) SearchArchives(query string, limit int) ([]ArchiveSummary,
 
 // Close 执行 WAL checkpoint (TRUNCATE) 后关闭数据库连接（D-15）。
 func (s *SQLiteStore) Close() error {
-	// 确保 WAL 完整落盘（忽略 error，因为 db 可能已经关闭）
-	_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
-	if err := s.db.Close(); err != nil {
-		return err
+	var busy, logFrames, checkpointed int
+	checkpointErr := s.db.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointed)
+	if checkpointErr == nil && (busy != 0 || logFrames != checkpointed) {
+		checkpointErr = fmt.Errorf("sqlite WAL checkpoint 未完成: busy=%d log=%d checkpointed=%d", busy, logFrames, checkpointed)
 	}
-	// Windows 的 TempDir 清理可能与 SQLite 伴生文件的删除发生竞态。
-	// 连接完全关闭后主动清理当前数据库专属的 WAL/SHM，避免目录清理时又出现文件。
-	for _, suffix := range []string{"-wal", "-shm"} {
-		if err := os.Remove(s.path + suffix); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("清理 sqlite 伴生文件 %s: %w", s.path+suffix, err)
+	closeErr := s.db.Close()
+	if checkpointErr == nil && closeErr == nil {
+		// 只有 checkpoint 明确完成后才清理当前数据库专属的伴生文件。
+		for _, suffix := range []string{"-wal", "-shm"} {
+			if err := os.Remove(s.path + suffix); err != nil && !os.IsNotExist(err) {
+				closeErr = errors.Join(closeErr, fmt.Errorf("清理 sqlite 伴生文件 %s: %w", s.path+suffix, err))
+			}
 		}
 	}
-	return nil
+	return errors.Join(checkpointErr, closeErr)
 }
 
 // ── SQLite 损坏恢复辅助函数 ──
