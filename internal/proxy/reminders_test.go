@@ -146,8 +146,8 @@ func TestStripReminders(t *testing.T) {
 		normalMsg := json.RawMessage(`[{"type":"text","text":"正常正文\n<system-reminder>\nYour task tools haven't been used recently.\n</system-reminder>"}]`)
 
 		input := []Message{
-			{Role: "user", Content: reminderOnly},                     // 旧消息：整页只有便利贴，撕完会空 → 应原样保留
-			{Role: "assistant", Content: normalMsg},                  // 旧消息：有正文+便利贴 → 应正常清理
+			{Role: "user", Content: reminderOnly},              // 旧消息：整页只有便利贴，撕完会空 → 应原样保留
+			{Role: "assistant", Content: normalMsg},            // 旧消息：有正文+便利贴 → 应正常清理
 			{Role: "user", Content: json.RawMessage(`"最新提问"`)}, // 末条 user → 保留
 		}
 		out := StripReminders(input)
@@ -165,6 +165,43 @@ func TestStripReminders(t *testing.T) {
 		// 断言 3：消息条数不变
 		if len(out) != 3 {
 			t.Errorf("消息条数不应变化，got=%d", len(out))
+		}
+	})
+
+	// 用例 8：持久 user context 位于旧首 user，且后续已有工具结果时仍保留。
+	t.Run("旧首user持久context保留", func(t *testing.T) {
+		for _, key := range []string{"claudeMd", "currentDate", "userEmail", "attachedProject"} {
+			t.Run(key, func(t *testing.T) {
+				input := []Message{
+					persistentContextMessage(key, "fictional-value"),
+					{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","id":"t1","name":"Read","input":{}}]`)},
+					{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]`)},
+					{Role: "user", Content: json.RawMessage(`"最新提问"`)},
+				}
+				out := StripReminders(input)
+				if !strings.Contains(allText(t, out[0]), "# "+key) {
+					t.Fatalf("持久 key #%s 被 StripReminders 删除", key)
+				}
+				if countBlockType(t, out[1], "tool_use") != 1 || countBlockType(t, out[2], "tool_result") != 1 {
+					t.Fatal("持久 context 分类改变了工具配对")
+				}
+			})
+		}
+	})
+
+	// 用例 9：未知或畸形 reminder 采用 fail-safe 保留。
+	t.Run("不确定reminder保留", func(t *testing.T) {
+		input := []Message{
+			{Role: "assistant", Content: json.RawMessage(`"before <system-reminder>future semantic reminder</system-reminder> after"`)},
+			{Role: "assistant", Content: json.RawMessage(`"before <system-reminder>unclosed reminder after"`)},
+			{Role: "user", Content: json.RawMessage(`"最新提问"`)},
+		}
+		out := StripReminders(input)
+		if !strings.Contains(allText(t, out[0]), "future semantic reminder") {
+			t.Fatal("未知完整 reminder 不应被删除")
+		}
+		if !strings.Contains(allText(t, out[1]), "unclosed reminder") {
+			t.Fatal("畸形 reminder 不应被删除")
 		}
 	})
 }
