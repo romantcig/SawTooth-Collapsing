@@ -167,11 +167,21 @@ func SearchAndExpand(messages []Message, store *SQLiteStore, tokenThreshold int,
 }
 
 func searchAndExpandForSession(messages []Message, store *SQLiteStore, tokenThreshold int, tc *TokenCounter, budget *Budget, requestSessionID string) RecallOutcome {
+	return searchAndExpandWithMeta(messages, store, tokenThreshold, tc, budget, newRequestMeta(0, requestSessionID))
+}
+
+func searchAndExpandWithMeta(messages []Message, store *SQLiteStore, tokenThreshold int, tc *TokenCounter, budget *Budget, meta *requestMeta) (outcome RecallOutcome) {
+	logger := slog.Default()
+	requestSessionID := ""
+	if meta != nil {
+		logger = meta.Logger
+		requestSessionID = meta.RequestSessionID
+	}
 	maxBudget := tokenThreshold / 10
 	if maxBudget < 0 {
 		maxBudget = 0
 	}
-	outcome := RecallOutcome{
+	outcome = RecallOutcome{
 		Messages:        messages,
 		BudgetLimit:     maxBudget,
 		BudgetRemaining: maxBudget,
@@ -197,6 +207,17 @@ func searchAndExpandForSession(messages []Message, store *SQLiteStore, tokenThre
 		return outcome
 	}
 	outcome.Attempted = true
+	defer func() {
+		logger.Info("Archive 召回汇总",
+			"candidates", outcome.Candidates,
+			"selected", outcome.Selected,
+			"injected", outcome.Injected,
+			"discarded", outcome.Discarded,
+			"token_cost", outcome.TokenCost,
+			"budget_limit", outcome.BudgetLimit,
+			"budget_remaining", outcome.BudgetRemaining,
+		)
+	}()
 	seenCandidates := make(map[string]bool)
 	var candidates []recallCandidate
 	for _, signal := range signals {
@@ -210,7 +231,7 @@ func searchAndExpandForSession(messages []Message, store *SQLiteStore, tokenThre
 		}
 		summaries, err := store.SearchArchives(query, 1)
 		if err != nil {
-			slog.Warn("archive 搜索失败", "query", query, "error", err)
+			logger.Warn("archive 搜索失败", "query", query, "error", err)
 			continue
 		}
 		for _, summary := range summaries {
@@ -313,7 +334,7 @@ func searchAndExpandForSession(messages []Message, store *SQLiteStore, tokenThre
 				}
 				if !fits {
 					outcome.Discarded++
-					slog.Info("archive 注入预算耗尽",
+					logger.Debug("archive 注入预算耗尽",
 						"injected_count", outcome.Injected,
 						"total_summaries", len(candidates),
 						"token_used", outcome.TokenCost,
@@ -340,30 +361,14 @@ func searchAndExpandForSession(messages []Message, store *SQLiteStore, tokenThre
 		}
 		outcome.Injected++
 
-		slog.Info("注入存档块",
-			"session_id", summary.SessionID,
+		logger.Debug("注入存档块",
+			"source_session_id", summary.SessionID,
 			"block_id", summary.ID,
 			"range", fmt.Sprintf("%d-%d", summary.BlockRangeStart, summary.BlockRangeEnd),
 			"full_expansion", fullExpanded,
 		)
 	}
 
-	if outcome.Injected == 0 {
-		return outcome
-	}
-
-	budgetUsedPct := "0.0%"
-	if outcome.BudgetLimit > 0 {
-		budgetUsedPct = fmt.Sprintf("%.1f%%", float64(outcome.TokenCost)/float64(outcome.BudgetLimit)*100)
-	}
-	slog.Info("archive 注入完成",
-		"injected_blocks", outcome.Injected,
-		"discarded_blocks", outcome.Discarded,
-		"token_cost", outcome.TokenCost,
-		"budget_limit", outcome.BudgetLimit,
-		"budget_remaining", outcome.BudgetRemaining,
-		"budget_used_pct", budgetUsedPct,
-	)
 	outcome.Messages = result
 	return outcome
 }

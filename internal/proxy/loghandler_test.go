@@ -209,3 +209,23 @@ func TestLogHandlerContract(t *testing.T) {
 		t.Error("WithGroup(\"\") 应返回自身")
 	}
 }
+
+func TestLogHandlerRequestAttrsSharedAcrossLines(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(NewLogHandler(&buf, slog.LevelInfo)).With(
+		"request_id", uint64(9),
+		"request_session_id", "current-session",
+	)
+	logger.Info("请求进入")
+	logger.Info("上游请求发送")
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("日志行数=%d，期望 2: %q", len(lines), buf.String())
+	}
+	for _, line := range lines {
+		if !strings.Contains(line, "request_id=9") || !strings.Contains(line, "request_session_id=current-session") {
+			t.Fatalf("请求固定字段未贯穿日志行: %q", line)
+		}
+	}
+}

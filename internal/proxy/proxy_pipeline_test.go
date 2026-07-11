@@ -42,6 +42,97 @@ func TestRequestMetaConcurrentIDsUnique(t *testing.T) {
 	}
 }
 
+func TestConcurrentRequestLogsReconstructable(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	seedRecallArchive(t, server.Store)
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(NewLogHandler(&logs, slog.LevelDebug)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, sessionID := range []string{"concurrent-a", "concurrent-b"} {
+		sessionID := sessionID
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			body, err := json.Marshal(map[string]any{
+				"model":    "deepseek-v4-pro",
+				"thinking": map[string]any{"type": "enabled"},
+				"messages": []Message{{Role: "user", Content: mustMarshal("restore archive about flimflam details parser")}},
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Claude-Code-Session-Id", sessionID)
+			recorder := httptest.NewRecorder()
+			server.HandleMessages(recorder, req)
+			if recorder.Code != http.StatusOK {
+				errs <- fmt.Errorf("%s status=%d body=%s", sessionID, recorder.Code, recorder.Body.String())
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	requestIDs := make(map[string]string)
+	for _, line := range lines {
+		if !strings.Contains(line, "请求进入") {
+			continue
+		}
+		for _, sessionID := range []string{"concurrent-a", "concurrent-b"} {
+			if !strings.Contains(line, "request_session_id="+sessionID) {
+				continue
+			}
+			for _, field := range strings.Fields(line) {
+				if strings.HasPrefix(field, "request_id=") {
+					requestIDs[sessionID] = strings.TrimPrefix(field, "request_id=")
+				}
+			}
+		}
+	}
+	if len(requestIDs) != 2 || requestIDs["concurrent-a"] == requestIDs["concurrent-b"] {
+		t.Fatalf("无法从入口日志还原唯一 request_id: %v\n%s", requestIDs, logs.String())
+	}
+	for sessionID, requestID := range requestIDs {
+		var chain strings.Builder
+		for _, line := range lines {
+			if strings.Contains(line, "request_id="+requestID+" ") || strings.HasSuffix(line, "request_id="+requestID) {
+				chain.WriteString(line)
+				chain.WriteByte('\n')
+			}
+		}
+		got := chain.String()
+		for _, event := range []string{"请求进入", "Archive 召回汇总", "上游请求发送"} {
+			if !strings.Contains(got, event) {
+				t.Fatalf("%s(request_id=%s) 缺少 %s:\n%s", sessionID, requestID, event, got)
+			}
+		}
+		if !strings.Contains(got, "request_session_id="+sessionID) {
+			t.Fatalf("request_id=%s 混入其他 session:\n%s", requestID, got)
+		}
+	}
+}
+
 func TestHandleMessagesSubagentNoSideEffects(t *testing.T) {
 	testHandleMessagesDirectAgentBypass(t, "subagent", `"deepseek-v4-pro"`, `{"type":"enabled"}`, `[{"type":"text","text":"cc_entrypoint=sdk-ts"}]`)
 }
@@ -66,7 +157,7 @@ func testHandleMessagesDirectAgentBypass(t *testing.T, name, model, thinking, sy
 
 	server := newPipelineTestServer(t, upstream.URL)
 	searchCalls := 0
-	server.searchAndExpandFn = func(messages []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, _ string) RecallOutcome {
+	server.searchAndExpandFn = func(messages []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, _ *requestMeta) RecallOutcome {
 		searchCalls++
 		return RecallOutcome{Messages: messages}
 	}
@@ -360,9 +451,9 @@ func TestHandleMessagesSearchOnceAcrossFrozenPaths(t *testing.T) {
 
 			searchCalls := 0
 			var outcomes []RecallOutcome
-			server.searchAndExpandFn = func(messages []Message, store *SQLiteStore, threshold int, counter *TokenCounter, budget *Budget, sessionID string) RecallOutcome {
+			server.searchAndExpandFn = func(messages []Message, store *SQLiteStore, threshold int, counter *TokenCounter, budget *Budget, meta *requestMeta) RecallOutcome {
 				searchCalls++
-				outcome := searchAndExpandForSession(messages, store, threshold, counter, budget, sessionID)
+				outcome := searchAndExpandWithMeta(messages, store, threshold, counter, budget, meta)
 				outcomes = append(outcomes, outcome)
 				return outcome
 			}
