@@ -139,14 +139,10 @@ func TestConcurrentRequestLogsReconstructable(t *testing.T) {
 }
 
 func TestHandleMessagesSubagentNoSideEffects(t *testing.T) {
-	testHandleMessagesDirectAgentBypass(t, "subagent", `"deepseek-v4-pro"`, `{"type":"enabled"}`, `[{"type":"text","text":"cc_entrypoint=sdk-ts"}]`)
+	testHandleMessagesDirectAgentBypass(t)
 }
 
-func TestHandleMessagesAgentUnknownNoSideEffects(t *testing.T) {
-	testHandleMessagesDirectAgentBypass(t, "unknown", `"unverified-model"`, `{"type":"enabled"}`, `[{"type":"text","text":"ordinary system"}]`)
-}
-
-func testHandleMessagesDirectAgentBypass(t *testing.T, name, model, thinking, system string) {
+func testHandleMessagesDirectAgentBypass(t *testing.T, _ ...string) {
 	t.Helper()
 	var forwardedBodies [][]byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -166,14 +162,16 @@ func testHandleMessagesDirectAgentBypass(t *testing.T, name, model, thinking, sy
 		searchCalls++
 		return RecallOutcome{Messages: messages}
 	}
-	messagesJSON, err := json.Marshal(pipelineMessages(300, 80))
+	messages := append([]Message{pipelinePersistentContextMessage(t, "subagent-current")}, pipelineMessages(300, 80)...)
+	messagesJSON, err := json.Marshal(messages)
 	if err != nil {
 		t.Fatalf("marshal messages: %v", err)
 	}
-	body := []byte(fmt.Sprintf("{ \"model\" : %s, \"thinking\" : %s, \"system\" : %s, \"messages\" : %s }", model, thinking, system, messagesJSON))
+	body := []byte(fmt.Sprintf("{ \"model\" : \"same-model\", \"thinking\" : {\"type\":\"enabled\"}, \"system\" : \"cc_entrypoint=sdk-ts\", \"messages\" : %s }", messagesJSON))
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Claude-Code-Session-Id", "thread-agent-"+name)
+	req.Header.Set("X-Claude-Code-Session-Id", "thread-agent-subagent")
+	req.Header.Set("x-anthropic-billing-header", "cch=12345, cc_is_subagent=true")
 	recorder := httptest.NewRecorder()
 	server.HandleMessages(recorder, req)
 
@@ -194,86 +192,73 @@ func testHandleMessagesDirectAgentBypass(t *testing.T, name, model, thinking, sy
 	}
 }
 
-func TestHandleMessagesParentFrozenRequiresExplicitRelation(t *testing.T) {
+func TestHandleMessagesMainFallbackRunsPipeline(t *testing.T) {
+	var forwarded []Message
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []Message `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		forwarded = deepCopyMessages(body.Messages)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	searchCalls := 0
+	server.searchAndExpandFn = func(messages []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, _ *requestMeta) RecallOutcome {
+		searchCalls++
+		return RecallOutcome{Messages: messages}
+	}
+	raw := append([]Message{pipelinePersistentContextMessage(t, "main-fallback")}, pipelineMessages(300, 80)...)
+	servePipelineRequestWith(t, server, "thread-main-fallback", raw, map[string]any{
+		"model":  "unverified-model",
+		"system": "cc_entrypoint=sdk-ts",
+	}, nil)
+	if searchCalls != 1 {
+		t.Fatalf("SearchAndExpand calls = %d, want 1", searchCalls)
+	}
+	if len(forwarded) >= len(raw) {
+		t.Fatalf("main fallback forwarded messages = %d, want collapse below raw %d", len(forwarded), len(raw))
+	}
+	assertPersistentContext(t, forwarded, "main-fallback")
+}
+
+func TestHandleMessagesSubagentIgnoresParentFrozen(t *testing.T) {
 	const (
 		childID  = "11111111-1111-4111-8111-111111111111"
 		parentID = "22222222-2222-4222-8222-222222222222"
 	)
-	tests := []struct {
-		name          string
-		parentHeader  string
-		wantFirstText string
-		wantLog       string
-	}{
-		{name: "explicit parent", parentHeader: parentID, wantFirstText: "parent frozen"},
-		{name: "parent unavailable", wantFirstText: "raw child", wantLog: "parent_frozen_unavailable"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var forwarded []Message
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				var body struct {
-					Messages []Message `json:"messages"`
-				}
-				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-					t.Fatalf("decode upstream request: %v", err)
-				}
-				forwarded = deepCopyMessages(body.Messages)
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
-			}))
-			defer upstream.Close()
-
-			server := newPipelineTestServer(t, upstream.URL)
-			raw := []Message{
-				{Role: "user", Content: mustMarshal("raw child")},
-				{Role: "assistant", Content: mustMarshal("fresh tail")},
-			}
-			parentPrefix := []Message{{Role: "user", Content: mustMarshal("parent frozen")}}
-			server.Frozen.Store(parentID, parentPrefix, 1, raw[0], 10, 20)
-			childPrefix := []Message{{Role: "user", Content: mustMarshal("child frozen must not be used")}}
-			server.Frozen.Store(childID, childPrefix, 1, raw[0], 10, 20)
-
-			var logs bytes.Buffer
-			previous := slog.Default()
-			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
-			t.Cleanup(func() { slog.SetDefault(previous) })
-
-			body, err := json.Marshal(map[string]any{
-				"model":    "deepseek-v4-pro",
-				"thinking": map[string]any{"type": "enabled"},
-				"system":   []map[string]string{{"type": "text", "text": "cc_entrypoint=sdk-ts"}},
-				"messages": raw,
-			})
-			if err != nil {
-				t.Fatalf("marshal request: %v", err)
-			}
-			req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("X-Claude-Code-Session-Id", childID)
-			if tt.parentHeader != "" {
-				req.Header.Set(parentSessionHeader, tt.parentHeader)
-			}
-			recorder := httptest.NewRecorder()
-			server.HandleMessages(recorder, req)
-			if recorder.Code != http.StatusOK {
-				t.Fatalf("HandleMessages status = %d, body = %s", recorder.Code, recorder.Body.String())
-			}
-			if len(forwarded) != 2 {
-				t.Fatalf("forwarded message count = %d, want 2", len(forwarded))
-			}
-			var firstText string
-			if err := json.Unmarshal(forwarded[0].Content, &firstText); err != nil {
-				t.Fatalf("decode first content: %v", err)
-			}
-			if firstText != tt.wantFirstText {
-				t.Fatalf("first message = %q, want %q", firstText, tt.wantFirstText)
-			}
-			if tt.wantLog != "" && !strings.Contains(logs.String(), tt.wantLog) {
-				t.Fatalf("logs missing %q: %s", tt.wantLog, logs.String())
-			}
-		})
+	var forwarded []Message
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []Message `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		forwarded = deepCopyMessages(body.Messages)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100}}`))
+	}))
+	defer upstream.Close()
+	server := newPipelineTestServer(t, upstream.URL)
+	history := pipelineMessages(3, 10)
+	server.Frozen.Store(parentID, []Message{{Role: "user", Content: mustMarshal("parent frozen must not be used")}}, 1, history[0], 10, 20)
+	server.Frozen.Store(childID, []Message{{Role: "user", Content: mustMarshal("child frozen must not be used")}}, 1, history[0], 10, 20)
+	raw := append([]Message{pipelinePersistentContextMessage(t, "child-current")}, history...)
+	servePipelineRequestWith(t, server, childID, raw, map[string]any{
+		"agentContext": map[string]any{"agentType": "subagent", "parentSessionId": parentID},
+	}, nil)
+	assertPersistentContext(t, forwarded, "child-current")
+	for _, message := range forwarded {
+		text := allText(t, message)
+		if strings.Contains(text, "frozen must not be used") {
+			t.Fatalf("subagent 读取了 parent/current Frozen: %s", text)
+		}
 	}
 }
 
@@ -342,14 +327,16 @@ func TestHandleMessagesCollapseThenRestore(t *testing.T) {
 	defer upstream.Close()
 
 	server := newPipelineTestServer(t, upstream.URL)
-	raw := pipelineMessages(300, 80)
+	history := pipelineMessages(300, 80)
+	raw := append([]Message{pipelinePersistentContextMessage(t, "context-A")}, history...)
 	servePipelineRequest(t, server, "thread-restore", raw)
 	archivesAfterFreeze := archiveCount(t, server.Store)
 
 	tail := pipelineMessages(2, 10)
 	tail[0].Content = mustMarshal("fresh-tail-0")
 	tail[1].Content = mustMarshal("fresh-tail-1")
-	secondRaw := append(deepCopyMessages(raw), tail...)
+	secondHistory := append(deepCopyMessages(history), tail...)
+	secondRaw := append([]Message{pipelinePersistentContextMessage(t, "context-B")}, secondHistory...)
 	servePipelineRequest(t, server, "thread-restore", secondRaw)
 
 	if len(forwarded) != 2 {
@@ -357,6 +344,14 @@ func TestHandleMessagesCollapseThenRestore(t *testing.T) {
 	}
 	if got, want := len(forwarded[1]), len(forwarded[0])+len(tail); got != want {
 		t.Fatalf("restored message count = %d, want frozen prefix %d + tail %d = %d", got, len(forwarded[0]), len(tail), want)
+	}
+	assertPersistentContext(t, forwarded[0], "context-A")
+	assertPersistentContext(t, forwarded[1], "context-B")
+	if got := countMessagesContaining(forwarded[1], "context-A"); got != 0 {
+		t.Fatalf("第二轮仍包含旧 context A，count=%d", got)
+	}
+	if got := countMessagesContaining(forwarded[1], "context-B"); got != 1 {
+		t.Fatalf("第二轮 context B count=%d, want 1", got)
 	}
 	for i := range tail {
 		got, err := json.Marshal(forwarded[1][len(forwarded[0])+i])
@@ -374,6 +369,16 @@ func TestHandleMessagesCollapseThenRestore(t *testing.T) {
 	if got := archiveCount(t, server.Store); got != archivesAfterFreeze {
 		t.Fatalf("archive rows after restore = %d, want unchanged %d", got, archivesAfterFreeze)
 	}
+	detachedSecond, _ := DetachPersistentUserContext(secondRaw)
+	if result := server.Frozen.Get("thread-restore", StripReminders(detachedSecond)); result == nil {
+		t.Fatal("context A→B 后稳定 historical Frozen 应继续命中")
+	}
+	server.Frozen.mu.RLock()
+	stored := deepCopyMessages(server.Frozen.messages["thread-restore"])
+	server.Frozen.mu.RUnlock()
+	if ExtractPersistentUserContext(stored) != nil {
+		t.Fatal("Frozen snapshot 不得包含任一轮 persistent context")
+	}
 }
 
 func TestHandleMessagesFrozenBoundaryEdit(t *testing.T) {
@@ -384,13 +389,15 @@ func TestHandleMessagesFrozenBoundaryEdit(t *testing.T) {
 	defer upstream.Close()
 
 	server := newPipelineTestServer(t, upstream.URL)
-	raw := pipelineMessages(300, 80)
+	history := pipelineMessages(300, 80)
+	raw := append([]Message{pipelinePersistentContextMessage(t, "boundary-A")}, history...)
 	servePipelineRequest(t, server, "thread-boundary-edit", raw)
 	archivesAfterFreeze := archiveCount(t, server.Store)
 
-	edited := deepCopyMessages(raw)
-	edited[299].Content = mustMarshal("edited raw boundary")
-	edited = append(edited, pipelineMessages(2, 10)...)
+	editedHistory := deepCopyMessages(history)
+	editedHistory[299].Content = mustMarshal("edited raw boundary")
+	editedHistory = append(editedHistory, pipelineMessages(2, 10)...)
+	edited := append([]Message{pipelinePersistentContextMessage(t, "boundary-B")}, editedHistory...)
 	servePipelineRequest(t, server, "thread-boundary-edit", edited)
 
 	if got := archiveCount(t, server.Store); got < archivesAfterFreeze {
@@ -399,8 +406,91 @@ func TestHandleMessagesFrozenBoundaryEdit(t *testing.T) {
 	server.Frozen.mu.RLock()
 	refreshedCutoff := server.Frozen.cutoff["thread-boundary-edit"]
 	server.Frozen.mu.RUnlock()
-	if refreshedCutoff != len(edited) {
-		t.Fatalf("refreshed cutoff=%d, want %d", refreshedCutoff, len(edited))
+	if refreshedCutoff != len(editedHistory) {
+		t.Fatalf("refreshed historical cutoff=%d, want %d", refreshedCutoff, len(editedHistory))
+	}
+}
+
+func TestHandleMessagesPersistentContextPaths(t *testing.T) {
+	tests := []struct {
+		name          string
+		historyCount  int
+		words         int
+		subagent      bool
+		setupFrozen   func(*Server, string, []Message)
+		wantFrozenHit bool
+	}{
+		{name: "below threshold", historyCount: 6, words: 5},
+		{name: "collapse", historyCount: 300, words: 80},
+		{
+			name: "valid frozen", historyCount: 6, words: 5, wantFrozenHit: true,
+			setupFrozen: func(server *Server, sessionID string, history []Message) {
+				prefix := deepCopyMessages(history[:2])
+				server.Frozen.Store(sessionID, prefix, 2, history[1], server.TokenCounter.CountMessagesTokens(prefix), server.TokenCounter.CountMessagesTokens(history))
+			},
+		},
+		{
+			name: "invalid frozen", historyCount: 6, words: 5,
+			setupFrozen: func(server *Server, sessionID string, history []Message) {
+				prefix := deepCopyMessages(history[:2])
+				wrongBoundary := history[1]
+				wrongBoundary.Content = mustMarshal("edited historical boundary")
+				server.Frozen.Store(sessionID, prefix, 2, wrongBoundary, server.TokenCounter.CountMessagesTokens(prefix), server.TokenCounter.CountMessagesTokens(history))
+			},
+		},
+		{name: "subagent bypass", historyCount: 300, words: 80, subagent: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var forwarded []Message
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Messages []Message `json:"messages"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				forwarded = deepCopyMessages(body.Messages)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"usage":{"input_tokens":100}}`))
+			}))
+			defer upstream.Close()
+
+			server := newPipelineTestServer(t, upstream.URL)
+			sessionID := "thread-context-" + strings.ReplaceAll(tt.name, " ", "-")
+			history := pipelineHistoryWithToolPair(t, tt.historyCount, tt.words)
+			if tt.setupFrozen != nil {
+				tt.setupFrozen(server, sessionID, history)
+			}
+			searchCalls := 0
+			server.searchAndExpandFn = func(messages []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, _ *requestMeta) RecallOutcome {
+				searchCalls++
+				return RecallOutcome{Messages: messages}
+			}
+			headers := map[string]string{}
+			if tt.subagent {
+				headers["x-anthropic-billing-header"] = "cc_is_subagent=true"
+			}
+			raw := append([]Message{pipelinePersistentContextMessage(t, "path-"+tt.name)}, history...)
+			servePipelineRequestWith(t, server, sessionID, raw, nil, headers)
+
+			assertPersistentContext(t, forwarded, "path-"+tt.name)
+			assertToolPairOrder(t, forwarded, "tool-context-path")
+			if tt.subagent {
+				if searchCalls != 0 || archiveCount(t, server.Store) != 0 {
+					t.Fatalf("subagent side effects: search=%d archives=%d", searchCalls, archiveCount(t, server.Store))
+				}
+			} else if searchCalls != 1 {
+				t.Fatalf("main SearchAndExpand calls=%d, want 1", searchCalls)
+			}
+			if tt.wantFrozenHit && server.Frozen.LengthFor(sessionID) == 0 {
+				t.Fatal("valid Frozen 应保持命中，不应被 context 坐标误判失效")
+			}
+			if tt.name == "invalid frozen" && server.Frozen.LengthFor(sessionID) != 0 {
+				t.Fatal("真实 historical boundary 编辑应使 Frozen 失效")
+			}
+		})
 	}
 }
 
@@ -565,21 +655,125 @@ func archiveCount(t *testing.T, store *SQLiteStore) int {
 
 func servePipelineRequest(t *testing.T, server *Server, sessionID string, messages []Message) {
 	t.Helper()
-	body, err := json.Marshal(map[string]any{
+	servePipelineRequestWith(t, server, sessionID, messages, nil, nil)
+}
+
+func servePipelineRequestWith(t *testing.T, server *Server, sessionID string, messages []Message, extra map[string]any, headers map[string]string) {
+	t.Helper()
+	requestBody := map[string]any{
 		"model":    "deepseek-v4-pro",
 		"thinking": map[string]any{"type": "enabled"},
 		"messages": messages,
-	})
+	}
+	for key, value := range extra {
+		requestBody[key] = value
+	}
+	body, err := json.Marshal(requestBody)
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Claude-Code-Session-Id", sessionID)
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
 	recorder := httptest.NewRecorder()
 	server.HandleMessages(recorder, req)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("HandleMessages status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func pipelinePersistentContextMessage(t *testing.T, label string) Message {
+	t.Helper()
+	text := "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# claudeMd\n" + label + "\n# currentDate\n2026-07-12\n</system-reminder>"
+	raw, err := json.Marshal(map[string]any{
+		"role": "user", "content": []map[string]any{{"type": "text", "text": text}},
+		"isMeta": true, "future_context_field": map[string]any{"preserve": label},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var message Message
+	if err := json.Unmarshal(raw, &message); err != nil {
+		t.Fatal(err)
+	}
+	return message
+}
+
+func pipelineHistoryWithToolPair(t *testing.T, count, words int) []Message {
+	t.Helper()
+	if count < 2 {
+		t.Fatal("history count must leave room for a tool pair")
+	}
+	messages := pipelineMessages(count, words)
+	toolUse := `{"role":"assistant","content":[{"type":"tool_use","id":"tool-context-path","name":"Read","input":{"file_path":"context.go"}}],"future_tail_field":{"kind":"tool-use"}}`
+	toolResult := `{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-context-path","content":"ok"}],"future_tail_field":{"kind":"tool-result"}}`
+	if err := json.Unmarshal([]byte(toolUse), &messages[count-2]); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(toolResult), &messages[count-1]); err != nil {
+		t.Fatal(err)
+	}
+	return messages
+}
+
+func assertPersistentContext(t *testing.T, messages []Message, label string) {
+	t.Helper()
+	if len(messages) == 0 || !strings.Contains(allText(t, messages[0]), "# claudeMd") || !strings.Contains(allText(t, messages[0]), label) {
+		t.Fatalf("首消息不是本轮 persistent context %q: %v", label, messages)
+	}
+	if got := countMessagesContaining(messages, label); got != 1 {
+		t.Fatalf("persistent context %q count=%d, want 1", label, got)
+	}
+	encoded, err := json.Marshal(messages[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fields["future_context_field"]; !ok {
+		t.Fatalf("persistent context 未知字段丢失: %s", encoded)
+	}
+}
+
+func countMessagesContaining(messages []Message, marker string) int {
+	count := 0
+	for _, message := range messages {
+		blocks, _ := parseContent(message.Content)
+		for _, block := range blocks {
+			if block.Type == "text" && strings.Contains(block.Text, marker) {
+				count++
+				break
+			}
+		}
+	}
+	return count
+}
+
+func assertToolPairOrder(t *testing.T, messages []Message, toolID string) {
+	t.Helper()
+	useIndex, resultIndex := -1, -1
+	for i, message := range messages {
+		blocks, _ := parseContent(message.Content)
+		for _, block := range blocks {
+			if block.Type == "tool_use" && block.ID == toolID {
+				useIndex = i
+			}
+			if block.Type == "tool_result" && block.ToolUseID == toolID {
+				resultIndex = i
+			}
+		}
+	}
+	if useIndex < 0 || resultIndex != useIndex+1 {
+		t.Fatalf("tool pair order invalid: use=%d result=%d", useIndex, resultIndex)
+	}
+	encoded, err := json.Marshal(messages[resultIndex])
+	if err != nil || !bytes.Contains(encoded, []byte("future_tail_field")) {
+		t.Fatalf("tool_result 未知字段丢失: %s err=%v", encoded, err)
 	}
 }
 
