@@ -38,6 +38,7 @@ func TestAgentRequestFeatures(t *testing.T) {
 				MetadataPresent:      true,
 				SessionHeaderPresent: true,
 				ParentRelation:       agentParentRelationUnavailable,
+				AgentContextType:     agentContextTypeMissing,
 				MessagesPresent:      true,
 			},
 		},
@@ -54,6 +55,7 @@ func TestAgentRequestFeatures(t *testing.T) {
 				SystemShape:        agentSystemShapeArray,
 				SDKTSMarkerPresent: true,
 				ParentRelation:     agentParentRelationUnavailable,
+				AgentContextType:   agentContextTypeMissing,
 				MessagesPresent:    true,
 			},
 		},
@@ -65,11 +67,12 @@ func TestAgentRequestFeatures(t *testing.T) {
 				"metadata": json.RawMessage(`{"broken":`),
 			},
 			want: agentRequestFeatures{
-				ModelFamily:     agentModelFamilyUnknown,
-				SystemPresent:   true,
-				SystemShape:     agentSystemShapeUnknown,
-				MetadataPresent: true,
-				ParentRelation:  agentParentRelationUnavailable,
+				ModelFamily:      agentModelFamilyUnknown,
+				SystemPresent:    true,
+				SystemShape:      agentSystemShapeUnknown,
+				MetadataPresent:  true,
+				ParentRelation:   agentParentRelationUnavailable,
+				AgentContextType: agentContextTypeMissing,
 			},
 		},
 	}
@@ -96,9 +99,10 @@ func TestAgentDiagnosticRedaction(t *testing.T) {
 		secretSession = "TOP-SECRET-SESSION"
 	)
 	bodyMap := map[string]json.RawMessage{
-		"model":    json.RawMessage(`"deepseek-v4-pro"`),
-		"thinking": json.RawMessage(`{"type":"enabled"}`),
-		"system":   json.RawMessage(`"` + secretSystem + `"`),
+		"model":        json.RawMessage(`"deepseek-v4-pro"`),
+		"thinking":     json.RawMessage(`{"type":"enabled"}`),
+		"system":       json.RawMessage(`"` + secretSystem + `"`),
+		"agentContext": json.RawMessage(`{"parentSessionId":"` + secretSession + `"}`),
 	}
 	req := httptest.NewRequest("POST", "/v1/messages", nil)
 	req.Header.Set("Authorization", secretAuth)
@@ -120,6 +124,7 @@ func TestAgentDiagnosticRedaction(t *testing.T) {
 	for _, field := range []string{
 		"agent_features", "model_family=deepseek", "thinking_present=true",
 		"system_present=true", "session_header_present=true", "parent_relation=unavailable",
+		"agent_context_type=missing", "parent_session_present=true",
 	} {
 		if !strings.Contains(got, field) {
 			t.Errorf("诊断日志缺少白名单字段 %q: %s", field, got)
@@ -316,6 +321,21 @@ func TestAgentClassificationCompatibilityPrecedence(t *testing.T) {
 				t.Fatalf("classification = %#v, want role=%q reason=%q", got, tt.wantRole, tt.wantWhy)
 			}
 		})
+	}
+}
+
+func TestAgentClassificationStrongFeaturePrecedence(t *testing.T) {
+	req := httptest.NewRequest("POST", "/v1/messages", nil)
+	req.Header.Set("x-anthropic-billing-header", "cc_is_subagent=true")
+	bodyMap := map[string]json.RawMessage{
+		"model":        json.RawMessage(`"deepseek-v4-pro"`),
+		"thinking":     json.RawMessage(`{"type":"enabled"}`),
+		"system":       json.RawMessage(`"cc_entrypoint=sdk-ts"`),
+		"agentContext": json.RawMessage(`{"agentType":"subagent","parentSessionId":"parent-secret"}`),
+	}
+	got := classifyAgentRequest(req, bodyMap, []Message{{Role: "user", Content: json.RawMessage(`"hello"`)}})
+	if got.Role != agentRoleSubagent || got.Reason != agentReasonBillingMarker {
+		t.Fatalf("组合强特征 classification = %#v, want billing marker precedence", got)
 	}
 }
 

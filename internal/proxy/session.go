@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 )
 
@@ -45,13 +46,23 @@ const (
 type agentClassificationReason string
 
 const (
-	agentReasonEmptyMessages      agentClassificationReason = "empty_messages"
-	agentReasonSDKTSCompatibility agentClassificationReason = "sdk_ts_compatibility"
-	agentReasonDeepSeekModel      agentClassificationReason = "deepseek_model"
-	agentReasonClaudeModel        agentClassificationReason = "claude_model"
-	agentReasonHaikuCompatibility agentClassificationReason = "haiku_compatibility"
-	agentReasonNoVerifiedMarker   agentClassificationReason = "no_verified_marker"
+	agentReasonBillingMarker      agentClassificationReason = "billing_marker"
+	agentReasonAgentContextType   agentClassificationReason = "agent_context_type"
+	agentReasonAgentContextParent agentClassificationReason = "agent_context_parent"
+	agentReasonNoSubagentMarker   agentClassificationReason = "no_subagent_marker"
 )
+
+type agentContextType string
+
+const (
+	agentContextTypeMissing   agentContextType = "missing"
+	agentContextTypeMain      agentContextType = "main"
+	agentContextTypeSubagent  agentContextType = "subagent"
+	agentContextTypeOther     agentContextType = "other"
+	agentContextTypeMalformed agentContextType = "malformed"
+)
+
+var billingSubagentMarkerPattern = regexp.MustCompile(`(?i)(?:^|[\s,;])cc_is_subagent\s*=\s*true(?:$|[\s,;])`)
 
 const parentSessionHeader = "X-Claude-Code-Parent-Session-Id"
 
@@ -65,36 +76,38 @@ type agentClassification struct {
 // agentRequestFeatures 只保存代理分类所需的脱敏事实。
 // 字段类型限定为布尔或受限枚举，避免 prompt、消息正文、凭证和完整 ID 进入日志或 fixture。
 type agentRequestFeatures struct {
-	ModelFamily          agentModelFamily    `json:"model_family"`
-	ThinkingPresent      bool                `json:"thinking_present"`
-	SystemPresent        bool                `json:"system_present"`
-	SystemShape          agentSystemShape    `json:"system_shape"`
-	SDKTSMarkerPresent   bool                `json:"sdk_ts_marker_present"`
-	MetadataPresent      bool                `json:"metadata_present"`
-	SessionHeaderPresent bool                `json:"session_header_present"`
-	ParentMarkerPresent  bool                `json:"parent_marker_present"`
-	ParentRelation       agentParentRelation `json:"parent_relation"`
-	MessagesPresent      bool                `json:"messages_present"`
+	ModelFamily           agentModelFamily    `json:"model_family"`
+	ThinkingPresent       bool                `json:"thinking_present"`
+	SystemPresent         bool                `json:"system_present"`
+	SystemShape           agentSystemShape    `json:"system_shape"`
+	SDKTSMarkerPresent    bool                `json:"sdk_ts_marker_present"`
+	MetadataPresent       bool                `json:"metadata_present"`
+	SessionHeaderPresent  bool                `json:"session_header_present"`
+	ParentMarkerPresent   bool                `json:"parent_marker_present"`
+	ParentRelation        agentParentRelation `json:"parent_relation"`
+	BillingSubagentMarker bool                `json:"billing_subagent_marker"`
+	AgentContextType      agentContextType    `json:"agent_context_type"`
+	ParentSessionPresent  bool                `json:"parent_session_present"`
+	MessagesPresent       bool                `json:"messages_present"`
 }
 
 func extractAgentRequestFeatures(r *http.Request, bodyMap map[string]json.RawMessage, messages []Message) agentRequestFeatures {
 	features := agentRequestFeatures{
-		ModelFamily:     extractAgentModelFamily(bodyMap["model"]),
-		SystemShape:     agentSystemShapeMissing,
-		ParentRelation:  agentParentRelationUnavailable,
-		MessagesPresent: len(messages) > 0,
+		ModelFamily:      extractAgentModelFamily(bodyMap["model"]),
+		SystemShape:      agentSystemShapeMissing,
+		ParentRelation:   agentParentRelationUnavailable,
+		AgentContextType: agentContextTypeMissing,
+		MessagesPresent:  len(messages) > 0,
 	}
 	_, features.ThinkingPresent = bodyMap["thinking"]
 	_, features.MetadataPresent = bodyMap["metadata"]
 	if r != nil {
 		sessionID := strings.TrimSpace(r.Header.Get("X-Claude-Code-Session-Id"))
-		parentID := strings.TrimSpace(r.Header.Get(parentSessionHeader))
 		features.SessionHeaderPresent = sessionID != ""
-		features.ParentMarkerPresent = parentID != ""
-		if sessionID != "" && parentID != "" && parentID != sessionID {
-			features.ParentRelation = agentParentRelationAvailable
-		}
+		features.BillingSubagentMarker = hasBillingSubagentMarker(r.Header.Values("x-anthropic-billing-header"))
 	}
+	features.AgentContextType, features.ParentSessionPresent = inspectAgentContext(bodyMap["agentContext"])
+	features.ParentMarkerPresent = features.ParentSessionPresent
 
 	systemRaw, ok := bodyMap["system"]
 	if !ok {
@@ -107,29 +120,67 @@ func extractAgentRequestFeatures(r *http.Request, bodyMap map[string]json.RawMes
 
 func classifyAgentFeatures(features agentRequestFeatures) agentClassification {
 	switch {
-	case !features.MessagesPresent:
-		return agentClassification{Role: agentRoleUnknown, Reason: agentReasonEmptyMessages}
-	case features.SDKTSMarkerPresent:
-		return agentClassification{Role: agentRoleSubagent, Reason: agentReasonSDKTSCompatibility}
-	case features.ModelFamily == agentModelFamilyDeepSeek:
-		return agentClassification{Role: agentRoleMain, Reason: agentReasonDeepSeekModel}
-	case features.ModelFamily == agentModelFamilyClaudeHaiku:
-		return agentClassification{Role: agentRoleSubagent, Reason: agentReasonHaikuCompatibility}
-	case features.ModelFamily == agentModelFamilyClaude && features.ThinkingPresent:
-		return agentClassification{Role: agentRoleMain, Reason: agentReasonClaudeModel}
+	case features.BillingSubagentMarker:
+		return agentClassification{Role: agentRoleSubagent, Reason: agentReasonBillingMarker}
+	case features.AgentContextType == agentContextTypeSubagent:
+		return agentClassification{Role: agentRoleSubagent, Reason: agentReasonAgentContextType}
+	case features.ParentSessionPresent:
+		return agentClassification{Role: agentRoleSubagent, Reason: agentReasonAgentContextParent}
 	default:
-		return agentClassification{Role: agentRoleUnknown, Reason: agentReasonNoVerifiedMarker}
+		return agentClassification{Role: agentRoleMain, Reason: agentReasonNoSubagentMarker}
 	}
 }
 
 func classifyAgentRequest(r *http.Request, bodyMap map[string]json.RawMessage, messages []Message) agentClassification {
 	features := extractAgentRequestFeatures(r, bodyMap, messages)
-	classification := classifyAgentFeatures(features)
-	if features.ParentRelation == agentParentRelationAvailable {
-		classification.ParentSessionID = strings.TrimSpace(r.Header.Get(parentSessionHeader))
-		classification.ParentAvailable = true
+	return classifyAgentFeatures(features)
+}
+
+func hasBillingSubagentMarker(values []string) bool {
+	for _, value := range values {
+		if billingSubagentMarkerPattern.MatchString(value) {
+			return true
+		}
 	}
-	return classification
+	return false
+}
+
+func inspectAgentContext(raw json.RawMessage) (agentContextType, bool) {
+	if len(raw) == 0 {
+		return agentContextTypeMissing, false
+	}
+	var context struct {
+		AgentType       json.RawMessage `json:"agentType"`
+		ParentSessionID json.RawMessage `json:"parentSessionId"`
+	}
+	if strings.TrimSpace(string(raw)) == "null" || json.Unmarshal(raw, &context) != nil {
+		return agentContextTypeMalformed, false
+	}
+
+	parentPresent := false
+	if len(context.ParentSessionID) > 0 {
+		var parentID string
+		if json.Unmarshal(context.ParentSessionID, &parentID) != nil {
+			return agentContextTypeMalformed, false
+		}
+		parentPresent = strings.TrimSpace(parentID) != ""
+	}
+
+	if len(context.AgentType) == 0 {
+		return agentContextTypeMissing, parentPresent
+	}
+	var agentType string
+	if json.Unmarshal(context.AgentType, &agentType) != nil {
+		return agentContextTypeMalformed, parentPresent
+	}
+	switch strings.ToLower(strings.TrimSpace(agentType)) {
+	case "main":
+		return agentContextTypeMain, parentPresent
+	case "subagent":
+		return agentContextTypeSubagent, parentPresent
+	default:
+		return agentContextTypeOther, parentPresent
+	}
 }
 
 func extractAgentModelFamily(raw json.RawMessage) agentModelFamily {
@@ -185,6 +236,9 @@ func logAgentRequestFeatures(logger *slog.Logger, features agentRequestFeatures)
 		"session_header_present", features.SessionHeaderPresent,
 		"parent_marker_present", features.ParentMarkerPresent,
 		"parent_relation", features.ParentRelation,
+		"billing_subagent_marker", features.BillingSubagentMarker,
+		"agent_context_type", features.AgentContextType,
+		"parent_session_present", features.ParentSessionPresent,
 		"messages_present", features.MessagesPresent,
 	)
 }
