@@ -14,7 +14,8 @@ import (
 
 // SQLiteStore 管理 archive + decay state 的 SQLite 数据库。
 type SQLiteStore struct {
-	db *sql.DB
+	db   *sql.DB
+	path string
 }
 
 // ArchiveBlock 折叠存档块——包含被折叠的原始消息及元数据。
@@ -105,7 +106,7 @@ func tryInitDB(path string) (*SQLiteStore, error) {
 		}
 	}
 
-	s := &SQLiteStore{db: db}
+	s := &SQLiteStore{db: db, path: path}
 	if err := s.createSchema(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("建表失败: %w", err)
@@ -388,7 +389,17 @@ func (s *SQLiteStore) SearchArchives(query string, limit int) ([]ArchiveSummary,
 func (s *SQLiteStore) Close() error {
 	// 确保 WAL 完整落盘（忽略 error，因为 db 可能已经关闭）
 	_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
-	return s.db.Close()
+	if err := s.db.Close(); err != nil {
+		return err
+	}
+	// Windows 的 TempDir 清理可能与 SQLite 伴生文件的删除发生竞态。
+	// 连接完全关闭后主动清理当前数据库专属的 WAL/SHM，避免目录清理时又出现文件。
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.Remove(s.path + suffix); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("清理 sqlite 伴生文件 %s: %w", s.path+suffix, err)
+		}
+	}
+	return nil
 }
 
 // ── SQLite 损坏恢复辅助函数 ──

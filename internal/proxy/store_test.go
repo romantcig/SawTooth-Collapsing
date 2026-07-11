@@ -197,7 +197,8 @@ func TestSearchArchivesMultiKeywordRanking(t *testing.T) {
 }
 
 func TestSearchArchivesStableOrderingAndFields(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "stable.db"))
+	dbPath := filepath.Join(t.TempDir(), "stable.db")
+	store, err := NewSQLiteStore(dbPath)
 	if err != nil {
 		t.Fatalf("NewSQLiteStore failed: %v", err)
 	}
@@ -254,6 +255,26 @@ func TestSearchArchivesStableOrderingAndFields(t *testing.T) {
 		}
 		if got.Rank >= 0 {
 			t.Fatalf("%s rank=%f, want negative BM25 aggregate", got.ID, got.Rank)
+		}
+	}
+}
+
+func TestSQLiteStoreCloseRemovesWALCompanions(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "close-cleanup.db")
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistState("key", "value"); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Stat(dbPath + suffix); !os.IsNotExist(err) {
+			t.Fatalf("Close 后伴生文件仍存在 %s: %v", dbPath+suffix, err)
 		}
 	}
 }
