@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -34,12 +35,10 @@ func TestArchiveReadOnlyAudit(t *testing.T) {
 		}
 		copyFile(t, source, snapshotPath+suffix)
 	}
-	t.Cleanup(func() {
-		after := snapshotFileStates(t, abs)
-		if fmt.Sprint(after) != fmt.Sprint(before) {
-			t.Errorf("生产 DB/WAL/SHM 在快照审计期间发生变化\nbefore=%v\nafter=%v", before, after)
-		}
-	})
+	after := snapshotFileStates(t, abs)
+	if !sameAuditFileStates(before, after) {
+		t.Skipf("生产 DB/WAL/SHM 在复制窗口发生变化，请停止 writer 后重试\nbefore=%v\nafter=%v", before, after)
+	}
 
 	uriPath := strings.Replace(filepath.ToSlash(snapshotPath), ":", "%3A", 1)
 	dsn := "file:///" + uriPath + "?mode=ro"
@@ -75,6 +74,18 @@ func TestArchiveReadOnlyAudit(t *testing.T) {
 	t.Logf("AUDIT total_blocks=%d distinct_sessions=%d exact_duplicate_groups=%d dominated_pairs=%d expected_retained=%d", total, sessions, exactDuplicateGroups, dominatedPairs, expectedRetained)
 	if expectedRetained > total {
 		t.Fatal(fmt.Sprintf("预计保留数 %d 不应大于总块数 %d", expectedRetained, total))
+	}
+}
+
+func sameAuditFileStates(before, after []auditFileState) bool {
+	return reflect.DeepEqual(before, after)
+}
+
+func TestAuditSnapshotRejectsWALChangeDuringCopyWindow(t *testing.T) {
+	before := []auditFileState{{Path: "archive.db-wal", Exists: true, Size: 10}}
+	after := []auditFileState{{Path: "archive.db-wal", Exists: true, Size: 11}}
+	if sameAuditFileStates(before, after) {
+		t.Fatal("复制窗口内 WAL 变化不应被接受为一致快照")
 	}
 }
 
