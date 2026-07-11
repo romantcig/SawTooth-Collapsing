@@ -4,14 +4,14 @@ milestone: v1.0
 milestone_name: milestone
 status: in_progress
 stopped_at: Completed 07.1-08-PLAN.md
-last_updated: "2026-07-11T00:19:41.660Z"
+last_updated: "2026-07-11T00:36:07.780Z"
 last_activity: 2026-07-10
 progress:
   total_phases: 8
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 10
-  completed_plans: 9
-  percent: 13
+  completed_plans: 10
+  percent: 25
 current_phase: 07.1
 ---
 
@@ -70,6 +70,7 @@ Last activity: 2026-07-10
 | Phase 07.1-frozen-archive-agent P06 | 27min | 2 tasks | 6 files |
 | Phase 07.1-frozen-archive-agent P07 | 24min | 2 tasks | 5 files |
 | Phase 07.1-frozen-archive-agent P08 | 11min | 2 tasks | 8 files |
+| Phase 07.1-frozen-archive-agent P09 | 18min | 2 tasks | 3 files |
 
 ## Decisions
 
@@ -94,9 +95,10 @@ Last activity: 2026-07-10
 - [Phase 07.1-frozen-archive-agent]: request_id 使用 Server 内 atomic.Uint64 从 1 单调分配，并通过 request-scoped logger 固定 request_id/request_session_id。 — 在不修改日志格式器或增加 goroutine 缓冲的前提下，使并发请求链可独立审计。
 - [Phase 07.1-frozen-archive-agent]: 入口与上游发送分别使用 original_message_count 和 forwarded_message_count，Archive 来源只使用 source_session_id。 — 消除处理前后计数和当前/来源 session 的语义混淆。
 - [Phase 07.1-frozen-archive-agent]: 显式 Archive 召回尝试只输出一次基于最终 RecallOutcome 的 Info 汇总，逐块与预算降级明细降为 Debug。 — 保证日志描述最终发送状态并限制 Info 日志量。
+- [Phase 07.1-frozen-archive-agent]: 生产 DB/WAL/SHM 只读复制到临时快照，SQLite mode=ro 仅打开副本，并以前后 size/mtime/SHA-256 证明生产文件不变。
 
 ## Session
 
-**Last session:** 2026-07-11T00:19:41.648Z
+**Last session:** 2026-07-11T00:36:07.772Z
 **Stopped at:** Completed 07.1-08-PLAN.md
 **Resume file:** None
