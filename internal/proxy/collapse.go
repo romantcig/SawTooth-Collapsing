@@ -82,14 +82,19 @@ func CalcCollapseCutoff(messages []Message, tokenFloor int, tc *TokenCounter, ke
 // 返回 (折叠后的消息数组, 构建的 archive block)，不修改输入。
 // COLLAPSE-03, COLLAPSE-05, D-04, D-05, ABLOCK-01
 func CollapseOldMessages(modified, original []Message, cutoffIdx int, tc *TokenCounter, sessionID string) ([]Message, ArchiveBlock) {
-	// T-03-04: bounds check — 同时检查 modified 和 original
+	// modified/original 必须保持一一对应；异常输入 fail closed，避免错误归档或越界。
+	if len(modified) != len(original) {
+		return modified, ArchiveBlock{}
+	}
+
+	// T-03-04: bounds check — 两组输入同步限制上限。
 	const maxMessages = 10000
 	if len(modified) > maxMessages {
 		modified = modified[:maxMessages]
 		original = original[:maxMessages]
 	}
 
-	if cutoffIdx < 1 || cutoffIdx >= len(modified) {
+	if cutoffIdx < 1 || cutoffIdx >= len(modified) || cutoffIdx >= len(original) {
 		return modified, ArchiveBlock{}
 	}
 

@@ -123,6 +123,29 @@ func TestCollapseOldMessagesLargeSessionReducesMessagesAndTokens(t *testing.T) {
 	}
 }
 
+func TestCollapseOldMessagesRejectsMismatchedInputs(t *testing.T) {
+	tc := mustTokenCounter(t)
+	modified := collapseTextMessages(10001, 1)
+	original := collapseTextMessages(3, 1)
+	result, block := CollapseOldMessages(modified, original, 2, tc, "session")
+	if len(result) != len(modified) {
+		t.Fatalf("异常输入应原样返回 modified，got=%d want=%d", len(result), len(modified))
+	}
+	if block.ID != "" {
+		t.Fatalf("异常输入不应创建 archive: %+v", block)
+	}
+}
+
+func TestCollapseOldMessagesRejectsCutoffBeyondOriginal(t *testing.T) {
+	tc := mustTokenCounter(t)
+	modified := collapseTextMessages(5, 1)
+	original := collapseTextMessages(2, 1)
+	result, block := CollapseOldMessages(modified, original, 4, tc, "session")
+	if len(result) != len(modified) || block.ID != "" {
+		t.Fatalf("越界 cutoff 未 fail closed: len=%d block=%+v", len(result), block)
+	}
+}
+
 func TestArchiveContentHashIsStableAndContentSensitive(t *testing.T) {
 	messages := []Message{
 		{Role: "user", Content: mustMarshal("same content")},
