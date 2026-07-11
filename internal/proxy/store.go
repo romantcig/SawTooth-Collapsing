@@ -247,11 +247,10 @@ func (s *SQLiteStore) SaveArchive(block ArchiveBlock) error {
 	if err != nil {
 		return fmt.Errorf("序列化消息失败: %w", err)
 	}
-	if block.ContentHash == "" {
-		block.ContentHash, err = archiveContentHash(block.Messages)
-		if err != nil {
-			return err
-		}
+	// 调用方提供的 hash 不可信；始终从实际正文重新计算。
+	block.ContentHash, err = archiveContentHash(block.Messages)
+	if err != nil {
+		return err
 	}
 
 	result, err := tx.Exec(

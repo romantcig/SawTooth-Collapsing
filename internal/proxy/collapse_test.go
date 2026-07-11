@@ -179,6 +179,22 @@ func TestArchiveContentHashIsStableAndContentSensitive(t *testing.T) {
 	}
 }
 
+func TestArchiveContentHashCanonicalizesJSONObjects(t *testing.T) {
+	first := []Message{{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","input":{"b":2,"a":1},"name":"Edit"}]`)}}
+	second := []Message{{Role: "assistant", Content: json.RawMessage(` [ { "name":"Edit", "input": { "a":1, "b":2 }, "type":"tool_use" } ] `)}}
+	firstHash, err := archiveContentHash(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondHash, err := archiveContentHash(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstHash != secondHash {
+		t.Fatalf("语义相同 JSON 的 hash 不一致: %s != %s", firstHash, secondHash)
+	}
+}
+
 func mustTokenCounter(t *testing.T) *TokenCounter {
 	t.Helper()
 	tc, err := NewTokenCounter()

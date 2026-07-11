@@ -366,6 +366,33 @@ func TestSaveArchiveIdempotent(t *testing.T) {
 	assertArchiveCounts(t, store, 2, len(first.Keywords)+len(different.Keywords))
 }
 
+func TestSaveArchiveIgnoresForgedContentHash(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "forged-hash.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	first := archiveTestBlock("first", "first content")
+	second := archiveTestBlock("second", "second content")
+	first.ContentHash = "forged-same-hash"
+	second.ContentHash = "forged-same-hash"
+	if err := store.SaveArchive(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveArchive(second); err != nil {
+		t.Fatal(err)
+	}
+	assertArchiveCounts(t, store, 2, len(first.Keywords)+len(second.Keywords))
+	var forgedCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM archive_blocks WHERE content_hash = ?`, "forged-same-hash").Scan(&forgedCount); err != nil {
+		t.Fatal(err)
+	}
+	if forgedCount != 0 {
+		t.Fatalf("调用方伪造 hash 被持久化: count=%d", forgedCount)
+	}
+}
+
 func TestSaveArchiveConcurrent(t *testing.T) {
 	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "concurrent.db"))
 	if err != nil {
