@@ -10,9 +10,37 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestRequestMetaConcurrentIDsUnique(t *testing.T) {
+	server := NewServer(DefaultConfig())
+	const requestCount = 64
+	ids := make(chan uint64, requestCount)
+	var wg sync.WaitGroup
+	for range requestCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ids <- server.nextRequestMeta("session").ID
+		}()
+	}
+	wg.Wait()
+	close(ids)
+
+	seen := make(map[uint64]bool, requestCount)
+	for id := range ids {
+		if id == 0 || seen[id] {
+			t.Fatalf("request_id 非法或重复: %d", id)
+		}
+		seen[id] = true
+	}
+	if len(seen) != requestCount {
+		t.Fatalf("唯一 request_id 数=%d，期望 %d", len(seen), requestCount)
+	}
+}
 
 func TestHandleMessagesSubagentNoSideEffects(t *testing.T) {
 	testHandleMessagesDirectAgentBypass(t, "subagent", `"deepseek-v4-pro"`, `{"type":"enabled"}`, `[{"type":"text","text":"cc_entrypoint=sdk-ts"}]`)
