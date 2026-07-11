@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +16,90 @@ import (
 	"testing"
 	"time"
 )
+
+func TestTotalInputTokens(t *testing.T) {
+	tests := []struct {
+		name  string
+		usage map[string]any
+		want  int
+	}{
+		{name: "真实 cache hit 25", usage: map[string]any{"input_tokens": 196, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 93056}, want: 93252},
+		{name: "真实 cache hit 26", usage: map[string]any{"input_tokens": json.Number("5559"), "cache_read_input_tokens": float64(15744)}, want: 21303},
+		{name: "缺失字段", usage: map[string]any{"input_tokens": int64(7)}, want: 7},
+		{name: "负数与非数字忽略", usage: map[string]any{"input_tokens": -1, "cache_creation_input_tokens": "secret", "cache_read_input_tokens": 4}, want: 4},
+		{name: "NaN Inf 忽略", usage: map[string]any{"input_tokens": math.NaN(), "cache_creation_input_tokens": math.Inf(1), "cache_read_input_tokens": 3}, want: 3},
+		{name: "单字段饱和", usage: map[string]any{"input_tokens": json.Number("9223372036854775807")}, want: math.MaxInt},
+		{name: "求和饱和", usage: map[string]any{"input_tokens": math.MaxInt, "cache_creation_input_tokens": math.MaxInt, "cache_read_input_tokens": math.MaxInt}, want: math.MaxInt},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := totalInputTokens(tt.usage); got != tt.want {
+				t.Fatalf("totalInputTokens() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHandleSSECacheUsagePersistsTotalBeforeDeflation(t *testing.T) {
+	trigger := NewSawtoothTrigger(time.Hour, 50000, 1000)
+	var persisted string
+	trigger.SetPersistFunc(func(_ string, value string) { persisted = value })
+	s := NewServer(Config{Proxy: ProxyConfig{Deflation: 0.5}})
+	s.Sawtooth = trigger
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader("event: message_start\n" +
+			"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":196,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":93056,\"output_tokens\":20}}}\n\n")),
+	}
+	recorder := httptest.NewRecorder()
+	s.handleSSE(recorder, resp, newRequestMeta(1, "sse-cache"), time.Now(), "model", 25)
+
+	var state persistedState
+	if err := json.Unmarshal([]byte(persisted), &state); err != nil {
+		t.Fatalf("解析持久状态: %v; raw=%q", err, persisted)
+	}
+	if state.Tokens != 93252 || state.MsgCount != 25 {
+		t.Fatalf("SSE 持久状态=%+v, want tokens=93252 msg_count=25", state)
+	}
+	if strings.Contains(recorder.Body.String(), `"input_tokens":196`) || !strings.Contains(recorder.Body.String(), `"input_tokens":98`) {
+		t.Fatalf("客户端 deflation 行为变化: %s", recorder.Body.String())
+	}
+}
+
+func TestHandleJSONCacheUsagePersistsTotalAndColdStartTriggers(t *testing.T) {
+	trigger := NewSawtoothTrigger(time.Hour, 50000, 1000)
+	var persisted string
+	trigger.SetPersistFunc(func(_ string, value string) { persisted = value })
+	s := NewServer(Config{Proxy: ProxyConfig{Deflation: 0.5}})
+	s.Sawtooth = trigger
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"type":"message","usage":{"input_tokens":196,"cache_creation_input_tokens":0,"cache_read_input_tokens":93056,"output_tokens":20}}`)),
+	}
+	recorder := httptest.NewRecorder()
+	s.handleJSON(recorder, resp, newRequestMeta(2, "json-cache"), time.Now(), "model", 25)
+
+	var state persistedState
+	if err := json.Unmarshal([]byte(persisted), &state); err != nil {
+		t.Fatalf("解析持久状态: %v; raw=%q", err, persisted)
+	}
+	if state.Tokens != 93252 || state.MsgCount != 25 {
+		t.Fatalf("JSON 持久状态=%+v, want tokens=93252 msg_count=25", state)
+	}
+	if strings.Contains(recorder.Body.String(), `"input_tokens":196`) || !strings.Contains(recorder.Body.String(), `"input_tokens":98`) {
+		t.Fatalf("客户端 deflation 行为变化: %s", recorder.Body.String())
+	}
+
+	restored := NewSawtoothTrigger(time.Hour, 50000, 1000)
+	restored.SetLoadFunc(func(key string) (string, bool) {
+		return persisted, key == "sawtooth:json-cache"
+	})
+	if got := restored.ShouldTrigger("json-cache", 1); got != TriggerTokens {
+		t.Fatalf("冷启动 trigger=%q, want %q", got, TriggerTokens)
+	}
+}
 
 type failingDebugFile struct {
 	file     *os.File
