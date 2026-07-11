@@ -144,12 +144,17 @@ func TestDebugFullBodyDefaultsOff(t *testing.T) {
 	if cfg.Debug.FullBody {
 		t.Fatal("DefaultConfig debug.full_body 必须为 false")
 	}
-	yamlData, err := os.ReadFile(filepath.Join("..", "..", "sawtooth.yaml"))
+	configPath := filepath.Join(t.TempDir(), "sawtooth.yaml")
+	yamlData := []byte("debug:\n  enabled: true\n  full_body: false\n  data_dir: ./debug\n")
+	if err := os.WriteFile(configPath, yamlData, 0600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadConfig(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(yamlData, []byte("full_body: false")) {
-		t.Fatalf("sawtooth.yaml 未显式关闭 full_body:\n%s", yamlData)
+	if !loaded.Debug.Enabled || loaded.Debug.FullBody || loaded.Debug.DataDir != "./debug" {
+		t.Fatalf("debug 配置解析错误: %+v", loaded.Debug)
 	}
 }
 

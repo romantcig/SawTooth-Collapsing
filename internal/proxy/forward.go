@@ -333,9 +333,10 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 	)
 
 	timestamp := time.Now()
+	s.writeRequestDebugFacts(meta, timestamp, debugStageForwarded, body, r)
 
 	// 步骤 2: Debug 写请求体
-	if s.Config.Debug.Enabled {
+	if s.Config.Debug.Enabled && s.Config.Debug.FullBody {
 		s.writeDebugFile(sessionID, meta.ID, timestamp, "req", body, r.Header, model, messageCount)
 	}
 
@@ -405,7 +406,7 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 		_, _ = w.Write(respBody)
 
 		// Debug 写非 2xx 响应
-		if s.Config.Debug.Enabled {
+		if s.Config.Debug.Enabled && s.Config.Debug.FullBody {
 			s.writeDebugFile(sessionID, meta.ID, timestamp, "resp", respBody, nil, model, messageCount)
 		}
 		return
@@ -473,14 +474,17 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 		line := scanner.Text()
 
 		// message_start 的 usage 在 processSSEEvent deflation 前更新 Sawtooth。
-		if s.Sawtooth != nil && !usageRecorded &&
+		if !usageRecorded &&
 			strings.HasPrefix(line, "data:") && strings.Contains(line, "message_start") {
 			dataStr := strings.TrimSpace(line[5:])
 			var data map[string]any
 			if json.Unmarshal([]byte(dataStr), &data) == nil {
 				if msg, ok := data["message"].(map[string]any); ok {
 					if usage, ok := msg["usage"].(map[string]any); ok {
-						s.Sawtooth.UpdateAfterResponse(sessionID, totalInputTokens(usage), messageCount)
+						s.writeUsageDebugFacts(meta, timestamp, usage)
+						if s.Sawtooth != nil {
+							s.Sawtooth.UpdateAfterResponse(sessionID, totalInputTokens(usage), messageCount)
+						}
 						usageRecorded = true
 					}
 				}
@@ -524,7 +528,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 	}
 
 	// 步骤 5: Debug 写 SSE 响应（完整拼接文本）
-	if s.Config.Debug.Enabled {
+	if s.Config.Debug.Enabled && s.Config.Debug.FullBody {
 		s.writeDebugFile(sessionID, meta.ID, timestamp, "resp", []byte(fullResponse.String()), nil, model, messageCount)
 	}
 }
@@ -629,8 +633,11 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *re
 			// 在客户端 usage deflation 之前，以完整输入空间更新 Sawtooth。
 			if s.Sawtooth != nil {
 				if usage, ok := body["usage"].(map[string]any); ok {
+					s.writeUsageDebugFacts(meta, timestamp, usage)
 					s.Sawtooth.UpdateAfterResponse(sessionID, totalInputTokens(usage), messageCount)
 				}
+			} else if usage, ok := body["usage"].(map[string]any); ok {
+				s.writeUsageDebugFacts(meta, timestamp, usage)
 			}
 
 			if usage, ok := body["usage"].(map[string]any); ok {
@@ -652,7 +659,7 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *re
 	_, _ = w.Write(respBody)
 
 	// 步骤 5: Debug 写 JSON 响应
-	if s.Config.Debug.Enabled {
+	if s.Config.Debug.Enabled && s.Config.Debug.FullBody {
 		s.writeDebugFile(sessionID, meta.ID, timestamp, "resp", respBody, nil, model, messageCount)
 	}
 }

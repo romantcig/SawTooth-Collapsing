@@ -12,6 +12,20 @@ type requestMeta struct {
 	OriginalMessageCount int
 	Logger               *slog.Logger
 	entryOnce            sync.Once
+	rawFactsOnce         sync.Once
+	forwardedFactsOnce   sync.Once
+	usageFactsOnce       sync.Once
+}
+
+func (m *requestMeta) debugOnce(stage debugStage) *sync.Once {
+	switch stage {
+	case debugStageRawInbound:
+		return &m.rawFactsOnce
+	case debugStageForwarded:
+		return &m.forwardedFactsOnce
+	default:
+		return nil
+	}
 }
 
 func newRequestMeta(id uint64, requestSessionID string) *requestMeta {

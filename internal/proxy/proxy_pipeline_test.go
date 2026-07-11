@@ -94,6 +94,33 @@ func TestHandleMessagesDebugStages(t *testing.T) {
 	}
 }
 
+func TestHandleMessagesDebugFullBodyOptIn(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	dataDir := t.TempDir()
+	server.Config.Debug = DebugConfig{Enabled: true, FullBody: true, DataDir: dataDir}
+	servePipelineRequest(t, server, "debug-full-body-session", pipelineMessages(2, 2))
+
+	dir, _ := safeDebugSessionDir(dataDir, "debug-full-body-session")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requestBody, responseBody bool
+	for _, entry := range entries {
+		requestBody = requestBody || strings.HasSuffix(entry.Name(), "-req.json")
+		responseBody = responseBody || strings.HasSuffix(entry.Name(), "-resp.json")
+	}
+	if !requestBody || !responseBody {
+		t.Fatalf("full_body=true 未保留兼容 body 文件: req=%v resp=%v", requestBody, responseBody)
+	}
+}
+
 func TestConcurrentRequestLogsReconstructable(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

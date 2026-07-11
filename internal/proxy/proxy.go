@@ -17,8 +17,10 @@ import (
 
 // DebugConfig 调试模式配置
 type DebugConfig struct {
-	// Enabled 为 true 时启用调试模式，HTTP 请求体和响应体完整落盘
+	// Enabled 为 true 时启用不含正文或凭证的结构化 facts。
 	Enabled bool `yaml:"enabled"`
+	// FullBody 为 true 时额外启用旧完整请求/响应落盘；默认关闭。
+	FullBody bool `yaml:"full_body"`
 	// DataDir 调试数据落盘根目录
 	DataDir string `yaml:"data_dir"`
 }
@@ -100,8 +102,9 @@ func DefaultConfig() Config {
 			Deflation: 0.7,
 		},
 		Debug: DebugConfig{
-			Enabled: false,
-			DataDir: "./data/",
+			Enabled:  false,
+			FullBody: false,
+			DataDir:  "./data/",
 		},
 		Stubify: StubifyConfig{
 			TokenThreshold: 100000, // D-04 默认值（1M 模型建议 500000+）
@@ -290,6 +293,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		meta.logEntry(extractModelFromBody(body), countMessages(body))
+		s.writeRequestDebugFacts(meta, time.Now(), debugStageRawInbound, body, r)
 
 		// 解析 Anthropic messages API 请求体
 		// 使用 map[string]json.RawMessage 保留所有原始字段（tools/thinking/tool_choice
