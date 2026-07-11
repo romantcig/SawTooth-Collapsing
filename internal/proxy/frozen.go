@@ -415,22 +415,18 @@ func deepCopyMessages(msgs []Message) []Message {
 	return out
 }
 
-// stableBoundaryHash 从 boundary message 的稳定部分计算 hash：
-// role + 第一个 text content block 的前 200 字符。
-// 避免因注入的 system-reminders 和 context tags 导致失效。
+// stableBoundaryHash 对 StripReminders 后的完整 boundary message 计算规范 JSON hash。
 func stableBoundaryHash(msg Message) string {
-	blocks, _ := parseContent(msg.Content)
-	text := ""
-	for _, b := range blocks {
-		if b.Type == "text" {
-			text = b.Text
-			break
-		}
+	var content any
+	if err := json.Unmarshal(msg.Content, &content); err != nil {
+		data, _ := json.Marshal(msg)
+		return sha256hex(data)
 	}
-	if len(text) > 200 {
-		text = text[:200]
-	}
-	return sha256hex([]byte(msg.Role + ":" + text))
+	canonical, _ := json.Marshal(struct {
+		Role    string `json:"role"`
+		Content any    `json:"content"`
+	}{Role: msg.Role, Content: content})
+	return sha256hex(canonical)
 }
 
 // sha256hex 返回 data 的十六进制编码 SHA-256 hash。

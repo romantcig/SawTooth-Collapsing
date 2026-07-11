@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -77,6 +78,42 @@ func TestFrozenUpdateMessagesPersistsBytesAndPreservesRawMetadata(t *testing.T) 
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("cold-start bytes differ\ngot:  %s\nwant: %s", got, want)
+	}
+}
+
+func TestFrozenBoundaryHashCoversCompleteMessage(t *testing.T) {
+	tests := []struct {
+		name   string
+		before json.RawMessage
+		after  json.RawMessage
+	}{
+		{
+			name:   "第 201 字节后文本变化",
+			before: mustMarshal(strings.Repeat("a", 220) + "before"),
+			after:  mustMarshal(strings.Repeat("a", 220) + "after"),
+		},
+		{
+			name:   "第二个文本块变化",
+			before: json.RawMessage(`[{"type":"text","text":"same"},{"type":"text","text":"before"}]`),
+			after:  json.RawMessage(`[{"type":"text","text":"same"},{"type":"text","text":"after"}]`),
+		},
+		{
+			name:   "tool_result 内容变化",
+			before: json.RawMessage(`[{"type":"tool_result","tool_use_id":"tool-1","content":"before"}]`),
+			after:  json.RawMessage(`[{"type":"tool_result","tool_use_id":"tool-1","content":"after"}]`),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			frozen := NewFrozenStubs()
+			current := frozenTestMessages(3)
+			current[1].Content = tt.before
+			frozen.Store("thread", current[:1], 2, current[1], 10, 20)
+			current[1].Content = tt.after
+			if got := frozen.Get("thread", current); got != nil {
+				t.Fatal("完整 boundary 内容变化后仍命中 frozen")
+			}
+		})
 	}
 }
 
