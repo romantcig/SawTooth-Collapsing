@@ -34,6 +34,62 @@ func TestFrozenStoreKeepsRawCutoffSeparateFromFrozenPrefixLength(t *testing.T) {
 	}
 }
 
+func TestFrozenPersistentContextSnapshotsRejected(t *testing.T) {
+	contextMessage := persistentContextMessage("claudeMd", "FROZEN-CONTEXT-MUST-NOT-PERSIST")
+	history := frozenTestMessages(3)
+
+	t.Run("new store", func(t *testing.T) {
+		frozen := NewFrozenStubs()
+		frozen.Store("thread", []Message{contextMessage, history[0]}, 2, history[1], 20, 40)
+		if got := frozen.LengthFor("thread"); got != 0 {
+			t.Fatalf("包含 persistent context 的 snapshot 被存储，length=%d", got)
+		}
+	})
+
+	t.Run("legacy persisted snapshot", func(t *testing.T) {
+		messages := []Message{contextMessage, history[0]}
+		messagesJSON, err := json.Marshal(messages)
+		if err != nil {
+			t.Fatal(err)
+		}
+		persisted, err := json.Marshal(frozenPersisted{
+			Messages: messages, Cutoff: 2, BoundaryHash: stableBoundaryHash(history[1]),
+			PrefixHash: sha256hex(messagesJSON), Tokens: 20, RawTokens: 40,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		frozen := NewFrozenStubs()
+		frozen.SetLoadFunc(func(string) (string, bool) { return string(persisted), true })
+		if got := frozen.Get("thread", history); got != nil {
+			t.Fatal("包含旧 persistent context 的持久化 snapshot 不得恢复")
+		}
+	})
+}
+
+func TestFrozenPersistentContextChangesDoNotInvalidateDetachedHistory(t *testing.T) {
+	history := frozenTestMessages(4)
+	firstRaw := append([]Message{persistentContextMessage("claudeMd", "context-A")}, history...)
+	firstHistory, _ := DetachPersistentUserContext(firstRaw)
+	prefix := deepCopyMessages(firstHistory[:2])
+	frozen := NewFrozenStubs()
+	frozen.Store("thread", prefix, 3, firstHistory[2], 20, 40)
+
+	secondRaw := append([]Message{persistentContextMessage("claudeMd", "context-B")}, history...)
+	secondHistory, context := DetachPersistentUserContext(secondRaw)
+	result := frozen.Get("thread", secondHistory)
+	if result == nil {
+		t.Fatal("只修改 current context 不应使 detached historical Frozen 失效")
+	}
+	forwarded := PrependPersistentUserContext(append(result.Messages, secondHistory[result.Cutoff:]...), context)
+	if got := countMessagesContaining(forwarded, "context-B"); got != 1 {
+		t.Fatalf("forwarded context B count=%d, want 1", got)
+	}
+	if got := countMessagesContaining(forwarded, "context-A"); got != 0 {
+		t.Fatalf("forwarded context A count=%d, want 0", got)
+	}
+}
+
 func TestFrozenUpdateMessagesPersistsBytesAndPreservesRawMetadata(t *testing.T) {
 	persisted := make(map[string]string)
 	frozen := NewFrozenStubs()
