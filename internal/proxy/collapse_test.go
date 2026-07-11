@@ -365,6 +365,40 @@ func TestArchiveContentHashCanonicalizesJSONObjects(t *testing.T) {
 	}
 }
 
+func TestArchiveContentHashIncludesMessageUnknownFieldStates(t *testing.T) {
+	decode := func(raw string) Message {
+		t.Helper()
+		var message Message
+		if err := json.Unmarshal([]byte(raw), &message); err != nil {
+			t.Fatalf("unmarshal archive message: %v", err)
+		}
+		return message
+	}
+	base := []Message{decode(`{"role":"user","content":"same"}`)}
+	baseHash, err := archiveContentHash(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name    string
+		message Message
+	}{
+		{name: "explicit null", message: decode(`{"role":"user","content":"same","future":null}`)},
+		{name: "non-null value", message: decode(`{"role":"user","content":"same","future":{"mode":"strict"}}`)},
+		{name: "known metadata", message: decode(`{"role":"user","content":"same","isMeta":true}`)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := archiveContentHash([]Message{tt.message})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got == baseHash {
+				t.Fatal("message-level archive field state did not affect hash")
+			}
+		})
+	}
+}
+
 func mustTokenCounter(t *testing.T) *TokenCounter {
 	t.Helper()
 	tc, err := NewTokenCounter()

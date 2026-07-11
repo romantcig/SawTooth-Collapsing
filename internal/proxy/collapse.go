@@ -175,17 +175,13 @@ func buildArchiveBlock(messages []Message, cutoffIdx int, tc *TokenCounter, sess
 
 // archiveContentHash 对项目稳定的 []Message JSON 表示计算 SHA-256 指纹。
 func archiveContentHash(messages []Message) (string, error) {
-	canonicalMessages := make([]struct {
-		Role    string `json:"role"`
-		Content any    `json:"content"`
-	}, len(messages))
+	canonicalMessages := make([]map[string]any, len(messages))
 	for i, message := range messages {
-		var content any
-		if err := json.Unmarshal(message.Content, &content); err != nil {
-			return "", fmt.Errorf("解析 archive message %d content 失败: %w", i, err)
+		canonical, err := canonicalMessageForHash(message, normalizeBoundaryContent)
+		if err != nil {
+			return "", fmt.Errorf("规范化 archive message %d 失败: %w", i, err)
 		}
-		canonicalMessages[i].Role = message.Role
-		canonicalMessages[i].Content = content
+		canonicalMessages[i] = canonical
 	}
 	canonical, err := json.Marshal(canonicalMessages)
 	if err != nil {

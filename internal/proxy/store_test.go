@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -514,6 +515,35 @@ func TestSaveArchiveIgnoresForgedContentHash(t *testing.T) {
 	if forgedCount != 0 {
 		t.Fatalf("调用方伪造 hash 被持久化: count=%d", forgedCount)
 	}
+}
+
+func TestSaveArchivePreservesDistinctMessageUnknownFields(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "message-fields.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	decode := func(raw string) Message {
+		t.Helper()
+		var message Message
+		if err := json.Unmarshal([]byte(raw), &message); err != nil {
+			t.Fatalf("unmarshal archive message: %v", err)
+		}
+		return message
+	}
+	first := archiveTestBlock("message-fields-a", "same content")
+	second := archiveTestBlock("message-fields-b", "same content")
+	first.Messages = []Message{decode(`{"role":"user","content":"same content","future":null}`)}
+	second.Messages = []Message{decode(`{"role":"user","content":"same content","future":{"mode":"strict"}}`)}
+
+	if err := store.SaveArchive(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveArchive(second); err != nil {
+		t.Fatal(err)
+	}
+	assertArchiveCounts(t, store, 2, len(first.Keywords)+len(second.Keywords))
 }
 
 func TestSaveArchiveConcurrent(t *testing.T) {
