@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -103,8 +104,8 @@ func DefaultConfig() Config {
 		},
 		Stubify: StubifyConfig{
 			TokenThreshold: 100000, // D-04 默认值（1M 模型建议 500000+）
-			KeepRecent:     8,     // 对标 YesMem（默认 10），放宽自硬编码 4
-			KeepThinking:    false, // 默认不保留 thinking，保持向后兼容
+			KeepRecent:     8,      // 对标 YesMem（默认 10），放宽自硬编码 4
+			KeepThinking:   false,  // 默认不保留 thinking，保持向后兼容
 		},
 		Collapse: CollapseConfig{
 			Enabled:             true,
@@ -116,9 +117,9 @@ func DefaultConfig() Config {
 			TTLMinutes: 30,
 		},
 		Cache: CacheConfig{
-			Enabled:        true,
+			Enabled:         true,
 			BreakpointLimit: 4,
-			CacheTTL:       "ephemeral",
+			CacheTTL:        "ephemeral",
 		},
 	}
 }
@@ -128,16 +129,21 @@ func DefaultConfig() Config {
 // Phase 3 添加 SQLite。
 // Phase 4 添加 FrozenStubs 和 SawtoothTrigger。
 type Server struct {
-	Config       Config
-	HTTPClient   *http.Client
-	TokenCounter *TokenCounter // Phase 2: token 计数单例 (D-01)
-	DecayTracker *DecayTracker // Phase B: per-message decay tracking
-	Store        *SQLiteStore      // Phase 3: SQLite 持久化 (D-14)
-	Frozen      *FrozenStubs       // Phase 4: frozen prefix 存储 (D-12)
-	Sawtooth    *SawtoothTrigger   // Phase 4: 桩化周期触发 (D-03)
-	EagerStub   *EagerStubMemory   // Phase 5: eager stub memory (EAGER-01)
-	cachedTTL   string             // 当前生效的 cache TTL（"ephemeral" 或 "1h"），用于检测切换
+	Config            Config
+	HTTPClient        *http.Client
+	TokenCounter      *TokenCounter    // Phase 2: token 计数单例 (D-01)
+	DecayTracker      *DecayTracker    // Phase B: per-message decay tracking
+	Store             *SQLiteStore     // Phase 3: SQLite 持久化 (D-14)
+	Frozen            *FrozenStubs     // Phase 4: frozen prefix 存储 (D-12)
+	Sawtooth          *SawtoothTrigger // Phase 4: 桩化周期触发 (D-03)
+	EagerStub         *EagerStubMemory // Phase 5: eager stub memory (EAGER-01)
+	cachedTTL         string           // 当前生效的 cache TTL（"ephemeral" 或 "1h"），用于检测切换
 	searchAndExpandFn func([]Message, *SQLiteStore, int, *TokenCounter, *Budget, string) RecallOutcome
+	requestIdx        atomic.Uint64
+}
+
+func (s *Server) nextRequestMeta(requestSessionID string) *requestMeta {
+	return newRequestMeta(s.requestIdx.Add(1), requestSessionID)
 }
 
 // NewServer 创建代理服务实例。
@@ -247,11 +253,14 @@ func LoadConfig(path string) (Config, error) {
 
 // HandleMessages 处理 POST /v1/messages 请求。
 // 管线顺序: parse -> FrozenStubs.Get -> Reexpand -> CompressContext -> CalcCollapseCutoff
-//   -> PRIMARY: collapse -> EagerStub -> cache -> orphan -> forwardRaw
-//   -> FALLBACK: stubify -> decay -> compact -> SawtoothTrigger+FrozenStubs.Store -> EagerStub -> cache -> orphan -> forwardRaw
+//
+//	-> PRIMARY: collapse -> EagerStub -> cache -> orphan -> forwardRaw
+//	-> FALLBACK: stubify -> decay -> compact -> SawtoothTrigger+FrozenStubs.Store -> EagerStub -> cache -> orphan -> forwardRaw
+//
 // (D-01/D-02/D-09/D-10/D-11, Phase F collapse-first)
 func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	sessionID := extractSessionID(r)
+	meta := s.nextRequestMeta(sessionID)
 
 	// Phase B: 递增请求序号（DecayTracker 用）
 	requestSeq := 0
@@ -267,42 +276,43 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(limitedReader)
 		r.Body.Close()
 		if err != nil {
-			slog.Error("读取请求体失败", "session_id", sessionID, "error", err)
+			meta.Logger.Error("读取请求体失败", "error", err)
 			http.Error(w, "Failed to read request body", http.StatusInternalServerError)
 			return
 		}
 		if len(body) > maxBodySize {
-			slog.Warn("请求体超限", "session_id", sessionID, "size", len(body))
+			meta.Logger.Warn("请求体超限", "size", len(body))
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusRequestEntityTooLarge)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "Request Entity Too Large"})
 			return
 		}
+		meta.logEntry(extractModelFromBody(body), countMessages(body))
 
 		// 解析 Anthropic messages API 请求体
 		// 使用 map[string]json.RawMessage 保留所有原始字段（tools/thinking/tool_choice
 		// 等），避免 json.Marshal 重建 body 时静默丢弃未映射的字段。
 		var bodyMap map[string]json.RawMessage
 		if err := json.Unmarshal(body, &bodyMap); err != nil {
-			slog.Warn("无法解析请求体 JSON，跳过管线处理", "session_id", sessionID, "error", err)
+			meta.Logger.Warn("无法解析请求体 JSON，跳过管线处理", "error", err)
 			r.Body = io.NopCloser(bytes.NewReader(body))
-			s.forwardRaw(w, r, sessionID)
+			s.forwardRaw(w, r, meta)
 			return
 		}
 
 		// 从 bodyMap 中提取 messages 数组
 		msgData, ok := bodyMap["messages"]
 		if !ok {
-			slog.Warn("请求体中缺少 messages 字段，原样转发", "session_id", sessionID)
+			meta.Logger.Warn("请求体中缺少 messages 字段，原样转发")
 			r.Body = io.NopCloser(bytes.NewReader(body))
-			s.forwardRaw(w, r, sessionID)
+			s.forwardRaw(w, r, meta)
 			return
 		}
 		var messages []Message
 		if err := json.Unmarshal(msgData, &messages); err != nil {
-			slog.Warn("无法解析 messages 数组，原样转发", "session_id", sessionID, "error", err)
+			meta.Logger.Warn("无法解析 messages 数组，原样转发", "error", err)
 			r.Body = io.NopCloser(bytes.NewReader(body))
-			s.forwardRaw(w, r, sessionID)
+			s.forwardRaw(w, r, meta)
 			return
 		}
 
@@ -314,8 +324,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		// 子代理仅在请求提供显式 parent 关联时读取父 session Frozen；unknown
 		// 不读取任何 Frozen，避免把不可信身份映射为另一会话。
 		if classification.Role == agentRoleSubagent || classification.Role == agentRoleUnknown {
-			slog.Info("Agent 请求安全直通",
-				"session_id", sessionID,
+			meta.Logger.Info("Agent 请求安全直通",
 				"model", extractModelFromBody(body),
 				"message_count", len(messages),
 				"agent_role", classification.Role,
@@ -336,8 +345,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					frozenReplaced = true
 				}
 			} else if classification.Role == agentRoleSubagent && !classification.ParentAvailable {
-				slog.Debug("parent_frozen_unavailable",
-					"session_id", sessionID,
+				meta.Logger.Debug("parent_frozen_unavailable",
 					"agent_reason", classification.Reason,
 				)
 			}
@@ -349,18 +357,18 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					if newBody, marshalErr := json.Marshal(bodyMap); marshalErr == nil {
 						r.Body = io.NopCloser(bytes.NewReader(newBody))
 					} else {
-						slog.Warn("Agent 请求体重建失败，回退原样转发", "session_id", sessionID, "error", marshalErr)
+						meta.Logger.Warn("Agent 请求体重建失败，回退原样转发", "error", marshalErr)
 						r.Body = io.NopCloser(bytes.NewReader(body))
 					}
 				} else {
-					slog.Warn("Agent 消息序列化失败，回退原样转发", "session_id", sessionID, "error", err)
+					meta.Logger.Warn("Agent 消息序列化失败，回退原样转发", "error", err)
 					r.Body = io.NopCloser(bytes.NewReader(body))
 				}
 			} else {
 				r.Body = io.NopCloser(bytes.NewReader(body))
 			}
 
-			s.forwardRaw(w, r, sessionID)
+			s.forwardRaw(w, r, meta)
 			return
 		}
 
@@ -408,8 +416,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				frozenPrefixLen = len(result.Messages)
 				frozenTokens = result.Tokens
 				messages = append(result.Messages, messages[result.Cutoff:]...)
-				slog.Info("frozen prefix 命中并拼接",
-					"session_id", sessionID,
+				meta.Logger.Info("frozen prefix 命中并拼接",
 					"raw_cutoff", result.Cutoff,
 					"frozen_prefix_len", frozenPrefixLen,
 					"frozen_tokens", result.Tokens,
@@ -436,8 +443,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			combinedTokens := frozenTokens + tailTokens
 			if combinedTokens <= threshold {
 				needCompress = false
-				slog.Info("frozen prefix 仍在阈值内，跳过压缩",
-					"session_id", sessionID,
+				meta.Logger.Info("frozen prefix 仍在阈值内，跳过压缩",
 					"frozen_tokens", frozenTokens,
 					"tail_tokens", tailTokens,
 					"combined_tokens", combinedTokens,
@@ -445,8 +451,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					LogLightGreen,
 				)
 			} else {
-				slog.Info("frozen prefix 不足，重新压缩",
-					"session_id", sessionID,
+				meta.Logger.Info("frozen prefix 不足，重新压缩",
 					"frozen_tokens", frozenTokens,
 					"tail_tokens", tailTokens,
 					"combined_tokens", combinedTokens,
@@ -489,8 +494,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			var compressResult CompressResult
 			messages, compressResult = CompressContext(messages, s.Config.Stubify.KeepRecent, s.TokenCounter)
 			if compressResult.ThinkingCompressed > 0 || compressResult.ToolResultsCompressed > 0 {
-				slog.Debug("compress_context 完成",
-					"session_id", sessionID,
+				meta.Logger.Debug("compress_context 完成",
 					"thinkingCompressed", compressResult.ThinkingCompressed,
 					"toolResultsCompressed", compressResult.ToolResultsCompressed,
 					"tokensSaved", compressResult.TokensSaved,
@@ -520,8 +524,8 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				// 折叠消息：266 条 → blank[0] + archive block[1] + tail[cutoffIdx:]
 				// CollapseOldMessages 内部调用 buildArchiveBlock，返回 (messages, archiveBlock)
 				collapsedMessages, archiveBlock := CollapseOldMessages(
-					messages,          // CompressContext 后的消息（modified）
-					originalMessages,  // 桩化前的原始消息（供 archive 提取完整摘要）
+					messages,         // CompressContext 后的消息（modified）
+					originalMessages, // 桩化前的原始消息（供 archive 提取完整摘要）
 					cutoffIdx,
 					s.TokenCounter,
 					sessionID,
@@ -530,12 +534,11 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				// 持久化到 SQLite（graceful degradation：失败不阻断请求）
 				if s.Store != nil {
 					if err := s.Store.SaveArchive(archiveBlock); err != nil {
-						slog.Error("保存存档失败", "session_id", sessionID, "error", err)
+						meta.Logger.Error("保存存档失败", "error", err)
 					}
 				}
 
-				slog.Info("collapse 完成",
-					"session_id", sessionID,
+				meta.Logger.Info("collapse 完成",
 					"before", len(messages),
 					"after", len(collapsedMessages),
 					"cutoff", cutoffIdx,
@@ -565,8 +568,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					)
 					messages = anyToMessages(messagesAny)
 					if freshStubs > 0 || stickyHits > 0 {
-						slog.Info("eager stub 完成（collapse 路径）",
-							"session_id", sessionID,
+						meta.Logger.Info("eager stub 完成（collapse 路径）",
 							"fresh_stubs", freshStubs,
 							"sticky_hits", stickyHits,
 							LogGreen,
@@ -577,8 +579,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				// Orphan repair
 				repaired, orphans := validateToolPairs(messages)
 				if orphans > 0 {
-					slog.Warn("修复 orphan tool_use/tool_result 对",
-						"session_id", sessionID,
+					meta.Logger.Warn("修复 orphan tool_use/tool_result 对",
 						"orphans_removed", orphans,
 					)
 					messages = repaired
@@ -592,8 +593,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				if s.Sawtooth != nil && s.Frozen != nil {
 					trigger := s.Sawtooth.ShouldTrigger(sessionID, rawEstimate)
 					if trigger != "" {
-						slog.Info("SawtoothTrigger 触发",
-							"session_id", sessionID,
+						meta.Logger.Info("SawtoothTrigger 触发",
 							"reason", trigger,
 							"raw_estimate", rawEstimate,
 							LogGreen,
@@ -605,13 +605,13 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 				newBody, err := rebuildBody(messages)
 				if err != nil {
-					slog.Error("重建折叠后请求体失败", "session_id", sessionID, "error", err)
+					meta.Logger.Error("重建折叠后请求体失败", "error", err)
 					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 					return
 				}
 
 				r.Body = io.NopCloser(bytes.NewReader(newBody))
-				s.forwardRaw(w, r, sessionID)
+				s.forwardRaw(w, r, meta)
 				return // collapse 路径在此结束
 			}
 
@@ -629,8 +629,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			// 步骤 2: decay
 			decayedMessages, phase := s.DecayTracker.ApplyDecayBatch(stubbedMessages, sessionID, totalTokens, threshold, s.TokenCounter, pivotText, requestSeq)
 
-			slog.Info("stubify+decay 完成",
-				"session_id", sessionID,
+			meta.Logger.Info("stubify+decay 完成",
 				"original_tokens", stats.OriginalTokens,
 				"stubbed_tokens", stats.StubbedTokens,
 				"messages_stubbed", stats.MessagesStubbed,
@@ -648,8 +647,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				var compactedBlocks []CompactedBlock
 				decayedMessages, compactedBlocks = CompactMessages(decayedMessages, originalMessages, s.DecayTracker, sessionID, requestSeq, pressure)
 				if len(compactedBlocks) > 0 {
-					slog.Info("compact 完成",
-						"session_id", sessionID,
+					meta.Logger.Info("compact 完成",
 						"before", beforeCompact,
 						"after", len(decayedMessages),
 						"blocks", len(compactedBlocks),
@@ -662,8 +660,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			if s.Sawtooth != nil && s.Frozen != nil {
 				trigger := s.Sawtooth.ShouldTrigger(sessionID, rawEstimate)
 				if trigger != "" {
-					slog.Info("SawtoothTrigger 触发",
-						"session_id", sessionID,
+					meta.Logger.Info("SawtoothTrigger 触发",
 						"reason", trigger,
 						"raw_estimate", rawEstimate,
 						LogGreen,
@@ -685,8 +682,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				)
 				messages = anyToMessages(messagesAny)
 				if freshStubs > 0 || stickyHits > 0 {
-					slog.Info("eager stub 完成（超阈值无折叠）",
-						"session_id", sessionID,
+					meta.Logger.Info("eager stub 完成（超阈值无折叠）",
 						"fresh_stubs", freshStubs,
 						"sticky_hits", stickyHits,
 					)
@@ -695,7 +691,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			s.applyCacheControl(messages, frozenPrefixLen, sessionID)
 			newBody, err := rebuildBody(messages)
 			if err != nil {
-				slog.Error("重建请求体失败", "session_id", sessionID, "error", err)
+				meta.Logger.Error("重建请求体失败", "error", err)
 				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 				return
 			}
@@ -703,13 +699,12 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			// Orphan repair
 			repaired, orphans := validateToolPairs(messages)
 			if orphans > 0 {
-				slog.Warn("修复 orphan tool_use/tool_result 对",
-					"session_id", sessionID,
+				meta.Logger.Warn("修复 orphan tool_use/tool_result 对",
 					"orphans_removed", orphans,
 				)
 				newBody, err = rebuildBody(repaired)
 				if err != nil {
-					slog.Error("重建修复后请求体失败", "session_id", sessionID, "error", err)
+					meta.Logger.Error("重建修复后请求体失败", "error", err)
 					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 					return
 				}
@@ -739,8 +734,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				)
 				messages = anyToMessages(messagesAny)
 				if freshStubs > 0 || stickyHits > 0 {
-					slog.Info("eager stub 完成（低于阈值）",
-						"session_id", sessionID,
+					meta.Logger.Info("eager stub 完成（低于阈值）",
 						"fresh_stubs", freshStubs,
 						"sticky_hits", stickyHits,
 					)
@@ -750,14 +744,13 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			// Phase 5: Orphan repair (ORPHAN-02)
 			repaired, orphans := validateToolPairs(messages)
 			if orphans > 0 {
-				slog.Warn("修复 orphan tool_use/tool_result 对",
-					"session_id", sessionID,
+				meta.Logger.Warn("修复 orphan tool_use/tool_result 对",
 					"orphans_removed", orphans,
 				)
 				if newBody, err := rebuildBody(repaired); err == nil {
 					r.Body = io.NopCloser(bytes.NewReader(newBody))
 				} else {
-					slog.Warn("marshal 修复后 body 失败", "session_id", sessionID, "error", err)
+					meta.Logger.Warn("marshal 修复后 body 失败", "error", err)
 					r.Body = io.NopCloser(bytes.NewReader(body))
 				}
 			} else {
@@ -766,7 +759,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					if newBody, err := rebuildBody(messages); err == nil {
 						r.Body = io.NopCloser(bytes.NewReader(newBody))
 					} else {
-						slog.Warn("marshal cache_control 处理后 body 失败", "session_id", sessionID, "error", err)
+						meta.Logger.Warn("marshal cache_control 处理后 body 失败", "error", err)
 						r.Body = io.NopCloser(bytes.NewReader(body))
 					}
 				} else {
@@ -777,7 +770,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.forwardRaw(w, r, sessionID)
+	s.forwardRaw(w, r, meta)
 }
 
 // searchAndExpand 是 HandleMessages 的唯一召回调用点；测试可注入计数 spy。
@@ -848,6 +841,7 @@ func (s *Server) applyCacheControl(messages []Message, frozenCount int, sessionI
 		}
 	}
 }
+
 // extractLatestUserText 从消息数组中提取最新一条 user 消息的文本内容。
 // 用于 stubify 的 pivot text 检测（pivot protection per D-08）。
 // 从末尾向前遍历，找到第一条 role 为 "user" 的消息，

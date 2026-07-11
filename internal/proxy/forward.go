@@ -155,20 +155,22 @@ func parseJSON(body []byte) []byte {
 }
 
 // forwardRaw 核心转发方法：SSE 流式 / JSON 非流式转发 + usage deflation + debug 落盘。
-func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, sessionID string) {
+func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *requestMeta) {
 	const maxBodySize = 10 * 1024 * 1024 // 10 MB（T-02-04）
+	sessionID := meta.RequestSessionID
+	logger := meta.Logger
 
 	// 步骤 1: 读取请求体
 	limitedReader := io.LimitReader(r.Body, maxBodySize+1)
 	body, err := io.ReadAll(limitedReader)
 	r.Body.Close()
 	if err != nil {
-		slog.Error("读取请求体失败", "session_id", sessionID, "error", err)
+		logger.Error("读取请求体失败", "error", err)
 		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
 		return
 	}
 	if len(body) > maxBodySize {
-		slog.Warn("请求体超限", "session_id", sessionID, "size", len(body))
+		logger.Warn("请求体超限", "size", len(body))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusRequestEntityTooLarge)
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -180,11 +182,11 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, sessionID st
 	// 提取 model 和 message_count
 	model := extractModelFromBody(body)
 	messageCount := countMessages(body)
+	meta.logEntry(model, messageCount)
 
-	slog.Info("请求已接收",
-		"session_id", sessionID,
+	logger.Info("上游请求发送",
+		"forwarded_message_count", messageCount,
 		"model", model,
-		"message_count", messageCount,
 	)
 
 	timestamp := time.Now()
@@ -198,7 +200,7 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, sessionID st
 	targetURL := strings.TrimRight(s.Config.Proxy.Target, "/") + r.URL.RequestURI()
 	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, strings.NewReader(string(body)))
 	if err != nil {
-		slog.Error("创建上游请求失败", "session_id", sessionID, "error", err)
+		logger.Error("创建上游请求失败", "error", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -225,7 +227,7 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, sessionID st
 	resp, err := s.HTTPClient.Do(upstreamReq)
 	if err != nil {
 		// 网络层错误 → 502 Bad Gateway（D-09）
-		slog.Error("上游请求失败", "session_id", sessionID, "error", err)
+		logger.Error("上游请求失败", "error", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -241,8 +243,7 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, sessionID st
 
 	// 非 2xx: 透传状态码 + body，记录 warn（D-08）
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		slog.Warn("上游返回非 2xx",
-			"session_id", sessionID,
+		logger.Warn("上游返回非 2xx",
 			"status", resp.StatusCode,
 		)
 
@@ -256,7 +257,7 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, sessionID st
 
 		respBody, readErr := io.ReadAll(resp.Body)
 		if readErr != nil {
-			slog.Warn("读取非 2xx 响应体失败", "session_id", sessionID, "error", readErr)
+			logger.Warn("读取非 2xx 响应体失败", "error", readErr)
 		}
 		_, _ = w.Write(respBody)
 
@@ -269,9 +270,9 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, sessionID st
 
 	// 判定流式/非流式
 	if strings.Contains(contentType, "text/event-stream") {
-		s.handleSSE(w, resp, sessionID, timestamp, model, messageCount)
+		s.handleSSE(w, resp, meta, timestamp, model, messageCount)
 	} else {
-		s.handleJSON(w, resp, sessionID, timestamp, model, messageCount)
+		s.handleJSON(w, resp, meta, timestamp, model, messageCount)
 	}
 }
 
@@ -289,10 +290,12 @@ func countMessages(body []byte) int {
 // handleSSE 处理 SSE 流式响应。
 // 逐行扫描，对 message_start 和 message_delta 事件执行 usage deflation，
 // 其他事件原样转发。每个事件后 flush。
-func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, sessionID string, timestamp time.Time, model string, messageCount int) {
+func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *requestMeta, timestamp time.Time, model string, messageCount int) {
+	sessionID := meta.RequestSessionID
+	logger := meta.Logger
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		slog.Error("ResponseWriter 不支持 Flush", "session_id", sessionID)
+		logger.Error("ResponseWriter 不支持 Flush")
 		return
 	}
 
@@ -305,7 +308,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, sessionID
 	if resp.Header.Get("Content-Encoding") == "gzip" {
 		gzReader, err := gzip.NewReader(resp.Body)
 		if err != nil {
-			slog.Error("gzip 解压失败", "session_id", sessionID, "error", err)
+			logger.Error("gzip 解压失败", "error", err)
 			http.Error(w, "Failed to decompress SSE stream", http.StatusBadGateway)
 			return
 		}
@@ -373,7 +376,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, sessionID
 	}
 
 	if err := scanner.Err(); err != nil {
-		slog.Warn("SSE 流读取错误", "session_id", sessionID, "error", err)
+		logger.Warn("SSE 流读取错误", "error", err)
 	}
 
 	// Phase 4: 使用从 message_start 中提取的原始 input_tokens 更新 SawtoothTrigger (D-04)
@@ -446,13 +449,15 @@ func (s *Server) processSSEEvent(event []string) []string {
 
 // handleJSON 处理 JSON 非流式响应。
 // 2xx 响应 deflate usage，非 2xx 不修改。
-func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, sessionID string, timestamp time.Time, model string, messageCount int) {
+func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *requestMeta, timestamp time.Time, model string, messageCount int) {
+	sessionID := meta.RequestSessionID
+	logger := meta.Logger
 	// gzip 解压（若上游返回了压缩响应）
 	var bodyReader io.Reader = resp.Body
 	if resp.Header.Get("Content-Encoding") == "gzip" {
 		gzReader, err := gzip.NewReader(resp.Body)
 		if err != nil {
-			slog.Error("gzip 解压失败", "session_id", sessionID, "error", err)
+			logger.Error("gzip 解压失败", "error", err)
 			http.Error(w, "Failed to decompress response", http.StatusBadGateway)
 			return
 		}
@@ -465,7 +470,7 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, sessionI
 
 	respBody, err := io.ReadAll(bodyReader)
 	if err != nil {
-		slog.Error("读取上游 JSON 响应失败", "session_id", sessionID, "error", err)
+		logger.Error("读取上游 JSON 响应失败", "error", err)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -480,7 +485,7 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, sessionI
 		var body map[string]any
 		if err := json.Unmarshal(respBody, &body); err != nil {
 			// 解析失败，原样转发（T-02-05）
-			slog.Warn("无法解析上游 JSON 响应，原样转发", "session_id", sessionID, "error", err)
+			logger.Warn("无法解析上游 JSON 响应，原样转发", "error", err)
 		} else {
 			// Phase 4: 提取 input_tokens 用于 SawtoothTrigger（在 deflation 之前，D-04）
 			if s.Sawtooth != nil {
