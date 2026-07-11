@@ -1,14 +1,55 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
 )
+
+func TestRecallLoggingFinalSummaryAndSourceSession(t *testing.T) {
+	store, _, messages, tc := seedBudgetStore(t)
+	var logs bytes.Buffer
+	meta := newRequestMeta(23, "request-session")
+	meta.Logger = slog.New(NewLogHandler(&logs, slog.LevelDebug)).With(
+		"request_id", meta.ID,
+		"request_session_id", meta.RequestSessionID,
+	)
+
+	outcome := searchAndExpandWithMeta(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, meta)
+	if outcome.Injected != 1 {
+		t.Fatalf("injected=%d，期望 1", outcome.Injected)
+	}
+	output := logs.String()
+	if got := strings.Count(output, "[INFO]  Archive 召回汇总"); got != 1 {
+		t.Fatalf("Info 汇总数=%d，期望 1:\n%s", got, output)
+	}
+	for _, want := range []string{
+		"request_id=23",
+		"request_session_id=request-session",
+		"source_session_id=s1",
+		"block_id=block-budget",
+		"candidates=1",
+		"selected=1",
+		"injected=1",
+		"discarded=0",
+		"token_cost=",
+		"budget_limit=100000",
+		"budget_remaining=",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("日志缺少 %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "[INFO]  注入存档块") || strings.Contains(output, " session_id=") {
+		t.Fatalf("Info 逐块日志未清除或 session_id 仍含糊:\n%s", output)
+	}
+}
 
 // ---- truncateSummaryText 分段感知截断测试 ----
 
