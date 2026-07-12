@@ -338,3 +338,14 @@ Plans:
 ---
 
 *Last updated: 2026-07-13 — Phase 8 is the final completed phase; Phase 1–6 completion metadata and compatibility directories were backfilled so GSD health/progress analysis agrees with STATE.md.*
+
+### Phase 08.1: Claude Code 辅助请求隔离与高级工具兼容 (INSERTED)
+
+**Goal:** [Urgent work - to be planned]
+**Requirements**: TBD
+**Depends on:** Phase 8
+**Plans:** 0 plans
+
+Plans:
+
+- [ ] TBD (run $gsd-plan-phase 08.1 to break down)
