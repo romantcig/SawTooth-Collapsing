@@ -61,6 +61,15 @@ func CalcCollapseCutoff(messages []Message, tokenFloor int, tc *TokenCounter, ke
 	if keepRecent > 0 {
 		maxCutoff = n - keepRecent
 	}
+	// 活动 assistant/tool_result 是不可跨越的协议原子区。cutoff 表示 tail
+	// 起点，因此最多只能落在 active assistant 上，绝不能推进到当前 result
+	// 或数组末端。
+	if activeAssistant, _ := activeToolPairIndices(messages); activeAssistant >= 0 && maxCutoff > activeAssistant {
+		maxCutoff = activeAssistant
+	}
+	if cutoff > maxCutoff {
+		cutoff = maxCutoff
+	}
 
 	// Orphan safety (COLLAPSE-02, D-03, T-03-05):
 	// 若 cutoff 落在含 tool_result 的 user 消息上，优先将整对纳入折叠；
@@ -72,7 +81,7 @@ func CalcCollapseCutoff(messages []Message, tokenFloor int, tc *TokenCounter, ke
 			cutoff--
 		}
 	}
-	if cutoff < 2 {
+	if cutoff < 2 || cutoff >= n || cutoff > maxCutoff {
 		return -1
 	}
 

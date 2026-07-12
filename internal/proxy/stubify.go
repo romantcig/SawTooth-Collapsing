@@ -9,19 +9,129 @@ import (
 	"unicode/utf8"
 )
 
+// decisionMarkers 与 YesMem 保持一致，作为结构判断之外的边缘兜底。
+var decisionMarkers = []string{
+	"nimm", "mach", "ja bitte", "nein", "bitte nicht",
+	"so lassen", "lass uns", "entscheidung", "option", "variante",
+	"ansatz", "take", "use", "go with", "let's do", "ja -", "ok -",
+}
+
 // ContentBlock 映射 Anthropic API content block JSON 结构。
 // 支持 text、thinking、tool_use、tool_result 四种类型。
 type ContentBlock struct {
-	Type      string         `json:"type"`
-	Text      string         `json:"text,omitempty"`
-	Thinking  string         `json:"thinking,omitempty"`
-	Signature string         `json:"signature,omitempty"`
-	ID        string         `json:"id,omitempty"`
-	Name      string         `json:"name,omitempty"`
-	Input     map[string]any `json:"input"`
-	ToolUseID string         `json:"tool_use_id,omitempty"`
-	Content   any            `json:"content,omitempty"`
-	IsError   bool           `json:"is_error,omitempty"`
+	Type        string         `json:"type"`
+	Text        string         `json:"text,omitempty"`
+	Thinking    string         `json:"thinking,omitempty"`
+	Signature   string         `json:"signature,omitempty"`
+	ID          string         `json:"id,omitempty"`
+	Name        string         `json:"name,omitempty"`
+	Input       map[string]any `json:"input,omitempty"`
+	ToolUseID   string         `json:"tool_use_id,omitempty"`
+	Content     any            `json:"content,omitempty"`
+	IsError     bool           `json:"is_error,omitempty"`
+	extraFields map[string]json.RawMessage
+}
+
+// UnmarshalJSON 提取代理会读取或修改的字段，并原样保留 block 级未知字段。
+// Claude Code/Anthropic 会持续增加 content block 字段；压缩其中一个 block 时，
+// 不能顺带丢掉 redacted_thinking.data、cache_control 或未来协议字段。
+func (b *ContentBlock) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+
+	decode := func(key string, dst any) error {
+		raw, ok := fields[key]
+		if !ok {
+			return nil
+		}
+		if err := json.Unmarshal(raw, dst); err != nil {
+			return fmt.Errorf("解析 content block.%s: %w", key, err)
+		}
+		delete(fields, key)
+		return nil
+	}
+	if err := decode("type", &b.Type); err != nil {
+		return err
+	}
+	if err := decode("text", &b.Text); err != nil {
+		return err
+	}
+	if err := decode("thinking", &b.Thinking); err != nil {
+		return err
+	}
+	if err := decode("signature", &b.Signature); err != nil {
+		return err
+	}
+	if err := decode("id", &b.ID); err != nil {
+		return err
+	}
+	if err := decode("name", &b.Name); err != nil {
+		return err
+	}
+	if err := decode("input", &b.Input); err != nil {
+		return err
+	}
+	if err := decode("tool_use_id", &b.ToolUseID); err != nil {
+		return err
+	}
+	if err := decode("content", &b.Content); err != nil {
+		return err
+	}
+	if err := decode("is_error", &b.IsError); err != nil {
+		return err
+	}
+
+	if len(fields) == 0 {
+		b.extraFields = nil
+		return nil
+	}
+	b.extraFields = make(map[string]json.RawMessage, len(fields))
+	for key, raw := range fields {
+		b.extraFields[key] = append(json.RawMessage(nil), raw...)
+	}
+	return nil
+}
+
+// MarshalJSON 只覆盖已知字段，其余 block 级字段透明重放。
+func (b ContentBlock) MarshalJSON() ([]byte, error) {
+	fields := make(map[string]any, len(b.extraFields)+10)
+	for key, raw := range b.extraFields {
+		if !json.Valid(raw) {
+			return nil, fmt.Errorf("content block 未知字段 %q 含非法 JSON", key)
+		}
+		fields[key] = raw
+	}
+	fields["type"] = b.Type
+	if b.Text != "" {
+		fields["text"] = b.Text
+	}
+	if b.Thinking != "" {
+		fields["thinking"] = b.Thinking
+	}
+	if b.Signature != "" {
+		fields["signature"] = b.Signature
+	}
+	if b.ID != "" {
+		fields["id"] = b.ID
+	}
+	if b.Name != "" {
+		fields["name"] = b.Name
+	}
+	if b.Input != nil {
+		fields["input"] = b.Input
+	}
+	if b.ToolUseID != "" {
+		fields["tool_use_id"] = b.ToolUseID
+	}
+	if b.Content != nil {
+		fields["content"] = b.Content
+	}
+	if b.IsError {
+		fields["is_error"] = true
+	}
+	return json.Marshal(fields)
 }
 
 // Message 表示 Anthropic API 中的一条消息。
@@ -221,6 +331,7 @@ func stubifyMessages(messages []Message, tc *TokenCounter, pivotText string, kee
 		stats.StubbedTokens = stats.OriginalTokens
 		return messages, stats
 	}
+	activeAssistant, activeResult := activeToolPairIndices(messages)
 
 	stubbed := make([]Message, 0, len(messages))
 	// messages[0] 始终保护，保证 frozen prefix 缓存前缀稳定性
@@ -236,12 +347,24 @@ func stubifyMessages(messages []Message, tc *TokenCounter, pivotText string, kee
 
 	for i := 1; i < len(messages); i++ {
 		msg := messages[i]
+		// 活动 tool_use/tool_result 是仍在继续的协议轮次，必须跨整个 fallback
+		// 管线原样保留，不能依赖 keepRecent，也不能先删 signed thinking。
+		if i == activeAssistant || i == activeResult {
+			stubbed = append(stubbed, msg)
+			continue
+		}
 		blocks, isArray := parseContent(msg.Content)
 
 		// 80-token 硬底：太短且无 tool 交互的消息跳过 stub（stub 后反而更大）
 		// 对标 YesMem stubify.go: estimateMessageContentTokens ≤ 80
 		// 含 tool_use 或 tool_result 的消息仍需 stub——tool stub 始终更短
 		msgTokens := tc.CountMessageTokens(msg)
+		// YesMem：决策是 user 的 steering/确认消息。先识别以便为可桩化的
+		// 决策设置高 intensity；≤80 token 的消息仍遵循硬底、完全不桩化。
+		isDecision := msg.Role == "user" && isDecisionMessage(messages, i)
+		if isDecision {
+			stats.IsDecision = true
+		}
 		if msgTokens <= 80 && !hasToolUseBlocks(msg.Content) && !hasToolResultBlocks(msg.Content) {
 			stubbed = append(stubbed, msg)
 			continue
@@ -283,11 +406,6 @@ func stubifyMessages(messages []Message, tc *TokenCounter, pivotText string, kee
 			continue
 		}
 
-		// STUB-06: 决策消息检测
-		if msg.Role == "assistant" && isDecisionMessage(msg.Content, tc) {
-			stats.IsDecision = true
-		}
-
 		// STUB-04/05: 文本截断
 		blocks = truncateTextBlocks(blocks, msg.Role)
 
@@ -323,7 +441,11 @@ func stubifyMessages(messages []Message, tc *TokenCounter, pivotText string, kee
 
 		// Phase B: 记录衰减状态（DecayTracker 非 nil 时）
 		if dt != nil {
-			dt.MarkStubbed(sessionID, i, requestIdx, intensity)
+			msgIntensity := intensity
+			if isDecision {
+				msgIntensity = 0.95 // YesMem: +19 requests before decay starts
+			}
+			dt.MarkStubbed(sessionID, i, requestIdx, msgIntensity)
 			if stubbedFilePath != "" {
 				dt.SetFilePath(sessionID, i, stubbedFilePath)
 			}
@@ -547,28 +669,46 @@ func truncateRunes(s string, maxRunes int) string {
 	return truncated
 }
 
-// isDecisionMessage 检测消息是否为决策消息（STUB-06，对应 D-03）。
-// 决策检测启发式（语言无关，来自 YesMem 算法）：
-//   a. 短确认：总 token < 50 且 role 为 assistant → 可能为决策
-//
-// 条件 a 即足以捕获真实决策消息。移除了旧版条件 c（末尾 200 字符内短句检测），
-// 因其将大量以句号结尾的常态消息误判为决策（如 "Done."、"Here's the fix."），
-// 导致 decay 推进速度慢 3 倍。
-func isDecisionMessage(content json.RawMessage, tc *TokenCounter) bool {
-	blocks, _ := parseContent(content)
+// isDecisionMessage 对齐 YesMem 的 user decision 结构判断：
+// 1) 少于 30 rune 且不是问题；
+// 2) 少于 100 rune、承接上一条超过 400 rune 的 assistant 分析；
+// 3) 决策关键词兜底。
+func isDecisionMessage(messages []Message, currentIdx int) bool {
+	if currentIdx < 0 || currentIdx >= len(messages) || messages[currentIdx].Role != "user" {
+		return false
+	}
+	text := extractDecisionText(messages[currentIdx].Content)
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" || strings.HasSuffix(trimmed, "?") {
+		return false
+	}
+	if len([]rune(trimmed)) < 30 {
+		return true
+	}
+	if len([]rune(trimmed)) < 100 && currentIdx > 0 && messages[currentIdx-1].Role == "assistant" {
+		if len([]rune(extractDecisionText(messages[currentIdx-1].Content))) > 400 {
+			return true
+		}
+	}
+	lower := strings.ToLower(text)
+	for _, marker := range decisionMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
 
-	// 提取所有文本
+func extractDecisionText(content json.RawMessage) string {
+	blocks, _ := parseContent(content)
 	var allText strings.Builder
 	for _, block := range blocks {
 		if block.Type == "text" {
 			allText.WriteString(block.Text)
+			allText.WriteByte(' ')
 		}
 	}
-	text := allText.String()
-
-	// 条件 a: 短确认 —— total tokens < 50
-	tokenCount := tc.CountTokens(text)
-	return tokenCount < 50
+	return strings.TrimSpace(allText.String())
 }
 
 // isTaskList 检查文本是否包含 TODO 项或 checklist。

@@ -65,6 +65,30 @@ func TestCalcCollapseCutoffFinalGuardAfterBoundaryAdjustments(t *testing.T) {
 	})
 }
 
+func TestCalcCollapseCutoffNeverCrossesActiveToolPair(t *testing.T) {
+	tc, err := NewTokenCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeAssistant := Message{Role: "assistant", Content: json.RawMessage(`[{"type":"thinking","thinking":"signed","signature":"sig"},{"type":"tool_use","id":"active","name":"Read","input":{"file_path":"main.go"}}]`)}
+	largeResult := Message{Role: "user", Content: mustMarshalBlocks([]ContentBlock{{Type: "tool_result", ToolUseID: "active", Content: strings.Repeat("large current result ", 2000)}})}
+
+	noHistory := []Message{{Role: "user", Content: mustMarshal("start")}, activeAssistant, largeResult}
+	if cutoff := CalcCollapseCutoff(noHistory, 100, tc, 0); cutoff != -1 {
+		t.Fatalf("无安全历史前缀时 cutoff=%d, want -1", cutoff)
+	}
+
+	withHistory := []Message{
+		{Role: "user", Content: mustMarshal("start")},
+		{Role: "assistant", Content: mustMarshal(strings.Repeat("old history ", 200))},
+		activeAssistant,
+		largeResult,
+	}
+	if cutoff := CalcCollapseCutoff(withHistory, 100, tc, 0); cutoff != 2 {
+		t.Fatalf("cutoff=%d, want active assistant index 2", cutoff)
+	}
+}
+
 func TestCalcCollapseCutoffKeepsToolPairWithoutViolatingKeepRecent(t *testing.T) {
 	tc := mustTokenCounter(t)
 	messages := collapseTextMessages(8, 40)

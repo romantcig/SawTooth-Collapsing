@@ -4,12 +4,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 )
 
 // TokenEstimateFunc 估算文本 token 数量的函数签名。
 type TokenEstimateFunc func(string) int
+
+type eagerToolInfo struct {
+	name  string
+	input map[string]any
+}
 
 const eagerStubTokenThreshold = 500
 
@@ -29,8 +35,12 @@ func EagerStubToolResults(messages []any, frozenBoundary int, estimateTokens Tok
 	}
 	result := make([]any, len(messages))
 	copy(result, messages)
+	activeToolResult := eagerActiveToolResultIndex(result)
 
 	for i := frozenBoundary; i < len(result); i++ {
+		if i == activeToolResult {
+			continue
+		}
 		msg, ok := result[i].(map[string]any)
 		if !ok || msg["role"] != "user" {
 			continue
@@ -68,12 +78,11 @@ func EagerStubToolResults(messages []any, frozenBoundary int, estimateTokens Tok
 			continue
 		}
 
-		// Find the matching tool_use in the previous assistant message
-		var toolName string
-		var toolInput map[string]any
+		// 按 tool_use_id 建索引；并行工具调用不能共用第一个工具的元数据。
+		toolInfoByID := map[string]eagerToolInfo{}
 		if i > 0 {
 			if prev, ok := result[i-1].(map[string]any); ok && prev["role"] == "assistant" {
-				toolName, toolInput = eagerExtractToolInfo(prev["content"])
+				toolInfoByID = eagerExtractToolInfoMap(prev["content"])
 			}
 		}
 
@@ -87,6 +96,7 @@ func EagerStubToolResults(messages []any, frozenBoundary int, estimateTokens Tok
 			}
 
 			toolUseID, _ := b["tool_use_id"].(string)
+			toolInfo := toolInfoByID[toolUseID]
 			content := extractToolResultText(b)
 
 			memoryHit := cfg.memory != nil && cfg.threadID != "" && toolUseID != "" &&
@@ -103,7 +113,7 @@ func EagerStubToolResults(messages []any, frozenBoundary int, estimateTokens Tok
 				}
 			}
 
-			stub := buildEagerStub(toolName, toolInput, content)
+			stub := buildEagerStub(toolInfo.name, toolInfo.input, content)
 			newBlock := make(map[string]any)
 			for k, v := range b {
 				newBlock[k] = v
@@ -139,10 +149,11 @@ func EagerStubToolResults(messages []any, frozenBoundary int, estimateTokens Tok
 	return result
 }
 
-func eagerExtractToolInfo(content any) (string, map[string]any) {
+func eagerExtractToolInfoMap(content any) map[string]eagerToolInfo {
+	result := make(map[string]eagerToolInfo)
 	blocks, ok := content.([]any)
 	if !ok {
-		return "", nil
+		return result
 	}
 	for _, block := range blocks {
 		b, ok := block.(map[string]any)
@@ -150,12 +161,46 @@ func eagerExtractToolInfo(content any) (string, map[string]any) {
 			continue
 		}
 		if b["type"] == "tool_use" {
+			id, _ := b["id"].(string)
+			if id == "" {
+				continue
+			}
 			name, _ := b["name"].(string)
 			input, _ := b["input"].(map[string]any)
-			return name, input
+			result[id] = eagerToolInfo{name: name, input: input}
 		}
 	}
-	return "", nil
+	return result
+}
+
+func eagerActiveToolResultIndex(messages []any) int {
+	if len(messages) < 2 {
+		return -1
+	}
+	assistant, ok := messages[len(messages)-2].(map[string]any)
+	if !ok || assistant["role"] != "assistant" {
+		return -1
+	}
+	user, ok := messages[len(messages)-1].(map[string]any)
+	if !ok || user["role"] != "user" {
+		return -1
+	}
+	toolUses := eagerExtractToolInfoMap(assistant["content"])
+	blocks, ok := user["content"].([]any)
+	if !ok {
+		return -1
+	}
+	for _, block := range blocks {
+		b, ok := block.(map[string]any)
+		if !ok || b["type"] != "tool_result" {
+			continue
+		}
+		id, _ := b["tool_use_id"].(string)
+		if _, matched := toolUses[id]; matched {
+			return len(messages) - 1
+		}
+	}
+	return -1
 }
 
 func buildEagerStub(toolName string, input map[string]any, content string) string {
@@ -280,8 +325,10 @@ func (m *EagerStubMemory) RecordStubbed(threadID, toolUseID string) {
 		return
 	}
 	m.stubbed[threadID][toolUseID] = true
+	// 更新、快照和同步持久化使用同一把写锁串行化，防止旧快照在新快照
+	// 之后落库。persistFn 是本地 SQLite 写入，调用约定必须同步返回。
+	m.persistLocked(threadID)
 	m.mu.Unlock()
-	m.persist(threadID)
 }
 
 func (m *EagerStubMemory) ensureLoaded(threadID string) {
@@ -328,16 +375,15 @@ func (m *EagerStubMemory) ensureLoaded(threadID string) {
 	m.mu.Unlock()
 }
 
-func (m *EagerStubMemory) persist(threadID string) {
+func (m *EagerStubMemory) persistLocked(threadID string) {
 	if m.persistFn == nil {
 		return
 	}
-	m.mu.RLock()
 	ids := make([]string, 0, len(m.stubbed[threadID]))
 	for id := range m.stubbed[threadID] {
 		ids = append(ids, id)
 	}
-	m.mu.RUnlock()
+	sort.Strings(ids)
 
 	payload := struct {
 		ToolUseIDs []string `json:"tool_use_ids"`

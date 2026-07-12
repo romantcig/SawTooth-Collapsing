@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -404,6 +405,9 @@ func TestStubifyMessagesDeepSearchIntegration(t *testing.T) {
 		{Role: "user", Content: mustMarshalBlocks([]ContentBlock{
 			{Type: "tool_result", ToolUseID: "toolu_001", Content: "package main\n\nfunc main() {\n\tfmt.Println(\"hello\")\n}"},
 		})},
+		// 加入后续 assistant，使前一组工具调用成为已完成历史，而不是必须原样
+		// 保留的活动协议轮次。
+		{Role: "assistant", Content: mustMarshal("done")},
 	}
 
 	// stubify with small threshold to force stubbing
@@ -436,6 +440,25 @@ func TestStubifyMessagesDeepSearchIntegration(t *testing.T) {
 	}
 	if !toolResultFound {
 		t.Error("expected tool_result stub in output")
+	}
+}
+
+func TestStubifyPreservesActiveToolPairRegardlessOfKeepRecent(t *testing.T) {
+	tc, _ := NewTokenCounter()
+	assistantContent := json.RawMessage(`[{"type":"thinking","thinking":"signed reasoning","signature":"sig"},{"type":"redacted_thinking","data":"opaque"},{"type":"tool_use","id":"active","name":"Read","input":{"file_path":"main.go"},"future":{"keep":true}}]`)
+	resultContent := json.RawMessage(`[{"type":"tool_result","tool_use_id":"active","content":"current result","cache_control":{"type":"ephemeral"},"future_result":true}]`)
+	messages := []Message{
+		{Role: "user", Content: mustMarshal("start")},
+		{Role: "assistant", Content: assistantContent},
+		{Role: "user", Content: resultContent},
+	}
+
+	stubbed, _ := stubifyMessages(messages, tc, "", 0, false, nil, "test", 1, 0, 0)
+	if !bytes.Equal(stubbed[1].Content, assistantContent) {
+		t.Fatalf("活动 assistant 被 stubify 修改:\n got: %s\nwant: %s", stubbed[1].Content, assistantContent)
+	}
+	if !bytes.Equal(stubbed[2].Content, resultContent) {
+		t.Fatalf("活动 tool_result 被 stubify 修改:\n got: %s\nwant: %s", stubbed[2].Content, resultContent)
 	}
 }
 

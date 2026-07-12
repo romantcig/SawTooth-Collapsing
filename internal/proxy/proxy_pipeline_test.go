@@ -88,7 +88,7 @@ func TestHandleMessagesDebugStages(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), "-req.json") || strings.HasSuffix(entry.Name(), "-resp.json") {
+		if !strings.HasSuffix(entry.Name(), "-facts.json") {
 			t.Fatalf("full_body=false 仍写完整 body: %s", entry.Name())
 		}
 	}
@@ -111,13 +111,28 @@ func TestHandleMessagesDebugFullBodyOptIn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var requestBody, responseBody bool
+	stages := make(map[debugBodyStage]bool)
 	for _, entry := range entries {
-		requestBody = requestBody || strings.HasSuffix(entry.Name(), "-req.json")
-		responseBody = responseBody || strings.HasSuffix(entry.Name(), "-resp.json")
+		if strings.HasSuffix(entry.Name(), "-facts.json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var bodyEntry debugEntry
+		if err := json.Unmarshal(data, &bodyEntry); err != nil {
+			t.Fatal(err)
+		}
+		if bodyEntry.RequestID == 0 || bodyEntry.Stage == "" {
+			t.Fatalf("完整 debug 条目缺少 request_id/stage: %+v", bodyEntry)
+		}
+		stages[bodyEntry.Stage] = true
 	}
-	if !requestBody || !responseBody {
-		t.Fatalf("full_body=true 未保留兼容 body 文件: req=%v resp=%v", requestBody, responseBody)
+	for _, stage := range []debugBodyStage{debugBodyStageRawInbound, debugBodyStageForwarded, debugBodyStageResponse} {
+		if !stages[stage] {
+			t.Fatalf("full_body=true 缺少 %s 正文；已有 stages=%v", stage, stages)
+		}
 	}
 }
 

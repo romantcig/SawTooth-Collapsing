@@ -14,8 +14,11 @@ proxy:
   deflation: 0.7
 
 debug:
-  # 是否启用调试模式，默认值: false（可省略）
+  # 是否启用结构化 debug facts，默认值: false（可省略）
   enabled: false
+  # 是否额外保存完整 raw inbound、forwarded 和 response 正文。
+  # 其中可能包含敏感提示词与工具结果，默认值: false（可省略）
+  full_body: false
   # 调试数据落盘目录，默认值: ./data/（可省略）
   data_dir: ./data/
 
@@ -39,7 +42,7 @@ collapse:
 frozen:
   # 是否启用 frozen prefix（默认 true）
   enabled: true
-  # Frozen prefix 内存 TTL 分钟数（默认 30）
+  # 旧配置兼容值；实际 Frozen TTL 跟随 cache.cache_ttl
   ttl_minutes: 30
 
 cache:

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -206,6 +207,117 @@ func TestCompressContextThinkingBlocks(t *testing.T) {
 	}
 }
 
+func TestCompressContextOmitsOldSignedThinking(t *testing.T) {
+	longThinking := strings.Repeat("signed reasoning ", 800)
+	originalContent := json.RawMessage(`[{"type":"thinking","thinking":` + string(mustMarshal(longThinking)) + `,"signature":"sig-protected"},{"type":"text","text":"answer"}]`)
+	messages := []Message{
+		{Role: "user", Content: mustMarshal("start")},
+		{Role: "assistant", Content: originalContent},
+		{Role: "user", Content: mustMarshal("next")},
+	}
+
+	compressed, result := CompressContext(messages, 1, nil)
+
+	if result.ThinkingCompressed != 1 {
+		t.Fatalf("旧带签名 thinking 应被省略，实际 compressed=%d", result.ThinkingCompressed)
+	}
+	blocks, _ := parseContent(compressed[1].Content)
+	if len(blocks) != 1 || blocks[0].Type != "text" || blocks[0].Text != "answer" {
+		t.Fatalf("省略旧 signed thinking 后内容异常: %s", compressed[1].Content)
+	}
+	if bytes.Contains(compressed[1].Content, []byte("sig-protected")) || bytes.Contains(compressed[1].Content, []byte("context compressed: thinking")) {
+		t.Fatalf("旧 signed thinking 不应保留签名或伪造 thinking 占位块: %s", compressed[1].Content)
+	}
+}
+
+func TestCompressContextPreservesRecentSignedThinkingByteForByte(t *testing.T) {
+	longThinking := strings.Repeat("active signed reasoning ", 800)
+	originalContent := json.RawMessage(`[{"type":"thinking","thinking":` + string(mustMarshal(longThinking)) + `,"signature":"sig-active","cache_control":{"type":"ephemeral"}},{"type":"tool_use","id":"toolu_active","name":"Read","input":{"file_path":"main.go"}}]`)
+	messages := []Message{
+		{Role: "user", Content: mustMarshal("start")},
+		{Role: "assistant", Content: originalContent},
+		{Role: "user", Content: mustMarshal("tool result")},
+	}
+
+	compressed, result := CompressContext(messages, 2, nil)
+
+	if result.ThinkingCompressed != 0 {
+		t.Fatalf("keepRecent 内的 signed thinking 不得压缩，实际 compressed=%d", result.ThinkingCompressed)
+	}
+	if !bytes.Equal(compressed[1].Content, originalContent) {
+		t.Fatalf("活动 tool-use thinking 未原样保留:\n got: %s\nwant: %s", compressed[1].Content, originalContent)
+	}
+}
+
+func TestCompressContextProtectsActiveToolThinkingWhenKeepRecentZero(t *testing.T) {
+	longThinking := strings.Repeat("active tool reasoning ", 800)
+	originalContent := json.RawMessage(`[{"type":"thinking","thinking":` + string(mustMarshal(longThinking)) + `,"signature":"sig-active-zero","cache_control":{"type":"ephemeral"}},{"type":"redacted_thinking","data":"opaque-redacted"},{"type":"tool_use","id":"toolu_active_zero","name":"Read","input":{"file_path":"main.go"},"future_field":{"keep":true}}]`)
+	messages := []Message{
+		{Role: "user", Content: mustMarshal("start")},
+		{Role: "assistant", Content: originalContent},
+		{Role: "user", Content: mustMarshalBlocks([]ContentBlock{{Type: "tool_result", ToolUseID: "toolu_active_zero", Content: "result"}})},
+	}
+
+	compressed, result := CompressContext(messages, 0, nil)
+
+	if result.ThinkingCompressed != 0 {
+		t.Fatalf("活动工具轮次不得压缩 thinking，实际 compressed=%d", result.ThinkingCompressed)
+	}
+	if !bytes.Equal(compressed[1].Content, originalContent) {
+		t.Fatalf("keepRecent=0 时活动工具 assistant 未原样保留:\n got: %s\nwant: %s", compressed[1].Content, originalContent)
+	}
+}
+
+func TestCompressContextPreservesUnknownBlockFieldsWhenRebuilding(t *testing.T) {
+	longThinking := strings.Repeat("old signed reasoning ", 800)
+	content := json.RawMessage(`[{"type":"thinking","thinking":` + string(mustMarshal(longThinking)) + `,"signature":"old"},{"type":"redacted_thinking","data":"opaque","future":{"keep":true}},{"type":"text","text":"visible","cache_control":{"type":"ephemeral"}}]`)
+	messages := []Message{
+		{Role: "user", Content: mustMarshal("start")},
+		{Role: "assistant", Content: content},
+		{Role: "user", Content: mustMarshal("next turn")},
+	}
+
+	compressed, result := CompressContext(messages, 1, nil)
+	if result.ThinkingCompressed != 1 {
+		t.Fatalf("signed thinking compressed=%d, want 1", result.ThinkingCompressed)
+	}
+	var blocks []map[string]any
+	if err := json.Unmarshal(compressed[1].Content, &blocks); err != nil {
+		t.Fatal(err)
+	}
+	if got := blocks[0]["type"]; got != "redacted_thinking" {
+		t.Fatalf("first retained block type=%v", got)
+	}
+	if got := blocks[0]["data"]; got != "opaque" {
+		t.Fatalf("redacted_thinking.data=%v, want opaque", got)
+	}
+	if _, ok := blocks[0]["future"]; !ok {
+		t.Fatal("未来 block 字段在重建时丢失")
+	}
+	if _, ok := blocks[0]["input"]; ok {
+		t.Fatal("非 tool_use block 不应凭空出现 input:null")
+	}
+	if _, ok := blocks[1]["cache_control"]; !ok {
+		t.Fatal("未修改 text block 的 cache_control 丢失")
+	}
+}
+
+func TestActiveToolAssistantIndexRequiresAdjacentMatchingIDs(t *testing.T) {
+	assistant := Message{Role: "assistant", Content: mustMarshalBlocks([]ContentBlock{{Type: "tool_use", ID: "toolu_match", Name: "Read"}})}
+	matchingResult := Message{Role: "user", Content: mustMarshalBlocks([]ContentBlock{{Type: "tool_result", ToolUseID: "toolu_match", Content: "ok"}})}
+	unmatchedResult := Message{Role: "user", Content: mustMarshalBlocks([]ContentBlock{{Type: "tool_result", ToolUseID: "toolu_other", Content: "ok"}})}
+
+	if got := activeToolAssistantIndex([]Message{{Role: "user", Content: mustMarshal("start")}, assistant, matchingResult}); got != 1 {
+		t.Fatalf("匹配工具轮次索引=%d, want 1", got)
+	}
+	if got := activeToolAssistantIndex([]Message{{Role: "user", Content: mustMarshal("start")}, assistant, unmatchedResult}); got != -1 {
+		t.Fatalf("不匹配 tool ID 不应保护 assistant，got=%d", got)
+	}
+	if got := activeToolAssistantIndex([]Message{assistant, matchingResult, {Role: "user", Content: mustMarshal("new turn")}}); got != -1 {
+		t.Fatalf("已结束的旧工具轮次不应视为活动轮次，got=%d", got)
+	}
+}
+
 func TestCompressContextToolResults(t *testing.T) {
 	tc, err := NewTokenCounter()
 	if err != nil {
@@ -300,7 +412,7 @@ func TestCompressContextKeepRecent(t *testing.T) {
 		{Role: "assistant", Content: rebuildContent([]ContentBlock{
 			{Type: "thinking", Thinking: longThinking}, // should be compressed
 		}, true)},
-		{Role: "user", Content: mustMarshal("msg2")}, // keepRecent protected
+		{Role: "user", Content: mustMarshal("msg2")},      // keepRecent protected
 		{Role: "assistant", Content: mustMarshal("msg3")}, // keepRecent protected
 	}
 

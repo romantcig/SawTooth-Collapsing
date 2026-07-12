@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // ── 公开纯函数 ──
@@ -35,6 +36,13 @@ func InjectFrozenBoundaryBreakpoint(messages []Message, frozenCount int) error {
 // 防止 Anthropic API 的 increasing-TTL violation（HTTP 400）。
 // 否则使用传入的 cacheTTL 参数。
 func NormalizeCacheTTL(messages []Message, cacheTTL string) error {
+	cacheTTL = strings.TrimSpace(cacheTTL)
+	if cacheTTL == "" {
+		cacheTTL = "ephemeral"
+	}
+	if cacheTTL != "ephemeral" && cacheTTL != "1h" {
+		return fmt.Errorf("不支持的 cache TTL %q", cacheTTL)
+	}
 	// 扫描已有 breakpoint，检测 1h TTL
 	targetTTL := cacheTTL
 	for _, msg := range messages {

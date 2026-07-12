@@ -57,8 +57,12 @@ func buildToolUseInfoExtended(messages []Message) map[string]toolUseInfoExtended
 // Rules:
 //   - messages[0] is never touched (system message).
 //   - Messages in the last keepRecent positions are never touched.
-//   - thinking blocks with > 500 chars of thinking text → replaced with
-//     "[context compressed: thinking block]".
+//   - unsigned thinking blocks with > 500 tokens of thinking text → replaced
+//     with "[context compressed: thinking block]".
+//   - old signed thinking blocks outside keepRecent are omitted rather than
+//     modified; Anthropic permits omitting thinking from prior assistant turns.
+//   - signed thinking inside keepRecent remains byte-for-byte untouched so an
+//     active tool-use assistant turn can continue with its original signature.
 //   - tool_result blocks with > 500 tokens → replaced with structured summary
 //     preserving tool_use_id and is_error.
 //
@@ -89,48 +93,73 @@ func CompressContext(messages []Message, keepRecent int, tc *TokenCounter) ([]Me
 	// Work on a copy to avoid mutating the input.
 	compressed := make([]Message, len(messages))
 	copy(compressed, messages)
+	activeToolAssistant, activeToolResult := activeToolPairIndices(messages)
 
 	for i := 1; i < scanEnd; i++ {
+		// keepRecent 是容量策略；活动工具轮次保护是协议约束，不能依赖配置值。
+		if i == activeToolAssistant || i == activeToolResult {
+			continue
+		}
 		blocks, isArray := parseContent(compressed[i].Content)
 		if len(blocks) == 0 {
 			continue
 		}
 
+		// 如果整条消息只有带签名 thinking，删除后会产生空 assistant content；
+		// 这种退化形状保持原样，等待后续整段 collapse 处理。
+		hasRetainableBlock := false
+		for _, block := range blocks {
+			if block.Type != "thinking" || block.Signature == "" {
+				hasRetainableBlock = true
+				break
+			}
+		}
+		if !hasRetainableBlock {
+			continue
+		}
+
 		modified := false
-		for j := range blocks {
-			switch blocks[j].Type {
+		newBlocks := make([]ContentBlock, 0, len(blocks))
+		for _, block := range blocks {
+			switch block.Type {
 			case "thinking":
-				if countBlockTokens(blocks[j], tc) > 500 {
-					// 保留 thinking 类型 — 对标 YesMem（保持 API 块形状一致）。
-					// 将压缩文本写入 Thinking 字段，原 Signature 保留（已在 copy 中传递）。
-					newBlock := blocks[j]
-					newBlock.Thinking = "[context compressed: thinking block]"
-					blocks[j] = newBlock
+				if countBlockTokens(block, tc) > 500 {
+					if block.Signature != "" {
+						// 已完成的旧 assistant turn 可以省略 thinking；不要伪造或复用旧签名。
+						result.ThinkingCompressed++
+						modified = true
+						continue
+					}
+					// 无签名 thinking 沿用 YesMem 的可见占位符。
+					block.Thinking = "[context compressed: thinking block]"
 					result.ThinkingCompressed++
 					modified = true
 				}
+				newBlocks = append(newBlocks, block)
 
 			case "tool_result":
-				blockTokens := countBlockTokens(blocks[j], tc)
+				blockTokens := countBlockTokens(block, tc)
 				if blockTokens > 500 {
-					info, ok := toolUseInfo[blocks[j].ToolUseID]
+					info, ok := toolUseInfo[block.ToolUseID]
 					if !ok {
 						info = toolUseInfoExtended{Name: "tool", Keywords: ""}
 					}
-					summary := buildToolResultSummary(blocks[j], info)
+					summary := buildToolResultSummary(block, info)
 
 					// 浅拷贝保留所有未知字段（对标 YesMem shallowCopyMap）
-					newBlock := blocks[j]
-					newBlock.Content = summary
-					blocks[j] = newBlock
+					block.Content = summary
 					result.ToolResultsCompressed++
 					modified = true
 				}
+				newBlocks = append(newBlocks, block)
+
+			default:
+				newBlocks = append(newBlocks, block)
 			}
 		}
 
 		if modified {
-			compressed[i].Content = rebuildContent(blocks, isArray)
+			compressed[i].Content = rebuildContent(newBlocks, isArray)
 		}
 	}
 
@@ -144,6 +173,49 @@ func CompressContext(messages []Message, keepRecent int, tc *TokenCounter) ([]Me
 	}
 
 	return compressed, result
+}
+
+// activeToolAssistantIndex 判断请求尾部是否正在提交 tool_result。
+// 若最后一条 user 消息的 tool_result ID 与紧邻的 assistant.tool_use 匹配，
+// 返回该 assistant 索引；调用方必须整条消息原样保留，包括 thinking、
+// redacted_thinking、signature、cache_control 和未来未知字段。
+func activeToolAssistantIndex(messages []Message) int {
+	assistant, _ := activeToolPairIndices(messages)
+	return assistant
+}
+
+// activeToolPairIndices 返回请求尾部仍在继续的 assistant tool_use 与 user
+// tool_result 索引。两条消息都属于协议原子单元，任何压缩阶段都必须原样保留。
+func activeToolPairIndices(messages []Message) (int, int) {
+	if len(messages) < 2 {
+		return -1, -1
+	}
+	resultMessage := messages[len(messages)-1]
+	assistantIdx := len(messages) - 2
+	assistantMessage := messages[assistantIdx]
+	if resultMessage.Role != "user" || assistantMessage.Role != "assistant" {
+		return -1, -1
+	}
+
+	var resultBlocks, assistantBlocks []ContentBlock
+	if json.Unmarshal(resultMessage.Content, &resultBlocks) != nil || json.Unmarshal(assistantMessage.Content, &assistantBlocks) != nil {
+		return -1, -1
+	}
+	toolUseIDs := make(map[string]struct{})
+	for _, block := range assistantBlocks {
+		if block.Type == "tool_use" && block.ID != "" {
+			toolUseIDs[block.ID] = struct{}{}
+		}
+	}
+	for _, block := range resultBlocks {
+		if block.Type != "tool_result" || block.ToolUseID == "" {
+			continue
+		}
+		if _, ok := toolUseIDs[block.ToolUseID]; ok {
+			return assistantIdx, len(messages) - 1
+		}
+	}
+	return -1, -1
 }
 
 // countBlockTokens estimates the token count of a single content block
@@ -232,7 +304,6 @@ func buildToolResultSummary(block ContentBlock, info toolUseInfoExtended) string
 
 	// 使用原始文本的行数（对标 YesMem — 报告"压缩了多少内容"）
 	lineCount := strings.Count(text, "\n") + 1
-
 
 	// 从原始文本中提取最多 5 个函数/类型签名（对标 YesMem compress_context.go:241-254）
 	matches := funcSigRe.FindAllStringSubmatch(text, 5)

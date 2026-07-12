@@ -495,11 +495,15 @@ func (d *DecayTracker) ApplyDecayBatch(messages []Message, sessionID string, tot
 		overallPhase = DecayFresh
 	}
 
-
 	// 对 messages 应用逐消息衰减
 	result := make([]Message, 0, len(messages))
 	threadLen := len(messages)
+	activeAssistant, activeResult := activeToolPairIndices(messages)
 	for i, msg := range messages {
+		if i == activeAssistant || i == activeResult {
+			result = append(result, msg)
+			continue
+		}
 		stage := d.GetStage(sessionID, i, requestIdx, threadLen, pressure)
 		blocks, isArray := parseContent(msg.Content)
 		changed := false
@@ -508,9 +512,10 @@ func (d *DecayTracker) ApplyDecayBatch(messages []Message, sessionID string, tot
 			switch blocks[j].Type {
 			case "text":
 				// 文本桩：应用 ApplyDecay
+				original := blocks[j].Text
 				decayed := ApplyDecay(blocks[j].Text, stage, msg.Role)
 				blocks[j].Text = decayed
-				if decayed == "" {
+				if decayed != original {
 					changed = true
 				}
 			case "tool_use":

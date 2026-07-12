@@ -163,12 +163,22 @@ func nonNegativeUsageFloat(number float64) int {
 // metadata 字段 + body（原始 JSON 解析后的对象）。
 type debugEntry struct {
 	Timestamp    string          `json:"timestamp"`
+	RequestID    uint64          `json:"request_id"`
+	Stage        debugBodyStage  `json:"stage"`
 	SessionID    string          `json:"session_id"`
 	Model        string          `json:"model"`
 	MessageCount int             `json:"message_count"`
 	Headers      json.RawMessage `json:"headers,omitempty"`
 	Body         json.RawMessage `json:"body"`
 }
+
+type debugBodyStage string
+
+const (
+	debugBodyStageRawInbound debugBodyStage = "raw_inbound"
+	debugBodyStageForwarded  debugBodyStage = "forwarded"
+	debugBodyStageResponse   debugBodyStage = "response"
+)
 
 type debugWriteCloser interface {
 	Write([]byte) (int, error)
@@ -179,7 +189,7 @@ type debugFileOpener func(string, int, os.FileMode) (debugWriteCloser, error)
 
 // writeDebugFile 将请求/响应落盘到 data_dir/debug/{sessionID}/{timestamp}-{direction}.json（D-03）。
 // headers 参数仅在 req 方向传入（用于 redact Authorization）。
-func (s *Server) writeDebugFile(sessionID string, requestID uint64, timestamp time.Time, direction string, body []byte, headers http.Header, model string, messageCount int) {
+func (s *Server) writeDebugFile(sessionID string, requestID uint64, timestamp time.Time, stage debugBodyStage, body []byte, headers http.Header, model string, messageCount int) {
 	debugDir, ok := safeDebugSessionDir(s.Config.Debug.DataDir, sessionID)
 	if !ok {
 		slog.Warn("debug session 目录校验失败")
@@ -192,7 +202,7 @@ func (s *Server) writeDebugFile(sessionID string, requestID uint64, timestamp ti
 
 	// 文件安全的时间戳格式（RFC3339 中冒号替换为连字符）
 	tsSafe := timestamp.Format("2006-01-02T150405.000000000")
-	filename := fmt.Sprintf("%s-%d-%s.json", tsSafe, requestID, direction)
+	filename := fmt.Sprintf("%s-%d-%s.json", tsSafe, requestID, stage)
 	filePath := filepath.Join(debugDir, filename)
 
 	// 解析 body 为 JSON 对象（若解析失败则存为字符串）
@@ -220,6 +230,8 @@ func (s *Server) writeDebugFile(sessionID string, requestID uint64, timestamp ti
 
 	entry := debugEntry{
 		Timestamp:    timestamp.Format(time.RFC3339),
+		RequestID:    requestID,
+		Stage:        stage,
 		SessionID:    sessionID,
 		Model:        model,
 		MessageCount: messageCount,
@@ -238,6 +250,21 @@ func (s *Server) writeDebugFile(sessionID string, requestID uint64, timestamp ti
 	}); err != nil {
 		slog.Warn("无法写入 debug 文件", "file", filePath, "error", err)
 	}
+}
+
+// writeFullBodyDebug 在显式开启 full_body 时，为每个请求阶段最多写入一份完整正文。
+// raw_inbound 与 forwarded 分开落盘，便于直接审计代理在请求管线中的具体改写。
+func (s *Server) writeFullBodyDebug(meta *requestMeta, timestamp time.Time, stage debugBodyStage, body []byte, headers http.Header, model string, messageCount int) {
+	if !s.Config.Debug.Enabled || !s.Config.Debug.FullBody || meta == nil {
+		return
+	}
+	once := meta.debugBodyOnce(stage)
+	if once == nil {
+		return
+	}
+	once.Do(func() {
+		s.writeDebugFile(meta.RequestSessionID, meta.ID, timestamp, stage, body, headers, model, messageCount)
+	})
 }
 
 func writeDebugEntryFile(filePath string, data []byte, openFile debugFileOpener) error {
@@ -300,7 +327,6 @@ func parseJSON(body []byte) []byte {
 // forwardRaw 核心转发方法：SSE 流式 / JSON 非流式转发 + usage deflation + debug 落盘。
 func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *requestMeta) {
 	const maxBodySize = 10 * 1024 * 1024 // 10 MB（T-02-04）
-	sessionID := meta.RequestSessionID
 	logger := meta.Logger
 
 	// 步骤 1: 读取请求体
@@ -338,10 +364,10 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 	s.writeRequestDebugFacts(meta, timestamp, debugStageRawInbound, body, r)
 	s.writeRequestDebugFacts(meta, timestamp, debugStageForwarded, body, r)
 
-	// 步骤 2: Debug 写请求体
-	if s.Config.Debug.Enabled && s.Config.Debug.FullBody {
-		s.writeDebugFile(sessionID, meta.ID, timestamp, "req", body, r.Header, model, messageCount)
-	}
+	// 步骤 2: Debug 写请求体。直通/解析降级路径中当前 body 同时是 raw inbound；
+	// 正常结构化管线已提前写入真正的 raw，once 会阻止被最终 body 覆盖。
+	s.writeFullBodyDebug(meta, timestamp, debugBodyStageRawInbound, body, r.Header, model, messageCount)
+	s.writeFullBodyDebug(meta, timestamp, debugBodyStageForwarded, body, r.Header, model, messageCount)
 
 	// 步骤 3: 创建上游请求
 	targetURL := strings.TrimRight(s.Config.Proxy.Target, "/") + r.URL.RequestURI()
@@ -409,9 +435,7 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 		_, _ = w.Write(respBody)
 
 		// Debug 写非 2xx 响应
-		if s.Config.Debug.Enabled && s.Config.Debug.FullBody {
-			s.writeDebugFile(sessionID, meta.ID, timestamp, "resp", respBody, nil, model, messageCount)
-		}
+		s.writeFullBodyDebug(meta, timestamp, debugBodyStageResponse, respBody, resp.Header, model, messageCount)
 		return
 	}
 
@@ -531,9 +555,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 	}
 
 	// 步骤 5: Debug 写 SSE 响应（完整拼接文本）
-	if s.Config.Debug.Enabled && s.Config.Debug.FullBody {
-		s.writeDebugFile(sessionID, meta.ID, timestamp, "resp", []byte(fullResponse.String()), nil, model, messageCount)
-	}
+	s.writeFullBodyDebug(meta, timestamp, debugBodyStageResponse, []byte(fullResponse.String()), resp.Header, model, messageCount)
 }
 
 // processSSEEvent 处理单个 SSE 事件。
@@ -662,7 +684,5 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *re
 	_, _ = w.Write(respBody)
 
 	// 步骤 5: Debug 写 JSON 响应
-	if s.Config.Debug.Enabled && s.Config.Debug.FullBody {
-		s.writeDebugFile(sessionID, meta.ID, timestamp, "resp", respBody, nil, model, messageCount)
-	}
+	s.writeFullBodyDebug(meta, timestamp, debugBodyStageResponse, respBody, resp.Header, model, messageCount)
 }

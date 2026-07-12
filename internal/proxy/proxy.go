@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,7 +58,7 @@ type CollapseConfig struct {
 type FrozenConfig struct {
 	// Enabled 是否启用 frozen prefix（默认 true）
 	Enabled bool `yaml:"enabled"`
-	// TTLMinutes frozen prefix 内存 TTL 分钟数（默认 30）
+	// TTLMinutes 保留用于旧配置兼容；实际 TTL 由 cache_ttl 推导。
 	TTLMinutes int `yaml:"ttl_minutes"`
 }
 
@@ -224,6 +225,16 @@ func validateConfig(cfg *Config) {
 			"breakpoint_limit", cfg.Cache.BreakpointLimit, "default", 4)
 		cfg.Cache.BreakpointLimit = 4
 	}
+	switch strings.TrimSpace(cfg.Cache.CacheTTL) {
+	case "", "ephemeral":
+		cfg.Cache.CacheTTL = "ephemeral"
+	case "1h":
+		cfg.Cache.CacheTTL = "1h"
+	default:
+		slog.Warn("非法 cache_ttl 值，回退到默认值",
+			"cache_ttl", cfg.Cache.CacheTTL, "default", "ephemeral")
+		cfg.Cache.CacheTTL = "ephemeral"
+	}
 }
 
 // LoadConfig 从 YAML 文件加载配置。
@@ -292,8 +303,12 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "Request Entity Too Large"})
 			return
 		}
-		meta.logEntry(extractModelFromBody(body), countMessages(body))
-		s.writeRequestDebugFacts(meta, time.Now(), debugStageRawInbound, body, r)
+		rawTimestamp := time.Now()
+		rawModel := extractModelFromBody(body)
+		rawMessageCount := countMessages(body)
+		meta.logEntry(rawModel, rawMessageCount)
+		s.writeRequestDebugFacts(meta, rawTimestamp, debugStageRawInbound, body, r)
+		s.writeFullBodyDebug(meta, rawTimestamp, debugBodyStageRawInbound, body, r.Header, rawModel, rawMessageCount)
 
 		// 解析 Anthropic messages API 请求体
 		// 使用 map[string]json.RawMessage 保留所有原始字段（tools/thinking/tool_choice
@@ -511,6 +526,11 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				tokenFloor = 10000
 			}
 			cutoffIdx := CalcCollapseCutoff(messages, tokenFloor, s.TokenCounter, s.Config.Stubify.KeepRecent)
+			if cutoffIdx >= len(messages) {
+				meta.Logger.Warn("collapse cutoff 越界，回退到 stubify",
+					"cutoff", cutoffIdx, "message_count", len(messages))
+				cutoffIdx = -1
+			}
 
 			if cutoffIdx > 0 {
 				// ── PRIMARY PATH: Collapse ──
@@ -524,89 +544,91 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					s.TokenCounter,
 					sessionID,
 				)
+				if archiveBlock.ID == "" {
+					meta.Logger.Warn("collapse 未生成有效存档，回退到 stubify",
+						"cutoff", cutoffIdx, "message_count", len(messages))
+				} else {
 
-				// 持久化到 SQLite（graceful degradation：失败不阻断请求）
-				if s.Store != nil {
-					if err := s.Store.SaveArchive(archiveBlock); err != nil {
-						meta.Logger.Error("保存存档失败", "error", err)
+					// 持久化到 SQLite（graceful degradation：失败不阻断请求）
+					if s.Store != nil {
+						if err := s.Store.SaveArchive(archiveBlock); err != nil {
+							meta.Logger.Error("保存存档失败", "error", err)
+						}
 					}
-				}
 
-				meta.Logger.Info("collapse 完成",
-					"before", len(messages),
-					"after", len(collapsedMessages),
-					"cutoff", cutoffIdx,
-					"archived_tokens", archiveBlock.EstimatedTokens,
-					LogGreen,
-				)
-
-				// DecayTracker: 清理被折叠的旧消息索引。
-				// 折叠后消息数组完全重建（indices 0:blank, 1:archive, 2+:tail），
-				// 旧 indices 不再有效。
-				if s.DecayTracker != nil {
-					s.DecayTracker.ClearSession(sessionID)
-				}
-
-				// 重建请求体
-				messages = collapsedMessages
-
-				// Phase 5: Eager stubbing（collapse 后 tail 中的大 tool_result 仍需处理）
-				if s.EagerStub != nil {
-					freshStubs := 0
-					stickyHits := 0
-					messagesAny := messagesToAny(messages)
-					messagesAny = EagerStubToolResults(messagesAny, 0,
-						func(text string) int { return s.TokenCounter.CountTokens(text) },
-						WithStubMemory(s.EagerStub, sessionID),
-						WithStubCounters(&stickyHits, &freshStubs),
+					meta.Logger.Info("collapse 完成",
+						"before", len(messages),
+						"after", len(collapsedMessages),
+						"cutoff", cutoffIdx,
+						"archived_tokens", archiveBlock.EstimatedTokens,
+						LogGreen,
 					)
-					messages = anyToMessages(messagesAny)
-					if freshStubs > 0 || stickyHits > 0 {
-						meta.Logger.Info("eager stub 完成（collapse 路径）",
-							"fresh_stubs", freshStubs,
-							"sticky_hits", stickyHits,
-							LogGreen,
-						)
+
+					// DecayTracker: 清理被折叠的旧消息索引。
+					// 折叠后消息数组完全重建（indices 0:blank, 1:archive, 2+:tail），
+					// 旧 indices 不再有效。
+					if s.DecayTracker != nil {
+						s.DecayTracker.ClearSession(sessionID)
 					}
-				}
 
-				// Orphan repair
-				repaired, orphans := validateToolPairs(messages)
-				if orphans > 0 {
-					meta.Logger.Warn("修复 orphan tool_use/tool_result 对",
-						"orphans_removed", orphans,
-					)
-					messages = repaired
-				}
+					// 重建请求体
+					messages = collapsedMessages
 
-				// collapse 当轮的整个最终消息序列构成 frozen prefix。先完成所有会改变
-				// prefix 长度/内容的变换，再注入唯一 boundary breakpoint 并持久化。
-				frozenPrefixLen = len(messages)
-				s.applyCacheControl(messages, frozenPrefixLen, sessionID)
-
-				if s.Sawtooth != nil && s.Frozen != nil {
-					trigger := s.Sawtooth.ShouldTrigger(sessionID, rawEstimate)
-					if trigger != "" {
-						meta.Logger.Info("SawtoothTrigger 触发",
-							"reason", trigger,
-							"raw_estimate", rawEstimate,
-							LogGreen,
+					// Phase 5: Eager stubbing（collapse 后 tail 中的大 tool_result 仍需处理）
+					if s.EagerStub != nil {
+						freshStubs := 0
+						stickyHits := 0
+						messagesAny := messagesToAny(messages)
+						messagesAny = EagerStubToolResults(messagesAny, 0,
+							func(text string) int { return s.TokenCounter.CountTokens(text) },
+							WithStubMemory(s.EagerStub, sessionID),
+							WithStubCounters(&stickyHits, &freshStubs),
 						)
-						compressedTokens := s.TokenCounter.CountMessagesTokens(messages)
-						s.Frozen.StoreWithLogger(meta.Logger, sessionID, messages, rawCutoff, rawBoundary, compressedTokens, rawEstimate)
+						messages = anyToMessages(messagesAny)
+						if freshStubs > 0 || stickyHits > 0 {
+							meta.Logger.Info("eager stub 完成（collapse 路径）",
+								"fresh_stubs", freshStubs,
+								"sticky_hits", stickyHits,
+								LogGreen,
+							)
+						}
 					}
-				}
 
-				newBody, err := rebuildBody(messages)
-				if err != nil {
-					meta.Logger.Error("重建折叠后请求体失败", "error", err)
-					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-					return
-				}
+					// Orphan repair
+					repaired, orphans := validateToolPairs(messages)
+					if orphans > 0 {
+						meta.Logger.Warn("修复 orphan tool_use/tool_result 对",
+							"orphans_removed", orphans,
+						)
+						messages = repaired
+					}
 
-				r.Body = io.NopCloser(bytes.NewReader(newBody))
-				s.forwardRaw(w, r, meta)
-				return // collapse 路径在此结束
+					if s.Sawtooth != nil && s.Frozen != nil {
+						trigger := s.Sawtooth.ShouldTrigger(sessionID, rawEstimate)
+						if trigger != "" {
+							meta.Logger.Info("SawtoothTrigger 触发",
+								"reason", trigger,
+								"raw_estimate", rawEstimate,
+								LogGreen,
+							)
+							frozenPrefixLen = len(messages)
+							s.applyCacheControl(messages, frozenPrefixLen, sessionID)
+							compressedTokens := s.TokenCounter.CountMessagesTokens(messages)
+							s.Frozen.StoreWithLogger(meta.Logger, sessionID, messages, rawCutoff, rawBoundary, compressedTokens, rawEstimate)
+						}
+					}
+
+					newBody, err := rebuildBody(messages)
+					if err != nil {
+						meta.Logger.Error("重建折叠后请求体失败", "error", err)
+						http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+						return
+					}
+
+					r.Body = io.NopCloser(bytes.NewReader(newBody))
+					s.forwardRaw(w, r, meta)
+					return // collapse 路径在此结束
+				}
 			}
 
 			// ── FALLBACK PATH: stubify+decay（cutoffIdx <= 0，对标 YesMem StubifyWithTotal） ──
@@ -650,22 +672,8 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			// 非 collapse 路径：SawtoothTrigger + Frozen.Store
-			if s.Sawtooth != nil && s.Frozen != nil {
-				trigger := s.Sawtooth.ShouldTrigger(sessionID, rawEstimate)
-				if trigger != "" {
-					meta.Logger.Info("SawtoothTrigger 触发",
-						"reason", trigger,
-						"raw_estimate", rawEstimate,
-						LogGreen,
-					)
-					compressedTokens := s.TokenCounter.CountMessagesTokens(decayedMessages)
-					s.Frozen.StoreWithLogger(meta.Logger, sessionID, decayedMessages, rawCutoff, rawBoundary, compressedTokens, rawEstimate)
-				}
-			}
-
 			messages = decayedMessages
-			if s.EagerStub != nil && frozenPrefixLen > 0 {
+			if s.EagerStub != nil {
 				freshStubs := 0
 				stickyHits := 0
 				messagesAny := messagesToAny(messages)
@@ -682,26 +690,41 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					)
 				}
 			}
-			s.applyCacheControl(messages, frozenPrefixLen, sessionID)
-			newBody, err := rebuildBody(messages)
-			if err != nil {
-				meta.Logger.Error("重建请求体失败", "error", err)
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-				return
-			}
-
 			// Orphan repair
 			repaired, orphans := validateToolPairs(messages)
 			if orphans > 0 {
 				meta.Logger.Warn("修复 orphan tool_use/tool_result 对",
 					"orphans_removed", orphans,
 				)
-				newBody, err = rebuildBody(repaired)
-				if err != nil {
-					meta.Logger.Error("重建修复后请求体失败", "error", err)
-					http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-					return
+				messages = repaired
+			}
+
+			// fallback 与 collapse 路径保持项目 Phase 07.1 的 snapshot 契约：
+			// 持久化的 prefix bytes 与本次实际上游 wire prefix 完全一致。
+			if s.Sawtooth != nil && s.Frozen != nil {
+				trigger := s.Sawtooth.ShouldTrigger(sessionID, rawEstimate)
+				if trigger != "" {
+					meta.Logger.Info("SawtoothTrigger 触发",
+						"reason", trigger,
+						"raw_estimate", rawEstimate,
+						LogGreen,
+					)
+					frozenPrefixLen = len(messages)
+					s.applyCacheControl(messages, frozenPrefixLen, sessionID)
+					compressedTokens := s.TokenCounter.CountMessagesTokens(messages)
+					s.Frozen.StoreWithLogger(meta.Logger, sessionID, messages, rawCutoff, rawBoundary, compressedTokens, rawEstimate)
+				} else {
+					s.applyCacheControl(messages, frozenPrefixLen, sessionID)
 				}
+			} else {
+				s.applyCacheControl(messages, frozenPrefixLen, sessionID)
+			}
+
+			newBody, err := rebuildBody(messages)
+			if err != nil {
+				meta.Logger.Error("重建请求体失败", "error", err)
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
 			}
 
 			// 替换 r.Body 为处理后的内容——forwardRaw 透明读取
@@ -713,11 +736,8 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				_ = s.Sawtooth.ShouldTrigger(sessionID, rawEstimate)
 			}
 
-			// 低于阈值但 frozen prefix 命中时仍需 cache_control 处理（D-09）
-			s.applyCacheControl(messages, frozenPrefixLen, sessionID)
-
-			// Phase 5: Eager stubbing on fresh tail below threshold (EAGER-02)
-			if s.EagerStub != nil && frozenPrefixLen > 0 {
+			// Phase 5: 每个主代理请求都主动清理已被后续 assistant 消化的旧 tool_result。
+			if s.EagerStub != nil {
 				freshStubs := 0
 				stickyHits := 0
 				messagesAny := messagesToAny(messages)
@@ -741,19 +761,16 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				meta.Logger.Warn("修复 orphan tool_use/tool_result 对",
 					"orphans_removed", orphans,
 				)
-				if newBody, err := rebuildBody(repaired); err == nil {
-					r.Body = io.NopCloser(bytes.NewReader(newBody))
-				} else {
-					meta.Logger.Warn("marshal 修复后 body 失败", "error", err)
-					r.Body = io.NopCloser(bytes.NewReader(body))
-				}
+				messages = repaired
+			}
+
+			// Eager 只改 fresh tail；在它和 pair repair 之后统一处理 frozen boundary。
+			s.applyCacheControl(messages, frozenPrefixLen, sessionID)
+			if newBody, err := rebuildBody(messages); err == nil {
+				r.Body = io.NopCloser(bytes.NewReader(newBody))
 			} else {
-				if newBody, err := rebuildBody(messages); err == nil {
-					r.Body = io.NopCloser(bytes.NewReader(newBody))
-				} else {
-					meta.Logger.Warn("marshal final messages 失败", "error", err)
-					r.Body = io.NopCloser(bytes.NewReader(body))
-				}
+				meta.Logger.Warn("marshal final messages 失败", "error", err)
+				r.Body = io.NopCloser(bytes.NewReader(body))
 			}
 		}
 	}
@@ -782,6 +799,14 @@ func (s *Server) applyCacheControl(messages []Message, frozenCount int, sessionI
 	if frozenCount > len(messages) {
 		frozenCount = len(messages)
 	}
+	// 活动 tool_use/tool_result 必须保持入口 wire JSON 语义不变；cache boundary
+	// 只能落在 active assistant 之前的稳定历史前缀。
+	if activeAssistant, _ := activeToolPairIndices(messages); activeAssistant >= 0 && frozenCount > activeAssistant {
+		frozenCount = activeAssistant
+	}
+	if frozenCount <= 0 {
+		return
+	}
 
 	// Step 1: Strip —— 移除 frozen portion 中已有的 cache_control
 	if err := StripMessagesCacheControl(messages[:frozenCount]); err != nil {
@@ -795,12 +820,12 @@ func (s *Server) applyCacheControl(messages []Message, frozenCount int, sessionI
 	}
 
 	// Step 3: EnforceLimit —— 限制已有 breakpoint 总数（包含刚注入的 boundary breakpoint）
-	if err := EnforceCacheBreakpointLimit(messages, s.Config.Cache.BreakpointLimit); err != nil {
+	if err := EnforceCacheBreakpointLimit(messages[:frozenCount], s.Config.Cache.BreakpointLimit); err != nil {
 		slog.Warn("cache_control enforce 失败", "session_id", sessionID, "error", err)
 	}
 
-	// Step 4: NormalizeTTL —— 统一所有 breakpoint TTL 为默认 5 分钟
-	if err := NormalizeCacheTTL(messages, "5m"); err != nil {
+	// Step 4: NormalizeTTL —— 统一为配置的 ephemeral(5m) 或 1h。
+	if err := NormalizeCacheTTL(messages[:frozenCount], s.Config.Cache.CacheTTL); err != nil {
 		slog.Warn("cache_control normalize 失败", "session_id", sessionID, "error", err)
 	}
 
@@ -812,7 +837,7 @@ func (s *Server) applyCacheControl(messages []Message, frozenCount int, sessionI
 			effectiveTTL = "ephemeral"
 		}
 		// NormalizeCacheTTL 会将 ephemeral 升级为 1h 当检测到已有 1h 断点时
-		for _, msg := range messages {
+		for _, msg := range messages[:frozenCount] {
 			if findExistingMaxTTL(msg) == "1h" {
 				effectiveTTL = "1h"
 				break

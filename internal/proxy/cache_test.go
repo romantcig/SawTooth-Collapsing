@@ -28,6 +28,51 @@ func TestApplyCacheControlConcurrentTTLUpdates(t *testing.T) {
 	}
 }
 
+func TestValidateConfigNormalizesCacheTTL(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Cache.CacheTTL = " 1h "
+	validateConfig(&cfg)
+	if cfg.Cache.CacheTTL != "1h" {
+		t.Fatalf("cache_ttl=%q, want 1h", cfg.Cache.CacheTTL)
+	}
+
+	cfg.Cache.CacheTTL = "1hr"
+	validateConfig(&cfg)
+	if cfg.Cache.CacheTTL != "ephemeral" {
+		t.Fatalf("非法 cache_ttl 未回退: %q", cfg.Cache.CacheTTL)
+	}
+}
+
+func TestNormalizeCacheTTLRejectsUnsupportedValue(t *testing.T) {
+	messages := []Message{{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"cached","cache_control":{"type":"ephemeral"}}]`)}}
+	if err := NormalizeCacheTTL(messages, "5m"); err == nil {
+		t.Fatal("非法 cache TTL 应返回错误")
+	}
+}
+
+func TestApplyCacheControlDoesNotMutateActiveToolPair(t *testing.T) {
+	s := NewServer(DefaultConfig())
+	s.Frozen = NewFrozenStubs()
+	assistantContent := json.RawMessage(`[{"type":"thinking","thinking":"signed","signature":"sig","cache_control":{"type":"ephemeral","ttl":"1h"}},{"type":"tool_use","id":"active","name":"Read","input":{"file_path":"main.go"},"future":true}]`)
+	resultContent := json.RawMessage(`[{"type":"tool_result","tool_use_id":"active","content":"current","cache_control":{"type":"ephemeral"},"future_result":true}]`)
+	messages := []Message{
+		{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"stable history","cache_control":{"type":"ephemeral"}}]`)},
+		{Role: "assistant", Content: assistantContent},
+		{Role: "user", Content: resultContent},
+	}
+
+	s.applyCacheControl(messages, len(messages), "session")
+	if !bytes.Equal(messages[1].Content, assistantContent) {
+		t.Fatalf("cache 管理改写活动 assistant:\n got: %s\nwant: %s", messages[1].Content, assistantContent)
+	}
+	if !bytes.Equal(messages[2].Content, resultContent) {
+		t.Fatalf("cache 管理改写活动 tool_result:\n got: %s\nwant: %s", messages[2].Content, resultContent)
+	}
+	if countBreakpoints(messages[:1]) != 1 {
+		t.Fatal("稳定历史 boundary 未保留单一 breakpoint")
+	}
+}
+
 func TestCacheFrozenFreezeRestorePrefixJSONBytesMatch(t *testing.T) {
 	raw := frozenTestMessages(302)
 	prefix := deepCopyMessages(raw[:5])

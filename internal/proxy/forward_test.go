@@ -135,13 +135,13 @@ func TestWriteDebugFileRedactsCredentialHeaders(t *testing.T) {
 		"X-Diagnostic":        {"safe-value"},
 	}
 	timestamp := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
-	s.writeDebugFile("session", 1, timestamp, "req", []byte(`{"ok":true}`), headers, "model", 1)
+	s.writeDebugFile("session", 1, timestamp, debugBodyStageForwarded, []byte(`{"ok":true}`), headers, "model", 1)
 
 	debugDir, ok := safeDebugSessionDir(dataDir, "session")
 	if !ok {
 		t.Fatal("合法 session debug 目录校验失败")
 	}
-	data, err := os.ReadFile(filepath.Join(debugDir, "2026-07-11T120000.000000000-1-req.json"))
+	data, err := os.ReadFile(filepath.Join(debugDir, "2026-07-11T120000.000000000-1-forwarded.json"))
 	if err != nil {
 		t.Fatalf("读取 debug 文件: %v", err)
 	}
@@ -154,6 +154,9 @@ func TestWriteDebugFileRedactsCredentialHeaders(t *testing.T) {
 	if err := json.Unmarshal(data, &entry); err != nil {
 		t.Fatalf("解析 debug 文件: %v", err)
 	}
+	if entry.RequestID != 1 || entry.Stage != debugBodyStageForwarded {
+		t.Fatalf("debug 条目缺少关联字段: %+v", entry)
+	}
 	if !bytes.Contains(entry.Headers, []byte("safe-value")) {
 		t.Fatalf("诊断 header 未保留: %s", entry.Headers)
 	}
@@ -164,7 +167,7 @@ func TestWriteDebugFileSessionPathCannotEscapeDebugRoot(t *testing.T) {
 		t.Run(sessionID, func(t *testing.T) {
 			dataDir := t.TempDir()
 			s := NewServer(Config{Debug: DebugConfig{DataDir: dataDir}})
-			s.writeDebugFile(sessionID, 1, time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC), "req", []byte(`{}`), nil, "model", 0)
+			s.writeDebugFile(sessionID, 1, time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC), debugBodyStageForwarded, []byte(`{}`), nil, "model", 0)
 
 			debugDir, ok := safeDebugSessionDir(dataDir, sessionID)
 			if !ok {
@@ -175,7 +178,7 @@ func TestWriteDebugFileSessionPathCannotEscapeDebugRoot(t *testing.T) {
 			if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
 				t.Fatalf("debug 目录逃逸: root=%s dir=%s rel=%s err=%v", root, debugDir, rel, err)
 			}
-			if _, err := os.Stat(filepath.Join(debugDir, "2026-07-11T120000.000000000-1-req.json")); err != nil {
+			if _, err := os.Stat(filepath.Join(debugDir, "2026-07-11T120000.000000000-1-forwarded.json")); err != nil {
 				t.Fatalf("debug 文件未写入哈希目录: %v", err)
 			}
 		})
@@ -191,7 +194,7 @@ func TestWriteDebugFileUsesRequestIDToPreventCollisions(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s.writeDebugFile("session", requestID, timestamp, "req", []byte(`{"request":true}`), nil, "model", 1)
+			s.writeDebugFile("session", requestID, timestamp, debugBodyStageForwarded, []byte(`{"request":true}`), nil, "model", 1)
 		}()
 	}
 	wg.Wait()

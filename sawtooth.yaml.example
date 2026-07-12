@@ -14,8 +14,11 @@ proxy:
   deflation: 0.7
 
 debug:
-  # Whether to enable debug mode, default: false (optional)
+  # Whether to enable structured debug facts, default: false (optional)
   enabled: false
+  # Whether to additionally save complete raw inbound, forwarded, and response bodies.
+  # This may contain sensitive prompts and tool results; default: false (optional)
+  full_body: false
   # Directory to save debug data, default: ./data/ (optional)
   data_dir: ./data/
 
@@ -39,7 +42,7 @@ collapse:
 frozen:
   # Whether to enable frozen prefix, default: true (optional)
   enabled: true
-  # Frozen prefix memory TTL in minutes, default: 30 (optional)
+  # Legacy compatibility value; effective Frozen TTL follows cache.cache_ttl
   ttl_minutes: 30
 
 cache:

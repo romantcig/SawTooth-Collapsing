@@ -15,6 +15,22 @@ type requestMeta struct {
 	rawFactsOnce         sync.Once
 	forwardedFactsOnce   sync.Once
 	usageFactsOnce       sync.Once
+	rawBodyOnce          sync.Once
+	forwardedBodyOnce    sync.Once
+	responseBodyOnce     sync.Once
+}
+
+func (m *requestMeta) debugBodyOnce(stage debugBodyStage) *sync.Once {
+	switch stage {
+	case debugBodyStageRawInbound:
+		return &m.rawBodyOnce
+	case debugBodyStageForwarded:
+		return &m.forwardedBodyOnce
+	case debugBodyStageResponse:
+		return &m.responseBodyOnce
+	default:
+		return nil
+	}
 }
 
 func (m *requestMeta) debugOnce(stage debugStage) *sync.Once {
