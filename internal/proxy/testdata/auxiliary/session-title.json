@@ -1,0 +1,50 @@
+{
+  "model": "grok-4.5",
+  "max_tokens": 128,
+  "stream": true,
+  "system": [
+    {
+      "type": "text",
+      "text": "You are Claude Code."
+    },
+    {
+      "type": "text",
+      "text": "Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session. The session content is provided inside <session> tags. Return JSON with a single \"title\" field."
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "<session>\nReview the proxy request classifier\n</session>"
+        }
+      ]
+    }
+  ],
+  "output_config": {
+    "effort": "high",
+    "format": {
+      "type": "json_schema",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "Read",
+      "description": "Harmless fixture variation"
+    }
+  ]
+}
