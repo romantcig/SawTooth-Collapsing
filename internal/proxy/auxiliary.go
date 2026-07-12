@@ -84,12 +84,46 @@ func extractAuxiliaryText(raw json.RawMessage) (string, bool) {
 }
 
 func hasCompleteSessionEnvelope(text string) bool {
+	const (
+		openTag         = "<session>"
+		closeTag        = "</session>"
+		maxSessionDepth = 32
+	)
+
 	trimmed := strings.TrimSpace(text)
-	if !strings.HasPrefix(trimmed, "<session>") || !strings.HasSuffix(trimmed, "</session>") {
+	if !strings.HasPrefix(trimmed, openTag) {
 		return false
 	}
-	inner := strings.TrimSuffix(strings.TrimPrefix(trimmed, "<session>"), "</session>")
-	return !strings.Contains(inner, "</session>")
+
+	depth := 1
+	position := len(openTag)
+	for position < len(trimmed) {
+		nextOpen := strings.Index(trimmed[position:], openTag)
+		nextClose := strings.Index(trimmed[position:], closeTag)
+		if nextClose < 0 {
+			return false
+		}
+
+		if nextOpen >= 0 && nextOpen < nextClose {
+			depth++
+			if depth > maxSessionDepth {
+				return false
+			}
+			position += nextOpen + len(openTag)
+			continue
+		}
+
+		depth--
+		if depth < 0 {
+			return false
+		}
+		position += nextClose + len(closeTag)
+		if depth == 0 {
+			return position == len(trimmed)
+		}
+	}
+
+	return false
 }
 
 func isSessionTitleSystem(text string) bool {
