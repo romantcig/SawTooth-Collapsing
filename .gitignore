@@ -41,3 +41,7 @@ RELEASE.md
 
 # Maintenance scripts (local only)
 fix_history.sh
+
+# Local review diagnostics
+changes_log.txt
+changes_stat.txt
