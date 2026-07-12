@@ -312,6 +312,119 @@ func TestHandleMessagesSessionTitleRequestState(t *testing.T) {
 	}
 }
 
+func TestSessionTitleJSONResponseState(t *testing.T) {
+	testSessionTitleResponseState(t, false)
+}
+
+func TestSessionTitleSSEResponseState(t *testing.T) {
+	testSessionTitleResponseState(t, true)
+}
+
+func TestForwardSawtoothStatePolicy(t *testing.T) {
+	if !(*requestMeta)(nil).tracksSawtoothState() {
+		t.Fatal("nil meta 必须默认跟踪 Sawtooth 状态")
+	}
+	if !(&requestMeta{}).tracksSawtoothState() {
+		t.Fatal("零值 meta 必须默认跟踪 Sawtooth 状态")
+	}
+	if (&requestMeta{RequestKind: requestKindSessionTitle}).tracksSawtoothState() {
+		t.Fatal("session_title meta 不得跟踪 Sawtooth 状态")
+	}
+}
+
+func testSessionTitleResponseState(t *testing.T, sse bool) {
+	t.Helper()
+	const sessionID = "session-title-response-state"
+	rawBody, err := os.ReadFile(filepath.Join("testdata", "auxiliary", "session-title.json"))
+	if err != nil {
+		t.Fatalf("读取 session title fixture 失败: %v", err)
+	}
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if sse {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: message_start\n"+
+				`data: {"type":"message_start","message":{"usage":{"input_tokens":196,"cache_creation_input_tokens":0,"cache_read_input_tokens":93056,"output_tokens":20}}}`+"\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"type":"message","usage":{"input_tokens":196,"cache_creation_input_tokens":0,"cache_read_input_tokens":93056,"output_tokens":20}}`)
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	server.Config.Proxy.Deflation = 0.5
+	server.Config.Debug = DebugConfig{Enabled: true, DataDir: t.TempDir()}
+	server.Sawtooth.UpdateAfterResponse(sessionID, 777, 9)
+	server.Sawtooth.mu.RLock()
+	beforeTime := server.Sawtooth.lastRequestTime[sessionID]
+	beforeLoaded := server.Sawtooth.loadedFromDB[sessionID]
+	server.Sawtooth.mu.RUnlock()
+	persistCalls := 0
+	server.Sawtooth.SetPersistFunc(func(_ string, _ string) { persistCalls++ })
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(rawBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Claude-Code-Session-Id", sessionID)
+	recorder := httptest.NewRecorder()
+	server.HandleMessages(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("HandleMessages status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if persistCalls != 0 {
+		t.Fatalf("session title persist calls=%d, want 0", persistCalls)
+	}
+	server.Sawtooth.mu.RLock()
+	gotTokens := server.Sawtooth.lastTotalTokens[sessionID]
+	gotMessages := server.Sawtooth.lastMessageCount[sessionID]
+	gotTime := server.Sawtooth.lastRequestTime[sessionID]
+	gotLoaded := server.Sawtooth.loadedFromDB[sessionID]
+	server.Sawtooth.mu.RUnlock()
+	if gotTokens != 777 || gotMessages != 9 || !gotTime.Equal(beforeTime) || gotLoaded != beforeLoaded {
+		t.Fatalf("session title 改写 Sawtooth 状态: tokens=%d messages=%d time_changed=%v loaded=%v", gotTokens, gotMessages, !gotTime.Equal(beforeTime), gotLoaded)
+	}
+	if strings.Contains(recorder.Body.String(), `"input_tokens":196`) || !strings.Contains(recorder.Body.String(), `"input_tokens":98`) {
+		t.Fatalf("session title 客户端 deflation 行为变化: %s", recorder.Body.String())
+	}
+
+	facts := readDebugFactFiles(t, server.Config.Debug.DataDir, sessionID)
+	usageFacts := 0
+	for _, data := range facts {
+		var fact debugFact
+		if json.Unmarshal(data, &fact) == nil && fact.Stage == debugStageResponseUsage {
+			usageFacts++
+			if fact.TotalInputTokens != 93252 {
+				t.Fatalf("usage fact total_input_tokens=%d, want 93252", fact.TotalInputTokens)
+			}
+		}
+	}
+	if usageFacts != 1 {
+		t.Fatalf("response usage facts=%d, want 1", usageFacts)
+	}
+
+	ordinaryID := sessionID + "-ordinary"
+	persistCalls = 0
+	ordinaryBody := []byte(`{"model":"grok-4.5","messages":[{"role":"user","content":"ordinary request"}]}`)
+	ordinaryReq := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(ordinaryBody))
+	ordinaryReq.Header.Set("Content-Type", "application/json")
+	ordinaryReq.Header.Set("X-Claude-Code-Session-Id", ordinaryID)
+	ordinaryRecorder := httptest.NewRecorder()
+	server.HandleMessages(ordinaryRecorder, ordinaryReq)
+	if ordinaryRecorder.Code != http.StatusOK {
+		t.Fatalf("ordinary status=%d body=%s", ordinaryRecorder.Code, ordinaryRecorder.Body.String())
+	}
+	if persistCalls != 1 {
+		t.Fatalf("ordinary persist calls=%d, want 1", persistCalls)
+	}
+	server.Sawtooth.mu.RLock()
+	ordinaryTokens := server.Sawtooth.lastTotalTokens[ordinaryID]
+	ordinaryMessages := server.Sawtooth.lastMessageCount[ordinaryID]
+	server.Sawtooth.mu.RUnlock()
+	if ordinaryTokens != 93252 || ordinaryMessages != 1 {
+		t.Fatalf("ordinary state tokens/messages=%d/%d, want 93252/1", ordinaryTokens, ordinaryMessages)
+	}
+}
+
 func testHandleMessagesDirectAgentBypass(t *testing.T, _ ...string) {
 	t.Helper()
 	var forwardedBodies [][]byte
