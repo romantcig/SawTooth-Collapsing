@@ -341,11 +341,14 @@ Plans:
 
 ### Phase 08.1: Claude Code 辅助请求隔离与高级工具兼容 (INSERTED)
 
-**Goal:** [Urgent work - to be planned]
-**Requirements**: TBD
+**Goal:** 高置信识别 Claude Code 自动会话标题辅助请求并在任何 Sawtooth 状态副作用前原字节安全直通，同时取消普通精确路径作为独立 Archive 召回信号，确保日常编码请求不会误触发历史搜索或注入。
+**Requirements**: —
 **Depends on:** Phase 8
-**Plans:** 0 plans
+**Plans:** 2 plans
 
 Plans:
 
-- [ ] TBD (run $gsd-plan-phase 08.1 to break down)
+**Wave 1**
+
+- [ ] 08.1-01-PLAN.md — 自动会话标题高置信分类、请求/响应 Sawtooth 状态隔离与原字节安全直通
+- [ ] 08.1-02-PLAN.md — Archive 召回 provenance 门禁收紧与普通路径零副作用回归
