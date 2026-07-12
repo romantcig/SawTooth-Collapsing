@@ -2,16 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: Milestone complete
-stopped_at: Phase 08.1 context gathered
-last_updated: "2026-07-12T20:45:43.946Z"
-last_activity: 2026-07-11
-last_activity_desc: Phase 08 complete
+status: Ready to execute
+stopped_at: Phase 08.1 gap closure planned (08.1-03)
+last_updated: "2026-07-12T23:49:03.565Z"
+last_activity: 2026-07-13
 progress:
   total_phases: 10
   completed_phases: 3
-  total_plans: 14
-  completed_plans: 14
+  total_plans: 17
+  completed_plans: 16
   percent: 30
 current_phase: 08.1
 ---
@@ -29,9 +28,11 @@ See: `.planning/ROADMAP.md`
 
 Phase 08 (claude-code-token-user-context-usage-debug) 已完成：4/4 plans、13/13 requirements、19/19 must-haves 均通过；代码审查发现的 4 个 Critical 和 1 个 Warning 已修复并复审为 clean。多模态 token、持久 CLAUDE.md context、Agent 强特征、真实 usage 与安全双阶段 debug 均已闭环。
 
+Phase 08.1 已执行 2/3 plans；验证发现 session envelope 平衡门禁与辅助分类日志 session ID 泄漏两项 blocker，已生成 08.1-03 gap-closure 计划，等待执行。
+
 ## Active Plan
 
-无活跃计划。
+08.1-03-PLAN.md — session envelope 平衡门禁与辅助分类日志 session ID 泄漏缺口关闭。
 
 ### Quick Tasks Completed
 
@@ -48,10 +49,10 @@ Phase 08 (claude-code-token-user-context-usage-debug) 已完成：4/4 plans、13
 | 260711-32d | 将日志格式改为时间戳加方括号级别，并仅为级别文字着色 | 2026-07-11 | 21717fe | [260711-32d-log-level-prefix-color](./quick/260711-32d-log-level-prefix-color/) |
 | 260711-4e0 | 修复上游 Base URL 尾斜杠导致请求路径错误，并添加回归测试 | 2026-07-11 | 1fa804d | [260711-4e0-base-url](./quick/260711-4e0-base-url/) |
 
-Last activity: 2026-07-11 — Phase 08 complete
+Last activity: 2026-07-13 — Phase 08.1 gap closure planned
 
 ---
-*Last updated: 2026-07-12*
+*Last updated: 2026-07-13*
 
 ## Accumulated Context
 
@@ -75,6 +76,8 @@ Last activity: 2026-07-11 — Phase 08 complete
 | Phase 07.1-frozen-archive-agent P07 | 24min | 2 tasks | 5 files |
 | Phase 07.1-frozen-archive-agent P08 | 11min | 2 tasks | 8 files |
 | Phase 07.1-frozen-archive-agent P09 | 18min | 2 tasks | 3 files |
+| Phase 08.1 P01 | 13 min | 3 tasks | 7 files |
+| Phase 08.1 P02 | 18 min | 2 tasks | 2 files |
 
 ## Decisions
 
@@ -100,9 +103,15 @@ Last activity: 2026-07-11 — Phase 08 complete
 - [Phase 07.1-frozen-archive-agent]: 入口与上游发送分别使用 original_message_count 和 forwarded_message_count，Archive 来源只使用 source_session_id。 — 消除处理前后计数和当前/来源 session 的语义混淆。
 - [Phase 07.1-frozen-archive-agent]: 显式 Archive 召回尝试只输出一次基于最终 RecallOutcome 的 Info 汇总，逐块与预算降级明细降为 Debug。 — 保证日志描述最终发送状态并限制 Info 日志量。
 - [Phase 07.1-frozen-archive-agent]: 生产 DB/WAL/SHM 只读复制到临时快照，SQLite mode=ro 仅打开副本，并以前后 size/mtime/SHA-256 证明生产文件不变。
+- [Phase 08.1]: 标题分类只依赖单条 user、完整 session envelope、受限标题 system 意图及 title-only schema；tools、thinking、model 不参与硬门禁。
+- [Phase 08.1]: output_config 只有整段缺失时允许严格 prompt fallback；存在但无效时 fail closed。
+- [Phase 08.1]: nil/零值 requestMeta 默认跟踪 Sawtooth，只有 session_title 禁止响应状态写回。
+- [Phase 08.1]: 删除 RecallSignalExactPath 独立 kind；ExactPath 只作为 recovery/deep_search provenance 的完全匹配修饰。
+- [Phase 08.1]: 明确恢复短语携带路径时生成 Recovery signal，并以原始路径作 Query、Terms 和 ExactPath。
+- [Phase 08.1]: 普通路径零查询使用已关闭的临时 SQLite store 作故障探针，不添加生产测试钩子。
 
 ## Session
 
-**Last session:** 2026-07-12T20:43:54.202Z
-**Stopped at:** Phase 08.1 context gathered
-**Resume file:** .planning/phases/08.1-claude-code/08.1-CONTEXT.md
+**Last session:** 2026-07-12T23:49:03.565Z
+**Stopped at:** Phase 08.1 gap closure planned (08.1-03)
+**Resume file:** .planning/phases/08.1-claude-code/08.1-03-PLAN.md
