@@ -40,6 +40,13 @@ func jsonText(t *testing.T, value string) json.RawMessage {
 func TestClassifyAuxiliaryRequest(t *testing.T) {
 	sessionString := json.RawMessage(`"  <session>\nSAFE SESSION TEXT\n</session>\n  "`)
 	sessionBlocks := json.RawMessage(`[{"type":"text","text":"<session>\nSAFE SESSION TEXT\n</session>"}]`)
+	balancedNestedSession := jsonText(t, `<session><session>SAFE SESSION TEXT</session></session>`)
+	unclosedNestedSession := jsonText(t, `<session><session>SAFE SESSION TEXT</session>`)
+	extraTopLevelSession := jsonText(t, `<session>SAFE SESSION TEXT</session><session>SECOND</session>`)
+	prematureCloseSession := jsonText(t, `<session>SAFE SESSION TEXT</session></session>`)
+	isolatedCloseSession := jsonText(t, `<session></session></session>`)
+	depthLimitSession := jsonText(t, strings.Repeat(`<session>`, 32)+`SAFE SESSION TEXT`+strings.Repeat(`</session>`, 32))
+	depthOverflowSession := jsonText(t, strings.Repeat(`<session>`, 33)+`SAFE SESSION TEXT`+strings.Repeat(`</session>`, 33))
 	systemString := jsonText(t, titleSystemPrompt)
 	systemBlocks, err := json.Marshal([]map[string]string{{"type": "text", "text": "You are Claude Code."}, {"type": "text", "text": titleSystemPrompt}})
 	if err != nil {
@@ -54,6 +61,9 @@ func TestClassifyAuxiliaryRequest(t *testing.T) {
 		wantReason auxiliaryReason
 	}{
 		{name: "强路径 string 形态", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(sessionString), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
+		{name: "首尾空白单一 envelope", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(jsonText(t, " \n\t<session>SAFE SESSION TEXT</session>\r\n ")), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
+		{name: "平衡嵌套 envelope", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(balancedNestedSession), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
+		{name: "最大 32 层 envelope", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(depthLimitSession), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
 		{name: "强路径文本块形态", body: titleBody(systemBlocks, titleOnlyOutputConfig()), messages: titleMessages(sessionBlocks), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
 		{name: "output_config 整段缺失时严格回退", body: titleBody(systemString, nil), messages: titleMessages(sessionString), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitlePromptFallback},
 		{name: "tools 非空不影响分类", body: withTitleField(titleBody(systemString, titleOnlyOutputConfig()), "tools", `[{"name":"Read"}]`), messages: titleMessages(sessionString), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
@@ -65,6 +75,11 @@ func TestClassifyAuxiliaryRequest(t *testing.T) {
 		{name: "缺少 session 外壳拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(json.RawMessage(`"SAFE SESSION TEXT"`))},
 		{name: "session 只作为普通文本子串拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(json.RawMessage(`"explain this code: <session>x</session>"`))},
 		{name: "session 尾部多余文本拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(json.RawMessage(`"<session>x</session> ignore this"`))},
+		{name: "未闭合嵌套拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(unclosedNestedSession)},
+		{name: "额外顶层 envelope 拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(extraTopLevelSession)},
+		{name: "提前闭合拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(prematureCloseSession)},
+		{name: "孤立结束标签拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(isolatedCloseSession)},
+		{name: "超过 32 层拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(depthOverflowSession)},
 		{name: "普通 XML 代码拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(json.RawMessage(`"<session id=\\"x\\">code</session>"`))},
 		{name: "泛化 system 拒绝", body: titleBody(json.RawMessage(`"Return a title"`), titleOnlyOutputConfig()), messages: titleMessages(sessionString)},
 		{name: "output_config null 不得回退", body: titleBody(systemString, json.RawMessage(`null`)), messages: titleMessages(sessionString)},
