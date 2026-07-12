@@ -237,7 +237,7 @@ func TestHandleMessagesSubagentNoSideEffects(t *testing.T) {
 }
 
 func TestHandleMessagesSessionTitleRequestState(t *testing.T) {
-	const sessionID = "session-title-request-state"
+	const sessionID = "SESSION-TITLE-HEADER-SECRET-8F3C1A"
 	rawBody, err := os.ReadFile(filepath.Join("testdata", "auxiliary", "session-title.json"))
 	if err != nil {
 		t.Fatalf("读取 session title fixture 失败: %v", err)
@@ -297,17 +297,26 @@ func TestHandleMessagesSessionTitleRequestState(t *testing.T) {
 	}
 
 	gotLogs := logs.String()
-	if strings.Count(gotLogs, "辅助请求安全直通") != 1 {
+	var auxiliaryLog string
+	for _, line := range strings.Split(strings.TrimSpace(gotLogs), "\n") {
+		if strings.Contains(line, "辅助请求安全直通") {
+			if auxiliaryLog != "" {
+				t.Fatalf("标题分类 Info 多于一条: %s", gotLogs)
+			}
+			auxiliaryLog = line
+		}
+	}
+	if auxiliaryLog == "" {
 		t.Fatalf("标题分类 Info 数量不正确: %s", gotLogs)
 	}
 	for _, field := range []string{"request_kind=session_title", "request_reason=title_schema", "message_count=1", "request_id="} {
-		if !strings.Contains(gotLogs, field) {
-			t.Errorf("分类审计缺少 %q: %s", field, gotLogs)
+		if !strings.Contains(auxiliaryLog, field) {
+			t.Errorf("分类审计缺少 %q: %s", field, auxiliaryLog)
 		}
 	}
-	for _, secret := range []string{"Review the proxy request classifier", titleSystemPrompt, "Harmless fixture variation"} {
-		if strings.Contains(gotLogs, secret) {
-			t.Fatalf("分类审计泄漏请求正文 %q: %s", secret, gotLogs)
+	for _, secret := range []string{sessionID, "Review the proxy request classifier", titleSystemPrompt, "Harmless fixture variation"} {
+		if strings.Contains(auxiliaryLog, secret) {
+			t.Fatalf("分类审计泄漏请求敏感值 %q: %s", secret, auxiliaryLog)
 		}
 	}
 }

@@ -148,9 +148,10 @@ func TestSessionTitleFixture(t *testing.T) {
 
 func TestAuxiliaryClassificationLog(t *testing.T) {
 	const (
-		secretSession = "TOP-SECRET-SESSION-CONTENT"
-		secretSystem  = "TOP-SECRET-SYSTEM-CONTENT"
-		secretAuth    = "Bearer TOP-SECRET-CREDENTIAL"
+		secretSessionID = "TOP-SECRET-SESSION-ID"
+		secretSession   = "TOP-SECRET-SESSION-CONTENT"
+		secretSystem    = "TOP-SECRET-SYSTEM-CONTENT"
+		secretAuth      = "Bearer TOP-SECRET-CREDENTIAL"
 	)
 	classification := classifyAuxiliaryRequest(
 		titleBody(jsonText(t, `Generate a concise coding session title (3-7 words). `+secretSystem+` Return JSON with a single title field.`), titleOnlyOutputConfig()),
@@ -158,7 +159,11 @@ func TestAuxiliaryClassificationLog(t *testing.T) {
 	)
 
 	var output bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelInfo})).With("request_id", 42)
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	meta := newRequestMeta(42, secretSessionID)
+	logger := slog.New(meta.Logger.Handler()).With("request_id", meta.ID)
 	logAuxiliaryClassification(logger, classification, 1)
 	got := output.String()
 	if strings.Count(got, "辅助请求安全直通") != 1 {
@@ -169,7 +174,7 @@ func TestAuxiliaryClassificationLog(t *testing.T) {
 			t.Errorf("审计日志缺少白名单字段 %q: %s", field, got)
 		}
 	}
-	for _, secret := range []string{secretSession, secretSystem, secretAuth} {
+	for _, secret := range []string{secretSessionID, secretSession, secretSystem, secretAuth} {
 		if strings.Contains(got, secret) {
 			t.Fatalf("审计日志泄漏敏感值 %q: %s", secret, got)
 		}
