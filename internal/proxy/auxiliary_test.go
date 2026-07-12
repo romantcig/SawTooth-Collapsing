@@ -28,11 +28,23 @@ func titleOnlyOutputConfig() json.RawMessage {
 	return json.RawMessage(`{"effort":"high","format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}}}`)
 }
 
+func jsonText(t *testing.T, value string) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("编码 JSON 文本失败: %v", err)
+	}
+	return raw
+}
+
 func TestClassifyAuxiliaryRequest(t *testing.T) {
 	sessionString := json.RawMessage(`"  <session>\nSAFE SESSION TEXT\n</session>\n  "`)
 	sessionBlocks := json.RawMessage(`[{"type":"text","text":"<session>\nSAFE SESSION TEXT\n</session>"}]`)
-	systemString := json.RawMessage(`"` + titleSystemPrompt + `"`)
-	systemBlocks := json.RawMessage(`[{"type":"text","text":"You are Claude Code."},{"type":"text","text":"` + titleSystemPrompt + `"}]`)
+	systemString := jsonText(t, titleSystemPrompt)
+	systemBlocks, err := json.Marshal([]map[string]string{{"type": "text", "text": "You are Claude Code."}, {"type": "text", "text": titleSystemPrompt}})
+	if err != nil {
+		t.Fatalf("编码 system blocks 失败: %v", err)
+	}
 
 	tests := []struct {
 		name       string
@@ -126,8 +138,8 @@ func TestAuxiliaryClassificationLog(t *testing.T) {
 		secretAuth    = "Bearer TOP-SECRET-CREDENTIAL"
 	)
 	classification := classifyAuxiliaryRequest(
-		titleBody(json.RawMessage(`"Generate a concise coding session title (3-7 words). `+secretSystem+` Return JSON with a single title field."`), titleOnlyOutputConfig()),
-		titleMessages(json.RawMessage(`"<session>`+secretSession+`</session>"`)),
+		titleBody(jsonText(t, `Generate a concise coding session title (3-7 words). `+secretSystem+` Return JSON with a single title field.`), titleOnlyOutputConfig()),
+		titleMessages(jsonText(t, `<session>`+secretSession+`</session>`)),
 	)
 
 	var output bytes.Buffer
