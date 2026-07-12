@@ -9,6 +9,7 @@ import (
 type requestMeta struct {
 	ID                   uint64
 	RequestSessionID     string
+	RequestKind          requestKind
 	OriginalMessageCount int
 	Logger               *slog.Logger
 	entryOnce            sync.Once

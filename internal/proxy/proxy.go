@@ -278,11 +278,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	sessionID := extractSessionID(r)
 	meta := s.nextRequestMeta(sessionID)
 
-	// Phase B: 递增请求序号（DecayTracker 用）
 	requestSeq := 0
-	if s.Sawtooth != nil {
-		requestSeq = s.Sawtooth.IncrementRequestSeq(sessionID)
-	}
 
 	// Phase 2+: stubify + decay + collapse + frozen + cache 管线
 	// 仅在 TokenCounter 和 DecayTracker 已初始化时执行
@@ -337,6 +333,15 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		auxiliary := classifyAuxiliaryRequest(bodyMap, messages)
+		if auxiliary.Kind == requestKindSessionTitle {
+			meta.RequestKind = auxiliary.Kind
+			logAuxiliaryClassification(meta.Logger, auxiliary, len(messages))
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			s.forwardRaw(w, r, meta)
+			return
+		}
+
 		features := extractAgentRequestFeatures(r, bodyMap, messages)
 		logAgentRequestFeatures(meta.Logger, features)
 		classification := classifyAgentRequest(r, bodyMap, messages)
@@ -373,6 +378,11 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			r.Body = io.NopCloser(bytes.NewReader(newBody))
 			s.forwardRaw(w, r, meta)
 			return
+		}
+
+		// Phase B: 只有进入有状态主请求管线时才递增请求序号（DecayTracker 用）。
+		if s.Sawtooth != nil {
+			requestSeq = s.Sawtooth.IncrementRequestSeq(sessionID)
 		}
 		messages = historyMessages
 
