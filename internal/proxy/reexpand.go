@@ -14,7 +14,6 @@ type RecallSignalKind string
 
 const (
 	RecallSignalDeepSearch RecallSignalKind = "deep_search"
-	RecallSignalExactPath  RecallSignalKind = "exact_path"
 	RecallSignalRecovery   RecallSignalKind = "recovery_intent"
 	maxRecallSignals                        = 3
 )
@@ -44,7 +43,8 @@ var recallCommonWords = map[string]bool{
 	"恢复": true, "找回": true, "之前": true, "存档": true, "搜索": true,
 }
 
-// extractRecallSignals 只接受 deep_search、精确路径和窄恢复意图。
+// extractRecallSignals 只接受 deep_search 和窄恢复意图。
+// 路径本身不授予 Archive 搜索资格，只作为合法 provenance 的精确匹配修饰。
 func extractRecallSignals(messages []Message) []RecallSignal {
 	latest := getLatestUserText(messages)
 	if latest == "" {
@@ -60,10 +60,6 @@ func extractRecallSignals(messages []Message) []RecallSignal {
 		}
 		seen[key] = true
 		signals = append(signals, signal)
-	}
-
-	for _, path := range extractFilePaths(latest) {
-		add(RecallSignal{Kind: RecallSignalExactPath, Query: path, Terms: []string{path}, ExactPath: path, MessageIdx: -1})
 	}
 
 	for msgIdx, msg := range messages {
@@ -99,7 +95,9 @@ func extractRecallSignals(messages []Message) []RecallSignal {
 		if !strings.Contains(lower, phrase) {
 			continue
 		}
-		if len(queryTerms) > 0 {
+		if path := exactPathInText(latest); path != "" {
+			add(RecallSignal{Kind: RecallSignalRecovery, Query: path, Terms: []string{path}, ExactPath: path, MessageIdx: -1})
+		} else if len(queryTerms) > 0 {
 			add(RecallSignal{Kind: RecallSignalRecovery, Query: strings.Join(queryTerms, " "), Terms: queryTerms, MessageIdx: -1})
 		}
 		break
