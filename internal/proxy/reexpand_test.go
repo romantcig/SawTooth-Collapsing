@@ -71,7 +71,7 @@ func buildBigTimeline(n int) []string {
 	return timeline
 }
 
-func TestRecallSignalRejectsCommonToolWords(t *testing.T) {
+func TestExtractRecallSignalsRejectsCommonToolWords(t *testing.T) {
 	messages := []Message{
 		{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"go test"}}]`)},
 		{Role: "user", Content: json.RawMessage(`"what did the bash tool request from the user"`)},
@@ -81,7 +81,7 @@ func TestRecallSignalRejectsCommonToolWords(t *testing.T) {
 	}
 }
 
-func TestRecallSignalDeepSearchRequiresOverlap(t *testing.T) {
+func TestExtractRecallSignalsDeepSearchRequiresOverlap(t *testing.T) {
 	messages := []Message{
 		{Role: "assistant", Content: json.RawMessage(`[{"type":"text","text":"[tool result archived → deep_search('flimflam parser warbler')]"}]`)},
 		{Role: "user", Content: json.RawMessage(`"explain the parser"`)},
@@ -97,11 +97,69 @@ func TestRecallSignalDeepSearchRequiresOverlap(t *testing.T) {
 	}
 }
 
-func TestRecallSignalExactPathIsSingleStrongSignal(t *testing.T) {
-	messages := []Message{{Role: "user", Content: json.RawMessage(`"restore C:\\work\\src\\proxy.go"`)}}
+func TestExtractRecallSignalsPlainPathsHaveNoProvenance(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+	}{
+		{name: "Windows 文件", text: `请检查 C:\Users\name\project\file.go`},
+		{name: "Unix 文件", text: `please inspect /home/name/project/file.go`},
+		{name: "相对文件", text: `Read internal/proxy/file.go and explain it`},
+		{name: "Windows 目录", text: `Bash 工作目录是 C:\Users\name\project\internal\proxy\`},
+		{name: "Unix 目录", text: `search /home/name/project/internal/proxy/ for files`},
+		{name: "多路径列表", text: `Edit C:\work\a.go, /home/name/b.go, internal/proxy/c.go`},
+		{name: "公共词与路径", text: `archive search Read Bash Grep internal/proxy/file.go`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			messages := []Message{{Role: "user", Content: mustRawJSON(t, tt.text)}}
+			if got := extractRecallSignals(messages); len(got) != 0 {
+				t.Fatalf("普通路径不应生成 Archive 信号: %+v", got)
+			}
+		})
+	}
+}
+
+func TestExtractRecallSignalsDeepSearchPreservesExactPathProvenance(t *testing.T) {
+	path := `C:\work\src\proxy.go`
+	stub := "[tool result archived → deep_search('" + path + "')]"
+	messages := []Message{
+		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "text", Text: stub}})},
+		{Role: "user", Content: mustRawJSON(t, "please inspect "+path)},
+	}
+
 	got := extractRecallSignals(messages)
-	if len(got) != 1 || got[0].Kind != RecallSignalExactPath || got[0].ExactPath != `C:\work\src\proxy.go` {
-		t.Fatalf("exact path signal=%+v", got)
+	if len(got) != 1 {
+		t.Fatalf("deep_search 精确路径信号数=%d，期望 1: %+v", len(got), got)
+	}
+	signal := got[0]
+	if signal.Kind != RecallSignalDeepSearch || signal.Query != path || signal.ExactPath != path || signal.MessageIdx != 0 || signal.StubText != stub {
+		t.Fatalf("deep_search 精确路径 provenance=%+v", signal)
+	}
+}
+
+func TestExtractRecallSignalsRecoveryIntentOwnsExactPathProvenance(t *testing.T) {
+	path := `C:\work\src\proxy.go`
+	tests := []struct {
+		name string
+		text string
+	}{
+		{name: "English", text: "restore archive from " + path},
+		{name: "中文", text: "请恢复存档 " + path},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractRecallSignals([]Message{{Role: "user", Content: mustRawJSON(t, tt.text)}})
+			if len(got) != 1 {
+				t.Fatalf("恢复意图信号数=%d，期望 1: %+v", len(got), got)
+			}
+			signal := got[0]
+			if signal.Kind != RecallSignalRecovery || signal.Query != path || signal.ExactPath != path || !reflect.DeepEqual(signal.Terms, []string{path}) || signal.MessageIdx != -1 {
+				t.Fatalf("恢复意图路径 provenance=%+v", signal)
+			}
+		})
 	}
 }
 
