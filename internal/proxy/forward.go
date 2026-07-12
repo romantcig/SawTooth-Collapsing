@@ -509,7 +509,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 				if msg, ok := data["message"].(map[string]any); ok {
 					if usage, ok := msg["usage"].(map[string]any); ok {
 						s.writeUsageDebugFacts(meta, timestamp, usage)
-						if s.Sawtooth != nil {
+						if s.Sawtooth != nil && meta.tracksSawtoothState() {
 							s.Sawtooth.UpdateAfterResponse(sessionID, totalInputTokens(usage), messageCount)
 						}
 						usageRecorded = true
@@ -655,14 +655,12 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *re
 			// 解析失败，原样转发（T-02-05）
 			logger.Warn("无法解析上游 JSON 响应，原样转发", "error", err)
 		} else {
-			// 在客户端 usage deflation 之前，以完整输入空间更新 Sawtooth。
-			if s.Sawtooth != nil {
-				if usage, ok := body["usage"].(map[string]any); ok {
-					s.writeUsageDebugFacts(meta, timestamp, usage)
+			// 在客户端 usage deflation 之前记录完整 usage；只有有状态请求写回 Sawtooth。
+			if usage, ok := body["usage"].(map[string]any); ok {
+				s.writeUsageDebugFacts(meta, timestamp, usage)
+				if s.Sawtooth != nil && meta.tracksSawtoothState() {
 					s.Sawtooth.UpdateAfterResponse(sessionID, totalInputTokens(usage), messageCount)
 				}
-			} else if usage, ok := body["usage"].(map[string]any); ok {
-				s.writeUsageDebugFacts(meta, timestamp, usage)
 			}
 
 			if usage, ok := body["usage"].(map[string]any); ok {

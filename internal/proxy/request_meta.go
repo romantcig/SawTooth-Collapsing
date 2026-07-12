@@ -21,6 +21,12 @@ type requestMeta struct {
 	responseBodyOnce     sync.Once
 }
 
+// tracksSawtoothState 使用默认安全策略：nil 与零值都保持现有状态跟踪，
+// 只有经过高置信分类的 session_title 请求关闭响应后的 Sawtooth 写回。
+func (m *requestMeta) tracksSawtoothState() bool {
+	return m == nil || m.RequestKind != requestKindSessionTitle
+}
+
 func (m *requestMeta) debugBodyOnce(stage debugBodyStage) *sync.Once {
 	switch stage {
 	case debugBodyStageRawInbound:
