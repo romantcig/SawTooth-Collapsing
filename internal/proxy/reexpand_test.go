@@ -172,6 +172,146 @@ func TestSearchAndExpandTriggerRequiresExplicitSignal(t *testing.T) {
 	}
 }
 
+func TestSearchAndExpandPlainPathZeroSideEffects(t *testing.T) {
+	tc, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	tests := []struct {
+		name string
+		text string
+	}{
+		{name: "标题风格 session 文本", text: `<session>Summarize work in C:\Users\name\project\internal\proxy\file.go</session>`},
+		{name: "普通主请求", text: `Please Read internal/proxy/file.go and compare /home/name/project/file.go`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "plain-path-probe.db"))
+			if err != nil {
+				t.Fatalf("NewSQLiteStore: %v", err)
+			}
+			// 关闭后的 store 是 DB 搜索故障探针：若零信号短路失效，搜索会立即报错并产生尝试/汇总。
+			if err := store.Close(); err != nil {
+				t.Fatalf("Close probe store: %v", err)
+			}
+
+			messages := []Message{{Role: "user", Content: mustRawJSON(t, tt.text)}}
+			wantMessages := append([]Message(nil), messages...)
+			budget := &Budget{ReExpansion: 4321}
+			beforeBudget := budget.RemainingReExpansion()
+			var logs bytes.Buffer
+			meta := newRequestMeta(81, "plain-path-session")
+			meta.Logger = slog.New(NewLogHandler(&logs, slog.LevelDebug)).With(
+				"request_id", meta.ID,
+				"request_session_id", meta.RequestSessionID,
+			)
+
+			outcome := searchAndExpandWithMeta(messages, store, 100000, tc, budget, meta)
+			if !reflect.DeepEqual(outcome.Messages, wantMessages) {
+				t.Fatalf("messages 发生变化:\ngot:  %#v\nwant: %#v", outcome.Messages, wantMessages)
+			}
+			if outcome.Attempted || outcome.Candidates != 0 || outcome.Selected != 0 || outcome.Injected != 0 || outcome.Discarded != 0 || outcome.TokenCost != 0 {
+				t.Fatalf("普通路径产生了 Archive 副作用: %+v", outcome)
+			}
+			if got := budget.RemainingReExpansion(); got != beforeBudget || outcome.BudgetRemaining != beforeBudget {
+				t.Fatalf("预算 remaining=%d, outcome=%d，期望都为 %d", got, outcome.BudgetRemaining, beforeBudget)
+			}
+			output := logs.String()
+			if strings.Contains(output, "Archive 召回汇总") || strings.Contains(output, "archive 搜索失败") {
+				t.Fatalf("普通路径触及了 DB 搜索或汇总日志:\n%s", output)
+			}
+		})
+	}
+}
+
+func TestSearchAndExpandNoRecallSummaryForPlainPath(t *testing.T) {
+	tc, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "no-summary.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	var logs bytes.Buffer
+	meta := newRequestMeta(82, "no-summary-session")
+	meta.Logger = slog.New(NewLogHandler(&logs, slog.LevelDebug))
+	messages := []Message{{Role: "user", Content: mustRawJSON(t, `Archive search for C:\work\src\proxy.go with Read and Grep`)}}
+	outcome := searchAndExpandWithMeta(messages, store, 100000, tc, &Budget{ReExpansion: 9999}, meta)
+	if outcome.Attempted {
+		t.Fatalf("普通路径 outcome.Attempted=true: %+v", outcome)
+	}
+	if got := strings.Count(logs.String(), "Archive 召回汇总"); got != 0 {
+		t.Fatalf("Archive 召回汇总数=%d，期望 0:\n%s", got, logs.String())
+	}
+}
+
+func TestSearchAndExpandDeepSearchExactPath(t *testing.T) {
+	store, tc, path := seedExactPathRecallStore(t)
+	stub := "[tool result archived → deep_search('" + path + "')]"
+	messages := []Message{
+		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "text", Text: stub}})},
+		{Role: "user", Content: mustRawJSON(t, "please inspect "+path)},
+	}
+	outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "request-session")
+	if !outcome.Attempted || outcome.Candidates != 1 || outcome.Selected != 1 || outcome.Injected != 1 || outcome.TokenCost <= 0 {
+		t.Fatalf("deep_search ExactPath outcome=%+v", outcome)
+	}
+	blocks, _ := parseContent(outcome.Messages[0].Content)
+	if len(blocks) != 1 || !strings.Contains(blocks[0].Text, "exact path archive") || strings.Contains(blocks[0].Text, "deep_search") {
+		t.Fatalf("deep_search ExactPath 未原位恢复: %+v", blocks)
+	}
+
+	partial := `internal/proxy/proxy.go`
+	partialStub := "[tool result archived → deep_search('" + partial + "')]"
+	partialMessages := []Message{
+		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "text", Text: partialStub}})},
+		{Role: "user", Content: mustRawJSON(t, "please inspect "+partial)},
+	}
+	partialOutcome := searchAndExpandForSession(partialMessages, store, 100000, tc, &Budget{ReExpansion: 100000}, "request-session")
+	if !partialOutcome.Attempted || partialOutcome.Candidates != 0 || partialOutcome.Injected != 0 || !reflect.DeepEqual(partialOutcome.Messages, partialMessages) {
+		t.Fatalf("不完整路径不应宽松命中: %+v", partialOutcome)
+	}
+}
+
+func TestSearchAndExpandRecoveryIntent(t *testing.T) {
+	store, tc, path := seedExactPathRecallStore(t)
+	messages := []Message{{Role: "user", Content: mustRawJSON(t, "请恢复存档 "+path)}}
+	outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "request-session")
+	if !outcome.Attempted || outcome.Candidates != 1 || outcome.Selected != 1 || outcome.Injected != 1 || outcome.TokenCost <= 0 {
+		t.Fatalf("明确恢复意图 outcome=%+v", outcome)
+	}
+	if payload := singleRecallPayload(t, outcome.Messages); !strings.Contains(payload, "exact path archive") {
+		t.Fatalf("恢复意图未注入精确路径存档: %q", payload)
+	}
+}
+
+func seedExactPathRecallStore(t *testing.T) (*SQLiteStore, *TokenCounter, string) {
+	t.Helper()
+	tc, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "exact-path.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	path := `C:\work\src\proxy.go`
+	block := ArchiveBlock{
+		ID: "exact-path", SessionID: "archive-session", BlockRangeStart: 1, BlockRangeEnd: 2,
+		MessageCount: 2, EstimatedTokens: 80, SummaryText: "exact path archive",
+		Keywords: []KeywordEntry{{Word: path, Source: "file_path"}},
+	}
+	if err := store.SaveArchive(block); err != nil {
+		t.Fatalf("SaveArchive: %v", err)
+	}
+	return store, tc, path
+}
+
 func TestSearchAndExpandTriggerCrossSessionNeedsThreeTerms(t *testing.T) {
 	tc, err := NewTokenCounter()
 	if err != nil {
@@ -406,7 +546,7 @@ func TestSearchAndExpandToolPairsAppendToLatestUser(t *testing.T) {
 
 	messages := []Message{
 		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "tool_use", ID: "tool-1", Name: "Read"}})},
-		{Role: "user", Content: mustRawJSON(t, []ContentBlock{{Type: "tool_result", ToolUseID: "tool-1", Content: "ok"}, {Type: "text", Text: "restore " + path}})},
+		{Role: "user", Content: mustRawJSON(t, []ContentBlock{{Type: "tool_result", ToolUseID: "tool-1", Content: "ok"}, {Type: "text", Text: "restore archive from " + path}})},
 	}
 	outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "current")
 	if len(outcome.Messages) != len(messages) {
