@@ -236,6 +236,82 @@ func TestHandleMessagesSubagentNoSideEffects(t *testing.T) {
 	testHandleMessagesDirectAgentBypass(t)
 }
 
+func TestHandleMessagesSessionTitleRequestState(t *testing.T) {
+	const sessionID = "session-title-request-state"
+	rawBody, err := os.ReadFile(filepath.Join("testdata", "auxiliary", "session-title.json"))
+	if err != nil {
+		t.Fatalf("读取 session title fixture 失败: %v", err)
+	}
+
+	var forwardedBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwardedBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("读取上游请求失败: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[]}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	searchCalls := 0
+	server.searchAndExpandFn = func(messages []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, _ *requestMeta) RecallOutcome {
+		searchCalls++
+		return RecallOutcome{Messages: messages}
+	}
+	frozenMessages := []Message{{Role: "user", Content: mustMarshal("frozen-title-sentinel")}}
+	server.Frozen.Store(sessionID, frozenMessages, 1, frozenMessages[0], 10, 20)
+	frozenBefore := server.Frozen.LengthFor(sessionID)
+	archivesBefore := archiveCount(t, server.Store)
+	requestSeqBefore := server.Sawtooth.GetRequestSeq(sessionID)
+
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(rawBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Claude-Code-Session-Id", sessionID)
+	recorder := httptest.NewRecorder()
+	server.HandleMessages(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("HandleMessages status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	if !bytes.Equal(forwardedBody, rawBody) {
+		t.Fatalf("标题请求未原字节直通\nforwarded: %s\nraw:       %s", forwardedBody, rawBody)
+	}
+	if searchCalls != 0 {
+		t.Fatalf("标题请求调用 Archive 搜索 %d 次", searchCalls)
+	}
+	if got := server.Sawtooth.GetRequestSeq(sessionID); got != requestSeqBefore {
+		t.Fatalf("request sequence=%d, want unchanged %d", got, requestSeqBefore)
+	}
+	if got := server.Frozen.LengthFor(sessionID); got != frozenBefore {
+		t.Fatalf("Frozen length=%d, want unchanged %d", got, frozenBefore)
+	}
+	if got := archiveCount(t, server.Store); got != archivesBefore {
+		t.Fatalf("Archive rows=%d, want unchanged %d", got, archivesBefore)
+	}
+
+	gotLogs := logs.String()
+	if strings.Count(gotLogs, "辅助请求安全直通") != 1 {
+		t.Fatalf("标题分类 Info 数量不正确: %s", gotLogs)
+	}
+	for _, field := range []string{"request_kind=session_title", "request_reason=title_schema", "message_count=1", "request_id="} {
+		if !strings.Contains(gotLogs, field) {
+			t.Errorf("分类审计缺少 %q: %s", field, gotLogs)
+		}
+	}
+	for _, secret := range []string{"Review the proxy request classifier", titleSystemPrompt, "Harmless fixture variation"} {
+		if strings.Contains(gotLogs, secret) {
+			t.Fatalf("分类审计泄漏请求正文 %q: %s", secret, gotLogs)
+		}
+	}
+}
+
 func testHandleMessagesDirectAgentBypass(t *testing.T, _ ...string) {
 	t.Helper()
 	var forwardedBodies [][]byte
