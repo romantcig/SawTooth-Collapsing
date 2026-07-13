@@ -525,11 +525,11 @@ func TestForwardRawFailureLogSensitiveBoundary(t *testing.T) {
 	)
 	s := NewServer(Config{Proxy: ProxyConfig{Target: "https://ordinary-target.invalid"}})
 	s.HTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		return nil, &url.Error{
+		return nil, fmt.Errorf("transport wrapper: %w", &url.Error{
 			Op:  "Post",
 			URL: "https://" + userinfoSecret + ":password@diagnostic-host.invalid/diagnostic-path?diagnostic-query=1",
 			Err: io.ErrUnexpectedEOF,
-		}
+		})
 	})}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[],"sentinel":"`+bodySecret+`"}`))

@@ -2,14 +2,20 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
+	"net/http/httptrace"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -324,15 +330,25 @@ func parseJSON(body []byte) []byte {
 	return data
 }
 
+type upstreamResponseResult struct {
+	err       error
+	committed bool
+}
+
+type upstreamFailureDecision struct {
+	status        int
+	timeoutSource string
+	silent        bool
+}
+
 // forwardRaw 核心转发方法：SSE 流式 / JSON 非流式转发 + usage deflation + debug 落盘。
 func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *requestMeta) {
 	const maxBodySize = 10 * 1024 * 1024 // 10 MB（T-02-04）
 	logger := meta.Logger
 
-	// 步骤 1: 读取请求体
 	limitedReader := io.LimitReader(r.Body, maxBodySize+1)
 	body, err := io.ReadAll(limitedReader)
-	r.Body.Close()
+	_ = r.Body.Close()
 	if err != nil {
 		logger.Error("读取请求体失败", "error", err)
 		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
@@ -342,48 +358,41 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 		logger.Warn("请求体超限", "size", len(body))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusRequestEntityTooLarge)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error": "Request Entity Too Large",
-		})
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Request Entity Too Large"})
 		return
 	}
 
-	// 提取 model 和 message_count
 	model := extractModelFromBody(body)
 	messageCount := countMessages(body)
+	stream := streamRequest(body)
 	meta.logEntry(model, messageCount)
-
 	logger.Info("上游请求发送",
 		"forwarded_message_count", messageCount,
 		"model", model,
 	)
 
 	timestamp := time.Now()
-	// 未进入结构化压缩管线（未初始化或解析降级）时，当前 body 同时是 raw inbound。
-	// 正常管线已在任何变换前写入 raw，requestMeta 的 once 会阻止最终 body 覆盖它。
 	s.writeRequestDebugFacts(meta, timestamp, debugStageRawInbound, body, r)
 	s.writeRequestDebugFacts(meta, timestamp, debugStageForwarded, body, r)
-
-	// 步骤 2: Debug 写请求体。直通/解析降级路径中当前 body 同时是 raw inbound；
-	// 正常结构化管线已提前写入真正的 raw，once 会阻止被最终 body 覆盖。
 	s.writeFullBodyDebug(meta, timestamp, debugBodyStageRawInbound, body, r.Header, model, messageCount)
 	s.writeFullBodyDebug(meta, timestamp, debugBodyStageForwarded, body, r.Header, model, messageCount)
 
-	// 步骤 3: 创建上游请求
+	upstreamStartedAt := time.Now()
+	tracker := newUpstreamPhaseTracker()
+	hardContext, hardCancel := withProxyHardLimit(r.Context(), s.Config.Transport.HardTimeout)
+	defer hardCancel()
+	upstreamContext := withStreamMarker(hardContext, stream)
+	upstreamContext = httptrace.WithClientTrace(upstreamContext, tracker.trace())
+
 	targetURL := strings.TrimRight(s.Config.Proxy.Target, "/") + r.URL.RequestURI()
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, strings.NewReader(string(body)))
+	upstreamReq, err := http.NewRequestWithContext(upstreamContext, r.Method, targetURL, bytes.NewReader(body))
 	if err != nil {
-		logger.Error("创建上游请求失败", "error", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadGateway)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error":  "Bad Gateway",
-			"detail": "failed to create upstream request",
-		})
+		logUpstreamFailure(logger, "创建上游请求失败", err, upstreamStartedAt, tracker, "upstream_transport", stream, false)
+		writeGatewayJSON(w, http.StatusBadGateway, "failed to create upstream request")
 		return
 	}
+	upstreamReq.ContentLength = int64(len(body))
 
-	// 复制 headers（包括 Authorization）到上游请求
 	for key, values := range r.Header {
 		for _, value := range values {
 			upstreamReq.Header.Add(key, value)
@@ -392,59 +401,162 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 	if upstreamReq.Header.Get("Content-Type") == "" {
 		upstreamReq.Header.Set("Content-Type", "application/json")
 	}
-
-	// 删除 Accept-Encoding，强制上游返回未压缩响应
+	upstreamReq.Header.Del("Connection")
+	upstreamReq.Header.Del("Content-Length")
 	upstreamReq.Header.Del("Accept-Encoding")
 
-	// 发送上游请求
 	resp, err := s.HTTPClient.Do(upstreamReq)
 	if err != nil {
-		// 网络层错误 → 502 Bad Gateway（D-09）
-		logger.Error("上游请求失败", "error", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadGateway)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error":  "Bad Gateway",
-			"detail": err.Error(),
-		})
+		decision := classifyUpstreamFailure(r.Context(), upstreamContext, tracker, nil, err, stream)
+		logUpstreamFailure(logger, "上游请求失败", err, upstreamStartedAt, tracker, decision.timeoutSource, stream, false)
+		if decision.silent {
+			return
+		}
+		writeClassifiedGatewayError(w, decision, err.Error(), true)
 		return
 	}
+	tracker.set(upstreamPhaseReadingBody)
+	resp.Body = newIdleTimeoutBody(resp.Body, s.Config.Transport.ResponseIdleTimeout)
 	defer resp.Body.Close()
 
-	// 步骤 4: 处理响应
-	contentType := resp.Header.Get("Content-Type")
-
-	// 非 2xx: 透传状态码 + body，记录 warn（D-08）
+	var result upstreamResponseResult
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		logger.Warn("上游返回非 2xx",
-			"status", resp.StatusCode,
-		)
-
-		// 复制响应 headers
-		for key, values := range resp.Header {
-			for _, value := range values {
-				w.Header().Add(key, value)
-			}
-		}
-		w.WriteHeader(resp.StatusCode)
-
-		respBody, readErr := io.ReadAll(resp.Body)
-		if readErr != nil {
-			logger.Warn("读取非 2xx 响应体失败", "error", readErr)
-		}
-		_, _ = w.Write(respBody)
-
-		// Debug 写非 2xx 响应
-		s.writeFullBodyDebug(meta, timestamp, debugBodyStageResponse, respBody, resp.Header, model, messageCount)
+		result = s.handleNon2xx(w, resp, meta, timestamp, model, messageCount)
+	} else if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		result = s.handleSSE(w, resp, meta, timestamp, model, messageCount)
+	} else {
+		result = s.handleJSON(w, resp, meta, timestamp, model, messageCount)
+	}
+	if result.err == nil {
 		return
 	}
 
-	// 判定流式/非流式
-	if strings.Contains(contentType, "text/event-stream") {
-		s.handleSSE(w, resp, meta, timestamp, model, messageCount)
-	} else {
-		s.handleJSON(w, resp, meta, timestamp, model, messageCount)
+	decision := classifyUpstreamFailure(r.Context(), upstreamContext, tracker, resp.Body, result.err, stream)
+	logUpstreamFailure(logger, "读取上游响应失败", result.err, upstreamStartedAt, tracker, decision.timeoutSource, stream, result.committed)
+	if decision.silent || result.committed {
+		return
 	}
+	writeClassifiedGatewayError(w, decision, "failed to read upstream response", false)
+}
+
+func streamRequest(body []byte) bool {
+	var envelope struct {
+		Stream bool `json:"stream"`
+	}
+	return json.Unmarshal(body, &envelope) == nil && envelope.Stream
+}
+
+func classifyUpstreamFailure(inboundContext, upstreamContext context.Context, tracker *upstreamPhaseTracker, body io.ReadCloser, err error, stream bool) upstreamFailureDecision {
+	if inboundContext.Err() != nil {
+		return upstreamFailureDecision{timeoutSource: "downstream_context", silent: true}
+	}
+	if errors.Is(context.Cause(upstreamContext), errProxyHardLimit) {
+		return upstreamFailureDecision{status: http.StatusGatewayTimeout, timeoutSource: "proxy_hard_limit"}
+	}
+	if errors.Is(err, errProxyResponseIdleTimeout) || idleBodyTimedOut(body) {
+		return upstreamFailureDecision{status: http.StatusGatewayTimeout, timeoutSource: "response_idle_timeout"}
+	}
+	if tracker.current() == upstreamPhaseAwaitingHeaders && isTimeoutError(err) {
+		source := "non_stream_header_timeout"
+		if stream {
+			source = "stream_header_timeout"
+		}
+		return upstreamFailureDecision{status: http.StatusGatewayTimeout, timeoutSource: source}
+	}
+	return upstreamFailureDecision{status: http.StatusBadGateway, timeoutSource: "upstream_transport"}
+}
+
+func idleBodyTimedOut(body io.ReadCloser) bool {
+	idleBody, ok := body.(*idleTimeoutBody)
+	return ok && idleBody.timedOut()
+}
+
+func isTimeoutError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func writeClassifiedGatewayError(w http.ResponseWriter, decision upstreamFailureDecision, fallbackDetail string, transportError bool) {
+	if decision.status == http.StatusGatewayTimeout {
+		writeGatewayJSON(w, http.StatusGatewayTimeout, "upstream request timed out")
+		return
+	}
+	detail := fallbackDetail
+	if !transportError {
+		detail = "failed to read upstream response"
+	}
+	writeGatewayJSON(w, http.StatusBadGateway, detail)
+}
+
+func writeGatewayJSON(w http.ResponseWriter, status int, detail string) {
+	w.Header().Del("Connection")
+	w.Header().Del("Content-Encoding")
+	w.Header().Del("Content-Length")
+	w.Header().Del("Cache-Control")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"error":  http.StatusText(status),
+		"detail": detail,
+	})
+}
+
+func logUpstreamFailure(logger *slog.Logger, message string, err error, started time.Time, tracker *upstreamPhaseTracker, timeoutSource string, stream, committed bool) {
+	fields := []any{
+		"error", safeUpstreamError(err),
+		"elapsed_ms", time.Since(started).Milliseconds(),
+		"phase", tracker.current(),
+		"timeout_source", timeoutSource,
+		"stream", stream,
+	}
+	if committed {
+		fields = append(fields, "response_committed", true)
+	}
+	logger.Error(message, fields...)
+}
+
+func safeUpstreamError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return safeURLError(urlErr)
+	}
+	return err.Error()
+}
+
+func safeURLError(err *url.Error) string {
+	safeURL := err.URL
+	if parsed, parseErr := url.Parse(err.URL); parseErr == nil {
+		parsed.User = nil
+		safeURL = parsed.String()
+	}
+	return fmt.Sprintf("%s %q: %s", err.Op, safeURL, safeUpstreamError(err.Err))
+}
+
+func copyResponseHeaders(dst http.Header, src http.Header) {
+	for key, values := range src {
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func (s *Server) handleNon2xx(w http.ResponseWriter, resp *http.Response, meta *requestMeta, timestamp time.Time, model string, messageCount int) upstreamResponseResult {
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return upstreamResponseResult{err: err}
+	}
+	meta.Logger.Warn("上游返回非 2xx", "status", resp.StatusCode)
+	copyResponseHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(respBody)
+	s.writeFullBodyDebug(meta, timestamp, debugBodyStageResponse, respBody, resp.Header, model, messageCount)
+	return upstreamResponseResult{committed: true}
 }
 
 // countMessages 从请求体 JSON 中提取 messages 数组长度。
@@ -461,33 +573,25 @@ func countMessages(body []byte) int {
 // handleSSE 处理 SSE 流式响应。
 // 逐行扫描，对 message_start 和 message_delta 事件执行 usage deflation，
 // 其他事件原样转发。每个事件后 flush。
-func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *requestMeta, timestamp time.Time, model string, messageCount int) {
+func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *requestMeta, timestamp time.Time, model string, messageCount int) upstreamResponseResult {
 	sessionID := meta.RequestSessionID
-	logger := meta.Logger
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		logger.Error("ResponseWriter 不支持 Flush")
-		return
+		return upstreamResponseResult{err: errors.New("ResponseWriter 不支持 Flush")}
 	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
 
 	// gzip 解压（若上游返回了压缩响应）
 	var bodyReader io.Reader = resp.Body
+	compressed := false
 	if resp.Header.Get("Content-Encoding") == "gzip" {
 		gzReader, err := gzip.NewReader(resp.Body)
 		if err != nil {
-			logger.Error("gzip 解压失败", "error", err)
-			http.Error(w, "Failed to decompress SSE stream", http.StatusBadGateway)
-			return
+			return upstreamResponseResult{err: fmt.Errorf("SSE gzip 解压失败: %w", err)}
 		}
 		defer gzReader.Close()
 		bodyReader = gzReader
+		compressed = true
 	}
-
-	w.WriteHeader(http.StatusOK)
 
 	scanner := bufio.NewScanner(bodyReader)
 	// 1 MB 行缓冲区处理大事件
@@ -496,6 +600,34 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 	var eventBuf []string
 	var fullResponse strings.Builder
 	usageRecorded := false
+	committed := false
+	commit := func() {
+		if committed {
+			return
+		}
+		copyResponseHeaders(w.Header(), resp.Header)
+		if compressed {
+			w.Header().Del("Content-Encoding")
+			w.Header().Del("Content-Length")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+		committed = true
+	}
+	flushEvent := func(event []string) {
+		commit()
+		processed := s.processSSEEvent(event)
+		for _, line := range processed {
+			_, _ = fmt.Fprintf(w, "%s\n", line)
+			fullResponse.WriteString(line)
+			fullResponse.WriteString("\n")
+		}
+		_, _ = fmt.Fprint(w, "\n")
+		fullResponse.WriteString("\n")
+		flusher.Flush()
+	}
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -521,15 +653,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 		if line == "" {
 			// 空行 = 事件边界，flush 整个事件
 			if len(eventBuf) > 0 {
-				processed := s.processSSEEvent(eventBuf)
-				for _, l := range processed {
-					fmt.Fprintf(w, "%s\n", l)
-					fullResponse.WriteString(l)
-					fullResponse.WriteString("\n")
-				}
-				fmt.Fprintf(w, "\n")
-				fullResponse.WriteString("\n")
-				flusher.Flush()
+				flushEvent(eventBuf)
 				eventBuf = eventBuf[:0]
 			}
 			continue
@@ -539,23 +663,17 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 
 	// 处理末尾可能遗漏的事件（无尾随空行）
 	if len(eventBuf) > 0 {
-		processed := s.processSSEEvent(eventBuf)
-		for _, l := range processed {
-			fmt.Fprintf(w, "%s\n", l)
-			fullResponse.WriteString(l)
-			fullResponse.WriteString("\n")
-		}
-		fmt.Fprintf(w, "\n")
-		fullResponse.WriteString("\n")
-		flusher.Flush()
+		flushEvent(eventBuf)
 	}
 
-	if err := scanner.Err(); err != nil {
-		logger.Warn("SSE 流读取错误", "error", err)
-	}
-
-	// 步骤 5: Debug 写 SSE 响应（完整拼接文本）
 	s.writeFullBodyDebug(meta, timestamp, debugBodyStageResponse, []byte(fullResponse.String()), resp.Header, model, messageCount)
+	if err := scanner.Err(); err != nil {
+		return upstreamResponseResult{err: err, committed: committed}
+	}
+	if !committed {
+		commit()
+	}
+	return upstreamResponseResult{committed: true}
 }
 
 // processSSEEvent 处理单个 SSE 事件。
@@ -617,35 +735,25 @@ func (s *Server) processSSEEvent(event []string) []string {
 
 // handleJSON 处理 JSON 非流式响应。
 // 2xx 响应 deflate usage，非 2xx 不修改。
-func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *requestMeta, timestamp time.Time, model string, messageCount int) {
+func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *requestMeta, timestamp time.Time, model string, messageCount int) upstreamResponseResult {
 	sessionID := meta.RequestSessionID
 	logger := meta.Logger
 	// gzip 解压（若上游返回了压缩响应）
 	var bodyReader io.Reader = resp.Body
+	compressed := false
 	if resp.Header.Get("Content-Encoding") == "gzip" {
 		gzReader, err := gzip.NewReader(resp.Body)
 		if err != nil {
-			logger.Error("gzip 解压失败", "error", err)
-			http.Error(w, "Failed to decompress response", http.StatusBadGateway)
-			return
+			return upstreamResponseResult{err: fmt.Errorf("JSON gzip 解压失败: %w", err)}
 		}
 		defer gzReader.Close()
 		bodyReader = gzReader
-		// 解压后删除 Content-Encoding 和 Content-Length，防止泄漏给客户端
-		resp.Header.Del("Content-Encoding")
-		resp.Header.Del("Content-Length")
+		compressed = true
 	}
 
 	respBody, err := io.ReadAll(bodyReader)
 	if err != nil {
-		logger.Error("读取上游 JSON 响应失败", "error", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadGateway)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error":  "Bad Gateway",
-			"detail": "failed to read upstream response",
-		})
-		return
+		return upstreamResponseResult{err: err}
 	}
 
 	// 2xx: deflate usage
@@ -672,15 +780,15 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *re
 		}
 	}
 
-	// 复制响应 headers
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
+	copyResponseHeaders(w.Header(), resp.Header)
+	if compressed {
+		w.Header().Del("Content-Encoding")
+		w.Header().Del("Content-Length")
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(respBody)
 
 	// 步骤 5: Debug 写 JSON 响应
 	s.writeFullBodyDebug(meta, timestamp, debugBodyStageResponse, respBody, resp.Header, model, messageCount)
+	return upstreamResponseResult{committed: true}
 }
