@@ -34,6 +34,69 @@ type ProxyConfig struct {
 	Deflation float64 `yaml:"deflation"`
 }
 
+// TransportConfig 控制 Sawtooth 到上游 API 的分阶段网络生命周期。
+// 所有 duration 的 0 值都表示显式禁用对应保护。
+type TransportConfig struct {
+	DialTimeout            time.Duration `yaml:"dial_timeout"`
+	TLSHandshakeTimeout    time.Duration `yaml:"tls_handshake_timeout"`
+	StreamHeaderTimeout    time.Duration `yaml:"stream_header_timeout"`
+	NonStreamHeaderTimeout time.Duration `yaml:"non_stream_header_timeout"`
+	ResponseIdleTimeout    time.Duration `yaml:"response_idle_timeout"`
+	HardTimeout            time.Duration `yaml:"hard_timeout"`
+}
+
+// UnmarshalYAML 兼容 yaml.v3 对 duration 字符串的原生解析，并额外接受裸标量 0。
+// yaml.v3 原生支持 "15s" 和字符串 "0"，但裸整数 0 不能直接解码到 time.Duration；
+// 配置契约要求 0 表示显式禁用，因此在 transport 分组边界统一补齐该语义。
+func (cfg *TransportConfig) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("transport 必须是 YAML mapping")
+	}
+	for index := 0; index+1 < len(node.Content); index += 2 {
+		key := node.Content[index].Value
+		value := node.Content[index+1]
+		known := key == "dial_timeout" ||
+			key == "tls_handshake_timeout" ||
+			key == "stream_header_timeout" ||
+			key == "non_stream_header_timeout" ||
+			key == "response_idle_timeout" ||
+			key == "hard_timeout"
+		if !known {
+			continue
+		}
+		duration, err := decodeTransportDuration(value)
+		if err != nil {
+			return fmt.Errorf("解析 transport.%s 失败: %w", key, err)
+		}
+		switch key {
+		case "dial_timeout":
+			cfg.DialTimeout = duration
+		case "tls_handshake_timeout":
+			cfg.TLSHandshakeTimeout = duration
+		case "stream_header_timeout":
+			cfg.StreamHeaderTimeout = duration
+		case "non_stream_header_timeout":
+			cfg.NonStreamHeaderTimeout = duration
+		case "response_idle_timeout":
+			cfg.ResponseIdleTimeout = duration
+		case "hard_timeout":
+			cfg.HardTimeout = duration
+		}
+	}
+	return nil
+}
+
+func decodeTransportDuration(node *yaml.Node) (time.Duration, error) {
+	if node.Tag == "!!int" && node.Value == "0" {
+		return 0, nil
+	}
+	var duration time.Duration
+	if err := node.Decode(&duration); err != nil {
+		return 0, err
+	}
+	return duration, nil
+}
+
 // StubifyConfig stub 化与衰减配置 (Phase 2, D-04)
 type StubifyConfig struct {
 	// TokenThreshold 触发衰减处理的总 token 上限（默认 100000）
@@ -80,15 +143,16 @@ type ServerConfig struct {
 	Host string `yaml:"host"`
 }
 
-// Config 顶层配置，包含 server、proxy、debug、stubify、collapse、frozen、cache 分组
+// Config 顶层配置，包含 server、proxy、transport、debug、stubify、collapse、frozen、cache 分组
 type Config struct {
-	Server   ServerConfig   `yaml:"server"`
-	Proxy    ProxyConfig    `yaml:"proxy"`
-	Debug    DebugConfig    `yaml:"debug"`
-	Stubify  StubifyConfig  `yaml:"stubify"`
-	Collapse CollapseConfig `yaml:"collapse"`
-	Frozen   FrozenConfig   `yaml:"frozen"` // Phase 4: frozen prefix 配置 (D-13)
-	Cache    CacheConfig    `yaml:"cache"`  // Phase 4: cache_control 管理配置 (D-13)
+	Server    ServerConfig    `yaml:"server"`
+	Proxy     ProxyConfig     `yaml:"proxy"`
+	Transport TransportConfig `yaml:"transport"`
+	Debug     DebugConfig     `yaml:"debug"`
+	Stubify   StubifyConfig   `yaml:"stubify"`
+	Collapse  CollapseConfig  `yaml:"collapse"`
+	Frozen    FrozenConfig    `yaml:"frozen"` // Phase 4: frozen prefix 配置 (D-13)
+	Cache     CacheConfig     `yaml:"cache"`  // Phase 4: cache_control 管理配置 (D-13)
 }
 
 // DefaultConfig 返回所有字段均已设置默认值的 Config。
@@ -101,6 +165,14 @@ func DefaultConfig() Config {
 		Proxy: ProxyConfig{
 			Target:    "https://api.anthropic.com",
 			Deflation: 0.7,
+		},
+		Transport: TransportConfig{
+			DialTimeout:            15 * time.Second,
+			TLSHandshakeTimeout:    15 * time.Second,
+			StreamHeaderTimeout:    10 * time.Minute,
+			NonStreamHeaderTimeout: 30 * time.Minute,
+			ResponseIdleTimeout:    10 * time.Minute,
+			HardTimeout:            60 * time.Minute,
 		},
 		Debug: DebugConfig{
 			Enabled:  false,
@@ -156,10 +228,8 @@ func (s *Server) nextRequestMeta(requestSessionID string) *requestMeta {
 // 若 Debug.Enabled 且 DataDir 非空，自动创建数据目录。
 func NewServer(cfg Config) *Server {
 	s := &Server{
-		Config: cfg,
-		HTTPClient: &http.Client{
-			Timeout: 120 * time.Second, // SSE 长连接需要较长超时
-		},
+		Config:     cfg,
+		HTTPClient: newUpstreamHTTPClient(cfg.Transport),
 	}
 
 	// 调试模式下创建数据目录
@@ -197,6 +267,32 @@ func validateConfig(cfg *Config) {
 	if cfg.Proxy.Target == "" {
 		slog.Warn("target 为空，回退到默认值", "default", "https://api.anthropic.com")
 		cfg.Proxy.Target = "https://api.anthropic.com"
+	}
+
+	transportDefaults := DefaultConfig().Transport
+	if cfg.Transport.DialTimeout < 0 {
+		slog.Warn("非法 dial_timeout，回退到默认值", "value", cfg.Transport.DialTimeout, "default", transportDefaults.DialTimeout)
+		cfg.Transport.DialTimeout = transportDefaults.DialTimeout
+	}
+	if cfg.Transport.TLSHandshakeTimeout < 0 {
+		slog.Warn("非法 tls_handshake_timeout，回退到默认值", "value", cfg.Transport.TLSHandshakeTimeout, "default", transportDefaults.TLSHandshakeTimeout)
+		cfg.Transport.TLSHandshakeTimeout = transportDefaults.TLSHandshakeTimeout
+	}
+	if cfg.Transport.StreamHeaderTimeout < 0 {
+		slog.Warn("非法 stream_header_timeout，回退到默认值", "value", cfg.Transport.StreamHeaderTimeout, "default", transportDefaults.StreamHeaderTimeout)
+		cfg.Transport.StreamHeaderTimeout = transportDefaults.StreamHeaderTimeout
+	}
+	if cfg.Transport.NonStreamHeaderTimeout < 0 {
+		slog.Warn("非法 non_stream_header_timeout，回退到默认值", "value", cfg.Transport.NonStreamHeaderTimeout, "default", transportDefaults.NonStreamHeaderTimeout)
+		cfg.Transport.NonStreamHeaderTimeout = transportDefaults.NonStreamHeaderTimeout
+	}
+	if cfg.Transport.ResponseIdleTimeout < 0 {
+		slog.Warn("非法 response_idle_timeout，回退到默认值", "value", cfg.Transport.ResponseIdleTimeout, "default", transportDefaults.ResponseIdleTimeout)
+		cfg.Transport.ResponseIdleTimeout = transportDefaults.ResponseIdleTimeout
+	}
+	if cfg.Transport.HardTimeout < 0 {
+		slog.Warn("非法 hard_timeout，回退到默认值", "value", cfg.Transport.HardTimeout, "default", transportDefaults.HardTimeout)
+		cfg.Transport.HardTimeout = transportDefaults.HardTimeout
 	}
 
 	// stubify 校验 (Phase 2, D-04)
