@@ -2,17 +2,23 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -296,5 +302,555 @@ func TestForwardRawRequestLogFields(t *testing.T) {
 	}
 	if strings.Contains(output, "请求已接收") || strings.Contains(output, "Authorization") {
 		t.Fatalf("日志包含旧事件名或敏感 header:\n%s", output)
+	}
+}
+
+func TestForwardRawClaudeCodeCancelDoesNotWriteGatewayError(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	s := NewServer(Config{Proxy: ProxyConfig{Target: "https://upstream.invalid"}})
+	s.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		close(started)
+		<-req.Context().Done()
+		close(canceled)
+		return nil, req.Context().Err()
+	})}
+
+	logs := captureForwardLogs(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"stream":true,"messages":[]}`)).WithContext(ctx)
+	w := newCountingResponseWriter()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.forwardRaw(w, req, newRequestMeta(100, "cancel-session"))
+	}()
+	<-started
+	cancel()
+
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("Claude Code 取消未传播到上游")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("取消后 forwardRaw 未结束")
+	}
+	status, headerCalls, body := w.snapshot()
+	if status != 0 || headerCalls != 0 || len(body) != 0 {
+		t.Fatalf("下游取消后写入了伪造网关响应: status=%d calls=%d body=%q", status, headerCalls, body)
+	}
+	assertLogFields(t, logs.String(), "timeout_source=downstream_context", "stream=true", "elapsed_ms=", "phase=")
+}
+
+func TestForwardRawHeaderTimeoutClassification(t *testing.T) {
+	logs := captureForwardLogs(t)
+	for _, tc := range []struct {
+		name   string
+		stream bool
+		source string
+	}{
+		{name: "stream", stream: true, source: "stream_header_timeout"},
+		{name: "non-stream", stream: false, source: "non_stream_header_timeout"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			received := make(chan struct{}, 1)
+			release := make(chan struct{})
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				received <- struct{}{}
+				<-release
+				w.WriteHeader(http.StatusNoContent)
+			}))
+
+			cfg := Config{
+				Proxy: ProxyConfig{Target: upstream.URL, Deflation: 1},
+				Transport: TransportConfig{
+					StreamHeaderTimeout:    30 * time.Millisecond,
+					NonStreamHeaderTimeout: 30 * time.Millisecond,
+				},
+			}
+			s := NewServer(cfg)
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(fmt.Sprintf(`{"stream":%t,"messages":[]}`, tc.stream)))
+			w := newCountingResponseWriter()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				s.forwardRaw(w, req, newRequestMeta(101, tc.name))
+			}()
+			<-received
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				close(release)
+				upstream.Close()
+				t.Fatal("响应头超时未结束请求")
+			}
+			close(release)
+			upstream.Close()
+
+			assertSingleGatewayResponse(t, w, http.StatusGatewayTimeout, "Gateway Timeout")
+			assertLogFields(t, logs.String(), "timeout_source="+tc.source, "phase=awaiting_headers")
+		})
+	}
+}
+
+func TestForwardRawHardTimeoutClassification(t *testing.T) {
+	logs := captureForwardLogs(t)
+	s := NewServer(Config{
+		Proxy:     ProxyConfig{Target: "https://upstream.invalid"},
+		Transport: TransportConfig{HardTimeout: 35 * time.Millisecond},
+	})
+	s.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		select {
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		case <-time.After(200 * time.Millisecond):
+			return nil, timeoutError{"fallback timeout"}
+		}
+	})}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+	w := newCountingResponseWriter()
+	s.forwardRaw(w, req, newRequestMeta(102, "hard-timeout"))
+
+	assertSingleGatewayResponse(t, w, http.StatusGatewayTimeout, "Gateway Timeout")
+	assertLogFields(t, logs.String(), "timeout_source=proxy_hard_limit", "stream=false")
+}
+
+func TestForwardRawResponseIdleTimeoutClassification(t *testing.T) {
+	logs := captureForwardLogs(t)
+	var body *stagedReadCloser
+	s := NewServer(Config{
+		Proxy:     ProxyConfig{Target: "https://upstream.invalid", Deflation: 1},
+		Transport: TransportConfig{ResponseIdleTimeout: 35 * time.Millisecond},
+	})
+	s.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body = newStagedReadCloser([]byte(`{"type":"message"`), req.Context(), 200*time.Millisecond)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"application/json"}},
+			Body:       body,
+		}, nil
+	})}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+	w := newCountingResponseWriter()
+	s.forwardRaw(w, req, newRequestMeta(103, "idle-timeout"))
+	if body != nil {
+		_ = body.Close()
+	}
+
+	assertSingleGatewayResponse(t, w, http.StatusGatewayTimeout, "Gateway Timeout")
+	assertLogFields(t, logs.String(), "timeout_source=response_idle_timeout", "phase=reading_body")
+}
+
+func TestForwardRawUnexpectedEOFRemainsBadGateway(t *testing.T) {
+	logs := captureForwardLogs(t)
+	s := NewServer(Config{Proxy: ProxyConfig{Target: "https://upstream.invalid"}})
+	s.HTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, io.ErrUnexpectedEOF
+	})}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+	w := newCountingResponseWriter()
+	s.forwardRaw(w, req, newRequestMeta(104, "unexpected-eof"))
+
+	assertSingleGatewayResponse(t, w, http.StatusBadGateway, "Bad Gateway")
+	assertLogFields(t, logs.String(), "timeout_source=upstream_transport")
+	if strings.Contains(logs.String(), "proxy_hard_limit") || strings.Contains(logs.String(), "header_timeout") {
+		t.Fatalf("unexpected EOF 被误判为代理超时:\n%s", logs.String())
+	}
+}
+
+func TestForwardRawDoesNotRetryAmbiguousPost(t *testing.T) {
+	var calls atomic.Int32
+	s := NewServer(Config{Proxy: ProxyConfig{Target: "https://upstream.invalid"}})
+	s.HTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return nil, io.ErrUnexpectedEOF
+	})}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+	w := newCountingResponseWriter()
+	s.forwardRaw(w, req, newRequestMeta(105, "single-post"))
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("含糊 POST 调用次数=%d, want 1", got)
+	}
+	assertSingleGatewayResponse(t, w, http.StatusBadGateway, "Bad Gateway")
+	if got := bytes.Count(w.bodyBytes(), []byte(`"error"`)); got != 1 {
+		t.Fatalf("错误 JSON 数量=%d, body=%s", got, w.bodyBytes())
+	}
+}
+
+func TestForwardRawConnectOrTLSFailureRemainsBadGateway(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		trace func(*httptrace.ClientTrace)
+	}{
+		{name: "connect", trace: func(trace *httptrace.ClientTrace) { trace.GetConn("upstream.invalid") }},
+		{name: "tls", trace: func(trace *httptrace.ClientTrace) { trace.TLSHandshakeStart() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureForwardLogs(t)
+			s := NewServer(Config{Proxy: ProxyConfig{Target: "https://upstream.invalid"}})
+			s.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				trace := httptrace.ContextClientTrace(req.Context())
+				if trace == nil {
+					t.Fatal("请求 context 缺少 httptrace")
+				}
+				tc.trace(trace)
+				return nil, timeoutError{tc.name + " timeout"}
+			})}
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+			w := newCountingResponseWriter()
+			s.forwardRaw(w, req, newRequestMeta(106, tc.name))
+
+			assertSingleGatewayResponse(t, w, http.StatusBadGateway, "Bad Gateway")
+			assertLogFields(t, logs.String(), "phase="+map[string]string{"connect": "connect", "tls": "tls_handshake"}[tc.name], "timeout_source=upstream_transport")
+		})
+	}
+}
+
+func TestForwardRawFailureLogSensitiveBoundary(t *testing.T) {
+	logs := captureForwardLogs(t)
+	const (
+		userinfoSecret = "userinfo-secret"
+		authSecret     = "authorization-secret"
+		apiKeySecret   = "api-key-secret"
+		bodySecret     = "request-body-secret"
+	)
+	s := NewServer(Config{Proxy: ProxyConfig{Target: "https://ordinary-target.invalid"}})
+	s.HTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, &url.Error{
+			Op:  "Post",
+			URL: "https://" + userinfoSecret + ":password@diagnostic-host.invalid/diagnostic-path?diagnostic-query=1",
+			Err: io.ErrUnexpectedEOF,
+		}
+	})}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[],"sentinel":"`+bodySecret+`"}`))
+	req.Header.Set("Authorization", "Bearer "+authSecret)
+	req.Header.Set("X-Api-Key", apiKeySecret)
+	w := newCountingResponseWriter()
+	s.forwardRaw(w, req, newRequestMeta(107, "safe-log"))
+
+	output := logs.String()
+	assertLogFields(t, output, "diagnostic-host.invalid", "/diagnostic-path", "diagnostic-query=1")
+	for _, secret := range []string{userinfoSecret, "password", authSecret, apiKeySecret, bodySecret} {
+		if strings.Contains(output, secret) {
+			t.Fatalf("失败日志泄漏 %q:\n%s", secret, output)
+		}
+	}
+}
+
+func TestForwardRawStripsConnectionAndSetsContentLength(t *testing.T) {
+	const requestBody = `{"model":"test","messages":[{"role":"user","content":"完整正文"}]}`
+	var seenConnection string
+	var seenHeaderLength string
+	var seenContentLength int64
+	var seenAuthorization string
+	var seenBody []byte
+
+	s := NewServer(Config{Proxy: ProxyConfig{Target: "https://upstream.invalid", Deflation: 1}})
+	s.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		seenConnection = req.Header.Get("Connection")
+		seenHeaderLength = req.Header.Get("Content-Length")
+		seenContentLength = req.ContentLength
+		seenAuthorization = req.Header.Get("Authorization")
+		seenBody, _ = io.ReadAll(req.Body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"type":"message","usage":{"input_tokens":1,"output_tokens":1}}`)),
+		}, nil
+	})}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(requestBody))
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Content-Length", "999999")
+	req.Header.Set("Authorization", "Bearer preserved")
+	w := newCountingResponseWriter()
+	s.forwardRaw(w, req, newRequestMeta(108, "wire"))
+
+	if seenConnection != "" || seenHeaderLength != "" {
+		t.Fatalf("逐跳/旧长度 header 未清理: Connection=%q Content-Length=%q", seenConnection, seenHeaderLength)
+	}
+	if seenContentLength != int64(len(requestBody)) || string(seenBody) != requestBody {
+		t.Fatalf("上游 body 长度不一致: ContentLength=%d len=%d body=%q", seenContentLength, len(seenBody), seenBody)
+	}
+	if seenAuthorization != "Bearer preserved" {
+		t.Fatalf("必要认证 header 未透传: %q", seenAuthorization)
+	}
+}
+
+func TestForwardRawNon2xxBodyTimeoutBeforeCommit(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     int
+		transport  TransportConfig
+		wantSource string
+	}{
+		{name: "idle", status: http.StatusTooManyRequests, transport: TransportConfig{ResponseIdleTimeout: 35 * time.Millisecond}, wantSource: "response_idle_timeout"},
+		{name: "hard", status: http.StatusServiceUnavailable, transport: TransportConfig{HardTimeout: 35 * time.Millisecond}, wantSource: "proxy_hard_limit"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureForwardLogs(t)
+			var body *stagedReadCloser
+			s := NewServer(Config{Proxy: ProxyConfig{Target: "https://upstream.invalid"}, Transport: tc.transport})
+			s.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				body = newStagedReadCloser([]byte("partial-upstream-body"), req.Context(), 200*time.Millisecond)
+				return &http.Response{StatusCode: tc.status, Header: http.Header{"Content-Type": {"application/json"}}, Body: body}, nil
+			})}
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"messages":[]}`))
+			w := newCountingResponseWriter()
+			s.forwardRaw(w, req, newRequestMeta(109, tc.name))
+			if body != nil {
+				_ = body.Close()
+			}
+
+			assertSingleGatewayResponse(t, w, http.StatusGatewayTimeout, "Gateway Timeout")
+			if bytes.Contains(w.bodyBytes(), []byte("partial-upstream-body")) {
+				t.Fatalf("504 混入上游部分正文: %s", w.bodyBytes())
+			}
+			assertLogFields(t, logs.String(), "timeout_source="+tc.wantSource, "phase=reading_body")
+		})
+	}
+}
+
+func TestForwardRawLongSSEProgressOutlivesLegacyLimit(t *testing.T) {
+	const legacyBoundary = 50 * time.Millisecond
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		for index := 0; index < 6; index++ {
+			_, _ = fmt.Fprintf(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":%d}\n\n", index)
+			flusher.Flush()
+			time.Sleep(15 * time.Millisecond)
+		}
+	}))
+	defer upstream.Close()
+
+	s := NewServer(Config{
+		Proxy: ProxyConfig{Target: upstream.URL, Deflation: 1},
+		Transport: TransportConfig{
+			StreamHeaderTimeout: 200 * time.Millisecond,
+			ResponseIdleTimeout: 100 * time.Millisecond,
+			HardTimeout:         time.Second,
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"stream":true,"messages":[]}`))
+	w := newCountingResponseWriter()
+	started := time.Now()
+	s.forwardRaw(w, req, newRequestMeta(110, "long-sse"))
+	elapsed := time.Since(started)
+
+	status, _, body := w.snapshot()
+	if status != http.StatusOK || bytes.Contains(body, []byte("Gateway")) {
+		t.Fatalf("长 SSE 被错误截断: status=%d body=%s", status, body)
+	}
+	if elapsed <= legacyBoundary {
+		t.Fatalf("测试总时长=%s，未超过概念旧界限=%s", elapsed, legacyBoundary)
+	}
+	if got := bytes.Count(body, []byte("content_block_delta")); got != 12 {
+		t.Fatalf("SSE 事件未完整到达: marker count=%d body=%s", got, body)
+	}
+}
+
+func TestForwardRawSSETimeoutAfterCommitTerminatesWithoutForgedJSON(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		transport  TransportConfig
+		wantSource string
+	}{
+		{name: "idle", transport: TransportConfig{ResponseIdleTimeout: 40 * time.Millisecond}, wantSource: "response_idle_timeout"},
+		{name: "hard", transport: TransportConfig{HardTimeout: 40 * time.Millisecond}, wantSource: "proxy_hard_limit"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureForwardLogs(t)
+			var body *stagedReadCloser
+			s := NewServer(Config{Proxy: ProxyConfig{Target: "https://upstream.invalid", Deflation: 1}, Transport: tc.transport})
+			s.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				body = newStagedReadCloser([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n"), req.Context(), 200*time.Millisecond)
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: body}, nil
+			})}
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"stream":true,"messages":[]}`))
+			w := newCountingResponseWriter()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				s.forwardRaw(w, req, newRequestMeta(111, tc.name))
+			}()
+
+			select {
+			case <-w.written:
+			case <-time.After(time.Second):
+				if body != nil {
+					_ = body.Close()
+				}
+				t.Fatal("首个 SSE 事件未提交")
+			}
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				if body != nil {
+					_ = body.Close()
+				}
+				<-done
+				t.Fatal("SSE timeout 后 handler 未结束")
+			}
+
+			status, headerCalls, responseBody := w.snapshot()
+			if status != http.StatusOK || headerCalls != 1 {
+				t.Fatalf("已提交 SSE 状态被改写: status=%d calls=%d", status, headerCalls)
+			}
+			if bytes.Contains(responseBody, []byte("Bad Gateway")) || bytes.Contains(responseBody, []byte("Gateway Timeout")) {
+				t.Fatalf("已提交 SSE 被追加伪造 JSON: %s", responseBody)
+			}
+			assertLogFields(t, logs.String(), "timeout_source="+tc.wantSource, "response_committed=true", "stream=true")
+		})
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+type timeoutError struct{ message string }
+
+func (err timeoutError) Error() string    { return err.message }
+func (timeoutError) Timeout() bool        { return true }
+func (timeoutError) Temporary() bool      { return true }
+func (timeoutError) Unwrap() error        { return nil }
+func (timeoutError) Network() net.Error   { return timeoutError{} }
+func (timeoutError) Is(target error) bool { return false }
+
+type countingResponseWriter struct {
+	mu          sync.Mutex
+	header      http.Header
+	status      int
+	headerCalls int
+	body        bytes.Buffer
+	written     chan struct{}
+	writtenOnce sync.Once
+}
+
+func newCountingResponseWriter() *countingResponseWriter {
+	return &countingResponseWriter{header: make(http.Header), written: make(chan struct{})}
+}
+
+func (w *countingResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *countingResponseWriter) WriteHeader(status int) {
+	w.mu.Lock()
+	w.headerCalls++
+	if w.status == 0 {
+		w.status = status
+	}
+	w.mu.Unlock()
+	w.signalWritten()
+}
+
+func (w *countingResponseWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	if w.status == 0 {
+		w.status = http.StatusOK
+		w.headerCalls++
+	}
+	n, err := w.body.Write(data)
+	w.mu.Unlock()
+	w.signalWritten()
+	return n, err
+}
+
+func (w *countingResponseWriter) Flush() {}
+
+func (w *countingResponseWriter) signalWritten() {
+	w.writtenOnce.Do(func() { close(w.written) })
+}
+
+func (w *countingResponseWriter) snapshot() (int, int, []byte) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.status, w.headerCalls, append([]byte(nil), w.body.Bytes()...)
+}
+
+func (w *countingResponseWriter) bodyBytes() []byte {
+	_, _, body := w.snapshot()
+	return body
+}
+
+type stagedReadCloser struct {
+	mu       sync.Mutex
+	first    []byte
+	ctx      context.Context
+	fallback time.Duration
+	closed   chan struct{}
+	close    sync.Once
+}
+
+func newStagedReadCloser(first []byte, ctx context.Context, fallback time.Duration) *stagedReadCloser {
+	return &stagedReadCloser{first: append([]byte(nil), first...), ctx: ctx, fallback: fallback, closed: make(chan struct{})}
+}
+
+func (body *stagedReadCloser) Read(buffer []byte) (int, error) {
+	body.mu.Lock()
+	if len(body.first) > 0 {
+		n := copy(buffer, body.first)
+		body.first = body.first[n:]
+		body.mu.Unlock()
+		return n, nil
+	}
+	body.mu.Unlock()
+
+	timer := time.NewTimer(body.fallback)
+	defer timer.Stop()
+	select {
+	case <-body.closed:
+		return 0, io.ErrClosedPipe
+	case <-body.ctx.Done():
+		return 0, body.ctx.Err()
+	case <-timer.C:
+		return 0, timeoutError{"staged body fallback timeout"}
+	}
+}
+
+func (body *stagedReadCloser) Close() error {
+	body.close.Do(func() { close(body.closed) })
+	return nil
+}
+
+func captureForwardLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(NewLogHandler(&logs, slog.LevelDebug)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return &logs
+}
+
+func assertSingleGatewayResponse(t *testing.T, w *countingResponseWriter, wantStatus int, wantBody string) {
+	t.Helper()
+	status, headerCalls, body := w.snapshot()
+	if status != wantStatus || headerCalls != 1 || !bytes.Contains(body, []byte(wantBody)) {
+		t.Fatalf("网关响应 = status=%d calls=%d body=%q, want status=%d single body containing %q", status, headerCalls, body, wantStatus, wantBody)
+	}
+}
+
+func assertLogFields(t *testing.T, output string, fields ...string) {
+	t.Helper()
+	for _, field := range fields {
+		if !strings.Contains(output, field) {
+			t.Fatalf("日志缺少 %q:\n%s", field, output)
+		}
 	}
 }
