@@ -344,7 +344,7 @@ Plans:
 **Goal:** 高置信识别 Claude Code 自动会话标题辅助请求并在任何 Sawtooth 状态副作用前原字节安全直通，同时取消普通精确路径作为独立 Archive 召回信号，确保日常编码请求不会误触发历史搜索或注入。
 **Requirements**: —
 **Depends on:** Phase 8
-**Plans:** 2/2 plans complete
+**Plans:** 3/3 plans complete
 
 Plans:
 
@@ -355,4 +355,4 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 08.1-03-PLAN.md — session envelope 平衡门禁与辅助分类日志 session ID 泄漏缺口关闭
+- [x] 08.1-03-PLAN.md — session envelope 平衡门禁与辅助分类日志 session ID 泄漏缺口关闭
