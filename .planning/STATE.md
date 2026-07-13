@@ -3,9 +3,9 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: Needs Review
-stopped_at: Phase 08.1 gap closure executed; verification pending
-last_updated: "2026-07-13T00:03:38.110Z"
-last_activity: 2026-07-13
+stopped_at: Quick task 260714-019 completed and verified
+last_updated: "2026-07-14T02:53:22+08:00"
+last_activity: 2026-07-14
 progress:
   total_phases: 10
   completed_phases: 3
@@ -36,23 +36,24 @@ Phase 08.1 已执行 3/3 plans；08.1-03 已关闭 session envelope 平衡门禁
 
 ### Quick Tasks Completed
 
-| # | Description | Date | Commit | Directory |
-|---|-------------|------|--------|-----------|
-| 260705-fxk | 删除 stubify.go 中语义反转的 isDebugFollowup（F-10）逻辑，回归 YesMem 基线行为 | 2026-07-05 | 16b9067 | [260705-fxk-stubify-go-isdebugfollowup-f-10-yesmem](./quick/260705-fxk-stubify-go-isdebugfollowup-f-10-yesmem/) |
-| 260705-gs9 | 删除 StubStats.ArchivedMessages 死代码（只写入无消费者） | 2026-07-05 | b9717ef | [260705-gs9-stubstats-archivedmessages](./quick/260705-gs9-stubstats-archivedmessages/) |
-| 260705-rce | golangci-lint 22 项告警清零：删除 unused 死代码、修复 ineffassign/S1008/errcheck | 2026-07-05 | 86c4654, 3ccf970, f034026 | [260705-rce-golangci-lint-collapse-go-filterstopword](./quick/260705-rce-golangci-lint-collapse-go-filterstopword/) |
-| 260709-pjw | 修复 truncateRunes 代码围栏截断污染与 SearchArchives bm25 聚合排序 | 2026-07-09 | 1e2daac, 9591150 | [260709-pjw-truncaterunes-searcharchives-bm25](./quick/260709-pjw-truncaterunes-searcharchives-bm25/) |
-| 260709-ukb | 收尾清洁：删 corrupt.db 残留、修 reexpand.go 注释缩进瑕疵、补 SQLite 损坏恢复单测 | 2026-07-09 | e305658, d73f7e7 | [260709-ukb-corrupt-db-reexpand-go-sqlite](./quick/260709-ukb-corrupt-db-reexpand-go-sqlite/) |
-| 260709-vui | SummaryText 分段感知截断保留 Gotchas/Conclusion + 归档注入预算降级减半重试 | 2026-07-09 | df3baac, 438f903 | [260709-vui-searchandexpand-summarytext-gotchas-conc](./quick/260709-vui-searchandexpand-summarytext-gotchas-conc/) |
-| 260711-12v | 定制 slog.Handler，使终端日志颜色和短时间戳对齐 YesMem，并确保文件日志无 ANSI 编码 | 2026-07-11 | 22eaf65 | [260711-12v-slog-handler-yesmem-ansi](./quick/260711-12v-slog-handler-yesmem-ansi/) |
-| 260711-1he | 将 AGENTS.md 加入提交黑名单，审查剩余改动并在验证后提交推送 GitHub | 2026-07-11 | 01849d6 | [260711-1he-agents-md-github](./quick/260711-1he-agents-md-github/) |
-| 260711-32d | 将日志格式改为时间戳加方括号级别，并仅为级别文字着色 | 2026-07-11 | 21717fe | [260711-32d-log-level-prefix-color](./quick/260711-32d-log-level-prefix-color/) |
-| 260711-4e0 | 修复上游 Base URL 尾斜杠导致请求路径错误，并添加回归测试 | 2026-07-11 | 1fa804d | [260711-4e0-base-url](./quick/260711-4e0-base-url/) |
+| # | Description | Date | Commit | Status | Directory |
+|---|-------------|------|--------|--------|-----------|
+| 260705-fxk | 删除 stubify.go 中语义反转的 isDebugFollowup（F-10）逻辑，回归 YesMem 基线行为 | 2026-07-05 | 16b9067 |  | [260705-fxk-stubify-go-isdebugfollowup-f-10-yesmem](./quick/260705-fxk-stubify-go-isdebugfollowup-f-10-yesmem/) |
+| 260705-gs9 | 删除 StubStats.ArchivedMessages 死代码（只写入无消费者） | 2026-07-05 | b9717ef |  | [260705-gs9-stubstats-archivedmessages](./quick/260705-gs9-stubstats-archivedmessages/) |
+| 260705-rce | golangci-lint 22 项告警清零：删除 unused 死代码、修复 ineffassign/S1008/errcheck | 2026-07-05 | 86c4654, 3ccf970, f034026 |  | [260705-rce-golangci-lint-collapse-go-filterstopword](./quick/260705-rce-golangci-lint-collapse-go-filterstopword/) |
+| 260709-pjw | 修复 truncateRunes 代码围栏截断污染与 SearchArchives bm25 聚合排序 | 2026-07-09 | 1e2daac, 9591150 |  | [260709-pjw-truncaterunes-searcharchives-bm25](./quick/260709-pjw-truncaterunes-searcharchives-bm25/) |
+| 260709-ukb | 收尾清洁：删 corrupt.db 残留、修 reexpand.go 注释缩进瑕疵、补 SQLite 损坏恢复单测 | 2026-07-09 | e305658, d73f7e7 |  | [260709-ukb-corrupt-db-reexpand-go-sqlite](./quick/260709-ukb-corrupt-db-reexpand-go-sqlite/) |
+| 260709-vui | SummaryText 分段感知截断保留 Gotchas/Conclusion + 归档注入预算降级减半重试 | 2026-07-09 | df3baac, 438f903 |  | [260709-vui-searchandexpand-summarytext-gotchas-conc](./quick/260709-vui-searchandexpand-summarytext-gotchas-conc/) |
+| 260711-12v | 定制 slog.Handler，使终端日志颜色和短时间戳对齐 YesMem，并确保文件日志无 ANSI 编码 | 2026-07-11 | 22eaf65 |  | [260711-12v-slog-handler-yesmem-ansi](./quick/260711-12v-slog-handler-yesmem-ansi/) |
+| 260711-1he | 将 AGENTS.md 加入提交黑名单，审查剩余改动并在验证后提交推送 GitHub | 2026-07-11 | 01849d6 |  | [260711-1he-agents-md-github](./quick/260711-1he-agents-md-github/) |
+| 260711-32d | 将日志格式改为时间戳加方括号级别，并仅为级别文字着色 | 2026-07-11 | 21717fe |  | [260711-32d-log-level-prefix-color](./quick/260711-32d-log-level-prefix-color/) |
+| 260711-4e0 | 修复上游 Base URL 尾斜杠导致请求路径错误，并添加回归测试 | 2026-07-11 | 1fa804d |  | [260711-4e0-base-url](./quick/260711-4e0-base-url/) |
+| 260714-019 | 重构 Claude Code 上游生命周期，以分层 timeout 取代固定 120 秒总限制 | 2026-07-14 | e4fc5f8 | Verified | [260714-019-claude-code-120-hard-limit-header](./quick/260714-019-claude-code-120-hard-limit-header/) |
 
-Last activity: 2026-07-13 — Phase 08.1 gap closure executed; verification pending
+Last activity: 2026-07-14 — Completed and verified quick task 260714-019: Claude Code upstream lifecycle and layered timeouts
 
 ---
-*Last updated: 2026-07-13*
+*Last updated: 2026-07-14*
 
 ## Accumulated Context
 
@@ -113,6 +114,6 @@ Last activity: 2026-07-13 — Phase 08.1 gap closure executed; verification pend
 
 ## Session
 
-**Last session:** 2026-07-13T00:03:38.096Z
-**Stopped at:** Phase 08.1 gap closure executed; verification pending
-**Resume file:** .planning/phases/08.1-claude-code/08.1-VERIFICATION.md
+**Last session:** 2026-07-14T02:53:22+08:00
+**Stopped at:** Quick task 260714-019 completed and verified; ready for the next task
+**Resume file:** None
