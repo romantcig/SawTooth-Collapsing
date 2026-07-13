@@ -13,6 +13,21 @@ proxy:
   # Usage deflation coefficient (0.0-1.0), default: 0.7 (optional)
   deflation: 0.7
 
+transport:
+  # TCP connection timeout only, default: 15s. Set to 0 to disable this protection.
+  dial_timeout: 15s
+  # TLS handshake timeout only, default: 15s. Set to 0 to disable this protection.
+  tls_handshake_timeout: 15s
+  # Time to wait for response headers after a stream request is fully written, default: 10m. Set to 0 to disable.
+  stream_header_timeout: 10m
+  # Time to wait for response headers after a non-stream request is fully written, default: 30m. Set to 0 to disable.
+  non_stream_header_timeout: 30m
+  # Maximum continuous interval without upstream response bytes, default: 10m. Each received byte resets it; set to 0 to disable.
+  response_idle_timeout: 10m
+  # Extreme absolute limit for the whole upstream request, default: 60m. Set to 0 to disable.
+  # With hard_timeout=0, the Claude Code request context and the other phase protections control the lifecycle; the old 120s limit is not restored.
+  hard_timeout: 60m
+
 debug:
   # Whether to enable structured debug facts, default: false (optional)
   enabled: false

@@ -13,6 +13,21 @@ proxy:
   # Usage 衰减系数（0.0-1.0），默认值: 0.7（可省略）
   deflation: 0.7
 
+transport:
+  # 仅限制 TCP 建连阶段，默认值: 15s；设为 0 可禁用此项保护
+  dial_timeout: 15s
+  # 仅限制 TLS 握手阶段，默认值: 15s；设为 0 可禁用此项保护
+  tls_handshake_timeout: 15s
+  # stream 请求完全发送后等待响应头的超时，默认值: 10m；设为 0 可禁用此项保护
+  stream_header_timeout: 10m
+  # non-stream 请求完全发送后等待响应头的超时，默认值: 30m；设为 0 可禁用此项保护
+  non_stream_header_timeout: 30m
+  # 响应体连续无上游字节的超时，默认值: 10m；每收到字节都会重置，设为 0 可禁用
+  response_idle_timeout: 10m
+  # 整个上游请求的极端绝对上限，默认值: 60m；设为 0 可禁用
+  # hard_timeout=0 时由 Claude Code request context 与其余阶段保护控制，不会恢复旧 120 秒限制
+  hard_timeout: 60m
+
 debug:
   # 是否启用结构化 debug facts，默认值: false（可省略）
   enabled: false

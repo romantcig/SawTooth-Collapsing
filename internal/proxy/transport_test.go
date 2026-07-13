@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -94,6 +95,42 @@ func TestTransportConfigYAMLAndZeroDisable(t *testing.T) {
 	validateConfig(&cfg)
 	if cfg.Transport != DefaultConfig().Transport {
 		t.Fatalf("负值未逐项回退默认值: %+v", cfg.Transport)
+	}
+}
+
+func TestTransportConfigFilesMatchDefaults(t *testing.T) {
+	want := DefaultConfig().Transport
+	keys := []string{
+		"dial_timeout",
+		"tls_handshake_timeout",
+		"stream_header_timeout",
+		"non_stream_header_timeout",
+		"response_idle_timeout",
+		"hard_timeout",
+	}
+	for _, name := range []string{"sawtooth.yaml", "sawtooth.yaml.example", "sawtooth_zh.yaml.example"} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join("..", "..", name)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("读取 %s: %v", name, err)
+			}
+			if !bytes.Contains(data, []byte("transport:")) {
+				t.Fatalf("%s 缺少 transport 分组", name)
+			}
+			for _, key := range keys {
+				if !bytes.Contains(data, []byte(key+":")) {
+					t.Fatalf("%s 缺少 transport.%s", name, key)
+				}
+			}
+			loaded, err := LoadConfig(path)
+			if err != nil {
+				t.Fatalf("解析 %s: %v", name, err)
+			}
+			if loaded.Transport != want {
+				t.Fatalf("%s transport=%+v, want %+v", name, loaded.Transport, want)
+			}
+		})
 	}
 }
 
