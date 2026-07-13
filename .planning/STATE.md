@@ -1,18 +1,17 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.0
-milestone_name: milestone
-status: Needs Review
-stopped_at: Quick task 260714-019 completed and verified
-last_updated: "2026-07-14T02:53:22+08:00"
-last_activity: 2026-07-14
+milestone: v1.1
+milestone_name: 锯齿折叠对齐与可靠性闭环
+status: planning
+current_phase: "09"
+last_updated: "2026-07-13T21:53:21.421Z"
+last_activity: 2026-07-13
 progress:
-  total_phases: 10
-  completed_phases: 3
-  total_plans: 17
-  completed_plans: 17
-  percent: 30
-current_phase: 08.1
+  total_phases: 5
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # State: Sawtooth Proxy
@@ -26,13 +25,13 @@ See: `.planning/ROADMAP.md`
 
 ## Phase Status
 
-Phase 08 (claude-code-token-user-context-usage-debug) 已完成：4/4 plans、13/13 requirements、19/19 must-haves 均通过；代码审查发现的 4 个 Critical 和 1 个 Warning 已修复并复审为 clean。多模态 token、持久 CLAUDE.md context、Agent 强特征、真实 usage 与安全双阶段 debug 均已闭环。
+v1.0 已于 2026-07-14 归档。Phase 08.1 的 9/9 must-haves 已由自动化证据重验证通过；无法可靠肉眼判断、且仅重复要求接受内部证据的人工 UAT 项已明确关闭并记录为 skipped。
 
-Phase 08.1 已执行 3/3 plans；08.1-03 已关闭 session envelope 平衡门禁与辅助分类日志 session ID 泄漏两项 blocker，deep code review 为 clean。由于 `verifier_enabled=false`，阶段保留为 Executed / Needs Review，等待重新生成 VERIFICATION.md。
+v1.1 已建立 Phase 09–13，当前从 Phase 09 的只读 YesMem 锯齿闭环差距审计开始。任何生产修复必须等待审计确认必要缺口。
 
 ## Active Plan
 
-无活跃计划；等待 Phase 08.1 重新验证。
+无活跃计划；下一步讨论并规划 Phase 09，只做审计，不修改生产逻辑。
 
 ### Quick Tasks Completed
 
@@ -50,7 +49,7 @@ Phase 08.1 已执行 3/3 plans；08.1-03 已关闭 session envelope 平衡门禁
 | 260711-4e0 | 修复上游 Base URL 尾斜杠导致请求路径错误，并添加回归测试 | 2026-07-11 | 1fa804d |  | [260711-4e0-base-url](./quick/260711-4e0-base-url/) |
 | 260714-019 | 重构 Claude Code 上游生命周期，以分层 timeout 取代固定 120 秒总限制 | 2026-07-14 | e4fc5f8 | Verified | [260714-019-claude-code-120-hard-limit-header](./quick/260714-019-claude-code-120-hard-limit-header/) |
 
-Last activity: 2026-07-14 — Completed and verified quick task 260714-019: Claude Code upstream lifecycle and layered timeouts
+Last activity: 2026-07-13
 
 ---
 *Last updated: 2026-07-14*
@@ -117,3 +116,14 @@ Last activity: 2026-07-14 — Completed and verified quick task 260714-019: Clau
 **Last session:** 2026-07-14T02:53:22+08:00
 **Stopped at:** Quick task 260714-019 completed and verified; ready for the next task
 **Resume file:** None
+
+## Current Position
+
+Phase: Not started (defining requirements)
+Plan: —
+Status: Ready to plan Phase 09
+Last activity: 2026-07-14 — Milestone v1.1 requirements and roadmap created
+
+## Operator Next Steps
+
+- Run `$gsd-discuss-phase 09` to lock the audit evidence format and comparison baseline.
