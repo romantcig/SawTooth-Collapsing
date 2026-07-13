@@ -336,7 +336,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		auxiliary := classifyAuxiliaryRequest(bodyMap, messages)
 		if auxiliary.Kind == requestKindSessionTitle {
 			meta.RequestKind = auxiliary.Kind
-			logAuxiliaryClassification(meta.Logger, auxiliary, len(messages))
+			logAuxiliaryClassification(meta.auxiliaryLogger(), auxiliary, len(messages))
 			r.Body = io.NopCloser(bytes.NewReader(body))
 			s.forwardRaw(w, r, meta)
 			return

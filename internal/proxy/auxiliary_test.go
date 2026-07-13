@@ -163,8 +163,7 @@ func TestAuxiliaryClassificationLog(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelInfo})))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 	meta := newRequestMeta(42, secretSessionID)
-	logger := slog.New(meta.Logger.Handler()).With("request_id", meta.ID)
-	logAuxiliaryClassification(logger, classification, 1)
+	logAuxiliaryClassification(meta.auxiliaryLogger(), classification, 1)
 	got := output.String()
 	if strings.Count(got, "辅助请求安全直通") != 1 {
 		t.Fatalf("Info 审计数量不正确: %s", got)
@@ -178,5 +177,17 @@ func TestAuxiliaryClassificationLog(t *testing.T) {
 		if strings.Contains(got, secret) {
 			t.Fatalf("审计日志泄漏敏感值 %q: %s", secret, got)
 		}
+	}
+
+	var zeroOutput bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&zeroOutput, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	manualMeta := &requestMeta{
+		ID:     43,
+		Logger: slog.Default().With("request_session_id", secretSessionID),
+	}
+	logAuxiliaryClassification(manualMeta.auxiliaryLogger(), classification, 1)
+	zeroGot := zeroOutput.String()
+	if !strings.Contains(zeroGot, "request_id=43") || strings.Contains(zeroGot, secretSessionID) {
+		t.Fatalf("零值辅助 logger fallback 不安全: %s", zeroGot)
 	}
 }

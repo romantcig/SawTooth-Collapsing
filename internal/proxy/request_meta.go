@@ -12,6 +12,7 @@ type requestMeta struct {
 	RequestKind          requestKind
 	OriginalMessageCount int
 	Logger               *slog.Logger
+	auxiliaryAuditLogger *slog.Logger
 	entryOnce            sync.Once
 	rawFactsOnce         sync.Once
 	forwardedFactsOnce   sync.Once
@@ -52,14 +53,25 @@ func (m *requestMeta) debugOnce(stage debugStage) *sync.Once {
 }
 
 func newRequestMeta(id uint64, requestSessionID string) *requestMeta {
+	baseLogger := slog.New(slog.Default().Handler()).With("request_id", id)
 	return &requestMeta{
-		ID:               id,
-		RequestSessionID: requestSessionID,
-		Logger: slog.Default().With(
-			"request_id", id,
-			"request_session_id", requestSessionID,
-		),
+		ID:                   id,
+		RequestSessionID:     requestSessionID,
+		Logger:               baseLogger.With("request_session_id", requestSessionID),
+		auxiliaryAuditLogger: baseLogger,
 	}
+}
+
+// auxiliaryLogger 返回辅助分类专用审计 logger，只允许继承 request_id。
+// 零值或手工构造的 requestMeta 不得回退到可能预绑定 session 属性的通用 Logger。
+func (m *requestMeta) auxiliaryLogger() *slog.Logger {
+	if m == nil {
+		return slog.Default()
+	}
+	if m.auxiliaryAuditLogger != nil {
+		return m.auxiliaryAuditLogger
+	}
+	return slog.New(slog.Default().Handler()).With("request_id", m.ID)
 }
 
 func (m *requestMeta) logEntry(model string, originalMessageCount int) {
