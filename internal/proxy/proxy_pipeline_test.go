@@ -1209,7 +1209,7 @@ func TestHandleMessagesCollapseThenRestore(t *testing.T) {
 func TestHandleMessagesFrozenBoundaryEdit(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":20000,"output_tokens":1}}`))
 	}))
 	defer upstream.Close()
 
