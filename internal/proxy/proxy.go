@@ -572,6 +572,8 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		features := extractAgentRequestFeatures(r, bodyMap, messages)
 		logAgentRequestFeatures(meta.Logger, features)
 		classification := classifyAgentRequest(r, bodyMap, messages)
+		meta.AgentRole = classification.Role
+		meta.AgentReason = classification.Reason
 		rawMessages := messages
 		historyMessages, currentContext := DetachPersistentUserContext(rawMessages)
 		finalizeMessages := func(history []Message) []Message {
@@ -611,12 +613,25 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		if s.Sawtooth != nil {
 			requestSeq = s.Sawtooth.IncrementRequestSeq(sessionID)
 		}
+		threshold := s.Config.Stubify.TokenThreshold
+		baseline := pressureBaseline{}
+		if s.Sawtooth != nil {
+			baseline = s.Sawtooth.PressureBaseline(sessionID)
+		}
+		decision := buildPressureDecision(rawMessages, bodyMap["system"], bodyMap["tools"], baseline, s.TokenCounter, threshold)
+		if s.Sawtooth != nil {
+			decision.TriggerReason = s.Sawtooth.ShouldTrigger(sessionID, decision.SelectedPressure)
+		} else if decision.SelectedPressure > threshold {
+			decision.TriggerReason = TriggerTokens
+		}
+		decision.CompressDecision = decision.TriggerReason != TriggerNone
+		meta.PressureDecision = decision
 		messages = historyMessages
 
 		// Phase 4 Step 0: 保存原始 token 估算和消息数（SawtoothTrigger + frozen cutoff）
 		// rawCutoff 必须在 reexpand 前保存——reexpand 会注入 archive block 增加消息数
 		// 对标 YesMem: cutoff := len(messages) 使用原始（未修改）消息数
-		rawEstimate := s.TokenCounter.CountMessagesTokens(rawMessages)
+		rawEstimate := decision.MessagesLocalTokens
 		rawCutoff := len(messages)
 		historyEstimate := s.TokenCounter.CountMessagesTokens(messages)
 		contextTokens := rawEstimate - historyEstimate
@@ -673,20 +688,12 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 		// 先基于 frozen+tail 判定 frozen 是否仍有效，确定本请求唯一的权威基础消息。
 		totalTokens := contextTokens + s.TokenCounter.CountMessagesTokens(messages)
-		threshold := s.Config.Stubify.TokenThreshold
-		pressureTrigger := TriggerNone
-		if s.Sawtooth != nil {
-			// 上次上游响应的 total_input_tokens 包含 system/tools/cache 等
-			// messages 本地估算看不到的真实上下文压力，必须能直接打开压缩入口。
-			// 此处传 0 只查历史 usage/pause；当前 rawEstimate 已由 totalTokens 门禁覆盖，
-			// 否则会让已有效的 frozen prefix 因原始长历史被每轮强制失效。
-			pressureTrigger = s.Sawtooth.ShouldTrigger(sessionID, 0)
-		}
+		pressureTrigger := decision.TriggerReason
 
 		// ── YesMem shouldInvalidateFrozen ──
 		// frozen prefix 存在时，若 frozen+tail 仍在阈值内则跳过压缩管线。
 		// 对标 YesMem proxy.go:1230: shouldInvalidateFrozen(combinedTokens, threshold)
-		needCompress := totalTokens >= threshold || pressureTrigger != TriggerNone
+		needCompress := decision.CompressDecision
 		if frozenPrefixLen > 0 && needCompress {
 			// 用原始消息切片计算 tail tokens——防止 frozen prefix 替换后
 			// len(messages) < raw cutoff 导致切片越界
@@ -734,7 +741,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 		// 召回后的消息才是最终压缩输入；Frozen 失效分支不再重跑召回。
 		totalTokens = contextTokens + s.TokenCounter.CountMessagesTokens(messages)
-		needCompress = totalTokens >= threshold || pressureTrigger != TriggerNone
+		needCompress = decision.CompressDecision
 		if needCompress {
 			// 提取 pivot text：使用最新一条 user 消息的内容文本
 			pivotText := extractLatestUserText(messages)
@@ -849,10 +856,9 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					}
 
 					if s.Sawtooth != nil && s.Frozen != nil {
-						trigger := s.Sawtooth.ShouldTrigger(sessionID, rawEstimate)
-						if trigger != TriggerNone {
+						if pressureTrigger != TriggerNone {
 							meta.Logger.Info("SawtoothTrigger 触发",
-								"reason", trigger,
+								"reason", pressureTrigger,
 								"raw_estimate", rawEstimate,
 								LogGreen,
 							)
@@ -947,10 +953,9 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			// fallback 与 collapse 路径保持项目 Phase 07.1 的 snapshot 契约：
 			// 持久化的 prefix bytes 与本次实际上游 wire prefix 完全一致。
 			if s.Sawtooth != nil && s.Frozen != nil {
-				trigger := s.Sawtooth.ShouldTrigger(sessionID, rawEstimate)
-				if trigger != TriggerNone {
+				if pressureTrigger != TriggerNone {
 					meta.Logger.Info("SawtoothTrigger 触发",
-						"reason", trigger,
+						"reason", pressureTrigger,
 						"raw_estimate", rawEstimate,
 						LogGreen,
 					)

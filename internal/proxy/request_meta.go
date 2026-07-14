@@ -11,6 +11,8 @@ type requestMeta struct {
 	RequestSessionID     string
 	RequestKind          requestKind
 	AgentRole            agentRole
+	AgentReason          agentClassificationReason
+	PressureDecision     pressureDecision
 	OriginalMessageCount int
 	Logger               *slog.Logger
 	auxiliaryAuditLogger *slog.Logger
