@@ -638,15 +638,17 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 			dataStr := strings.TrimSpace(line[5:])
 			var data map[string]any
 			if json.Unmarshal([]byte(dataStr), &data) == nil {
-				if msg, ok := data["message"].(map[string]any); ok {
-					if usage, ok := msg["usage"].(map[string]any); ok {
-						s.writeUsageDebugFacts(meta, timestamp, usage)
-						actual := totalInputTokens(usage)
-						if actual > 0 && s.Sawtooth != nil && meta != nil && meta.tracksSawtoothState() && meta.PressureDecision.Available {
-							decision := meta.PressureDecision
-							s.Sawtooth.UpdatePressureBaseline(sessionID, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint)
+				if eventType, _ := data["type"].(string); eventType == "message_start" {
+					if msg, ok := data["message"].(map[string]any); ok {
+						if usage, ok := msg["usage"].(map[string]any); ok {
+							s.writeUsageDebugFacts(meta, timestamp, usage)
+							actual := totalInputTokens(usage)
+							if actual > 0 && s.Sawtooth != nil && meta != nil && meta.tracksSawtoothState() && meta.PressureDecision.Available {
+								decision := meta.PressureDecision
+								s.Sawtooth.UpdatePressureBaseline(sessionID, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint)
+							}
+							usageRecorded = true
 						}
-						usageRecorded = true
 					}
 				}
 			}
