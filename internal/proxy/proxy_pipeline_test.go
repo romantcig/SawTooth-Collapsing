@@ -1132,6 +1132,9 @@ func TestHandleMessagesPressureBaselineReset(t *testing.T) {
 			if captured.Source != pressureSourceLocalFull || captured.ResetReason != tc.wantReason || captured.SelectedPressure != captured.FullLocalEstimate {
 				t.Fatalf("reset decision=%+v, want reason=%q", captured, tc.wantReason)
 			}
+			if captured.TriggerReason != TriggerNone || captured.CompressDecision {
+				t.Fatalf("失效旧 actual 被重新引入 trigger: %+v", captured)
+			}
 		})
 	}
 }
