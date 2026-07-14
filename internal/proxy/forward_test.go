@@ -246,6 +246,7 @@ func testHandleFailureDoesNotUpdate(t *testing.T, sse bool) {
 		}{
 			{name: "parse failure", statusCode: http.StatusOK, body: "event: message_start\ndata: {not-json\n\n"},
 			{name: "no message start", statusCode: http.StatusOK, body: "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":99999}}\n\n"},
+			{name: "spoofed message start text", statusCode: http.StatusOK, body: "event: message_delta\ndata: {\"type\":\"message_delta\",\"note\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":99999}}}\n\n"},
 			{name: "message start without usage", statusCode: http.StatusOK, body: "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\n"},
 			{name: "empty usage", statusCode: http.StatusOK, body: "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\n"},
 		}
