@@ -10,6 +10,7 @@ type requestMeta struct {
 	ID                   uint64
 	RequestSessionID     string
 	RequestKind          requestKind
+	AgentRole            agentRole
 	OriginalMessageCount int
 	Logger               *slog.Logger
 	auxiliaryAuditLogger *slog.Logger
@@ -22,10 +23,10 @@ type requestMeta struct {
 	responseBodyOnce     sync.Once
 }
 
-// tracksSawtoothState 使用默认安全策略：nil 与零值都保持现有状态跟踪，
-// 只有经过高置信分类的 session_title 请求关闭响应后的 Sawtooth 写回。
+// tracksSawtoothState 使用默认安全策略：nil、零值、main 与 unknown 都保持状态跟踪，
+// 只有经过高置信分类的 session_title 或 subagent 请求关闭 Sawtooth 状态读写。
 func (m *requestMeta) tracksSawtoothState() bool {
-	return m == nil || m.RequestKind != requestKindSessionTitle
+	return m == nil || (m.RequestKind != requestKindSessionTitle && m.AgentRole != agentRoleSubagent)
 }
 
 func (m *requestMeta) debugBodyOnce(stage debugBodyStage) *sync.Once {
