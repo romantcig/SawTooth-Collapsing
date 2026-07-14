@@ -110,6 +110,152 @@ func TestSawtoothPressureBaselineMissingState(t *testing.T) {
 	}
 }
 
+func TestSawtoothPressureBaselinePersistenceRoundTrip(t *testing.T) {
+	const threadID = "pressure-round-trip"
+	systemFingerprint := strings.Repeat("a", 64)
+	toolsFingerprint := strings.Repeat("b", 64)
+	persisted := make(map[string]string)
+
+	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+	trigger.SetPersistFunc(func(key, value string) { persisted[key] = value })
+	trigger.UpdatePressureBaseline(threadID, 93_252, 25, systemFingerprint, toolsFingerprint)
+
+	raw, ok := persisted["sawtooth:"+threadID]
+	if !ok {
+		t.Fatal("complete pressure baseline was not persisted")
+	}
+	var state persistedState
+	if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		t.Fatalf("unmarshal persisted pressure baseline: %v", err)
+	}
+	if state.Tokens != 93_252 || state.MsgCount != 25 ||
+		state.SystemFingerprint != systemFingerprint || state.ToolsFingerprint != toolsFingerprint {
+		t.Fatalf("persisted pressure baseline = %+v", state)
+	}
+
+	restored := NewSawtoothTrigger(0, 100_000, 10_000)
+	restored.SetLoadFunc(func(key string) (string, bool) {
+		value, found := persisted[key]
+		return value, found
+	})
+	got := restored.PressureBaseline(threadID)
+	if !got.Available || got.ActualTokens != 93_252 || got.MessageCount != 25 ||
+		got.SystemFingerprint != systemFingerprint || got.ToolsFingerprint != toolsFingerprint {
+		t.Fatalf("restored pressure baseline = %+v", got)
+	}
+}
+
+func TestSawtoothPressureBaselineLoadsLegacyState(t *testing.T) {
+	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+	trigger.SetLoadFunc(func(key string) (string, bool) {
+		return `{"tokens":81234,"msg_count":19}`, key == "sawtooth:pressure-legacy"
+	})
+
+	got := trigger.PressureBaseline("pressure-legacy")
+	if got.ActualTokens != 81_234 || got.MessageCount != 19 {
+		t.Fatalf("legacy coordinates were not restored: %+v", got)
+	}
+	if got.Available || got.SystemFingerprint != "" || got.ToolsFingerprint != "" || got.ResetReason != baselineResetNoActual {
+		t.Fatalf("legacy state was incorrectly treated as calibrated: %+v", got)
+	}
+	if reason := trigger.ShouldTrigger("pressure-legacy", 1); reason != TriggerNone {
+		t.Fatalf("legacy actual below threshold changed trigger behavior: %q", reason)
+	}
+}
+
+func TestSawtoothPressureBaselineLegacyUpdateForcesRebaseline(t *testing.T) {
+	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+	trigger.UpdatePressureBaseline(
+		"pressure-wrapper",
+		70_000,
+		20,
+		strings.Repeat("c", 64),
+		strings.Repeat("d", 64),
+	)
+	trigger.UpdateAfterResponse("pressure-wrapper", 71_000, 22)
+
+	got := trigger.PressureBaseline("pressure-wrapper")
+	if got.ActualTokens != 71_000 || got.MessageCount != 22 {
+		t.Fatalf("legacy wrapper did not update coordinates: %+v", got)
+	}
+	if got.Available || got.SystemFingerprint != "" || got.ToolsFingerprint != "" {
+		t.Fatalf("legacy wrapper retained reusable fingerprints: %+v", got)
+	}
+}
+
+func TestSawtoothPressureBaselineRejectsInvalidFingerprint(t *testing.T) {
+	valid := strings.Repeat("e", 64)
+	invalidFingerprints := []string{
+		strings.Repeat("A", 64),
+		strings.Repeat("f", 63),
+		strings.Repeat("g", 64),
+	}
+	for index, invalid := range invalidFingerprints {
+		threadID := fmt.Sprintf("pressure-invalid-%d", index)
+		trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+		trigger.UpdatePressureBaseline(threadID, 50_000, 12, invalid, valid)
+		got := trigger.PressureBaseline(threadID)
+		if got.Available || got.SystemFingerprint != "" || got.ToolsFingerprint != valid {
+			t.Fatalf("invalid fingerprint entered calibrated baseline: %+v", got)
+		}
+	}
+
+	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+	trigger.UpdatePressureBaseline("pressure-no-actual", 0, 12, valid, valid)
+	got := trigger.PressureBaseline("pressure-no-actual")
+	if got.Available || got.ActualTokens != 0 || got.SystemFingerprint != "" || got.ToolsFingerprint != "" {
+		t.Fatalf("non-positive actual established baseline: %+v", got)
+	}
+}
+
+func TestSawtoothPressureBaselineUpdateIsAtomic(t *testing.T) {
+	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+	const threadID = "pressure-update-atomic"
+	type version struct {
+		actual int
+		count  int
+		system string
+		tools  string
+	}
+	versions := []version{
+		{actual: 30_003, count: 303, system: strings.Repeat("5", 64), tools: strings.Repeat("6", 64)},
+		{actual: 40_004, count: 404, system: strings.Repeat("7", 64), tools: strings.Repeat("8", 64)},
+	}
+	trigger.UpdatePressureBaseline(threadID, versions[0].actual, versions[0].count, versions[0].system, versions[0].tools)
+
+	const iterations = 20_000
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for writer := 0; writer < 2; writer++ {
+		writer := writer
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < iterations; i++ {
+				value := versions[(i+writer)%len(versions)]
+				trigger.UpdatePressureBaseline(threadID, value.actual, value.count, value.system, value.tools)
+			}
+		}()
+	}
+	close(start)
+	for i := 0; i < iterations; i++ {
+		got := trigger.PressureBaseline(threadID)
+		matches := false
+		for _, want := range versions {
+			if got.Available && got.ActualTokens == want.actual && got.MessageCount == want.count &&
+				got.SystemFingerprint == want.system && got.ToolsFingerprint == want.tools {
+				matches = true
+				break
+			}
+		}
+		if !matches {
+			t.Fatalf("observed torn public baseline update: %+v", got)
+		}
+	}
+	wg.Wait()
+}
+
 func TestFrozenStoreKeepsRawCutoffSeparateFromFrozenPrefixLength(t *testing.T) {
 	frozen := NewFrozenStubs()
 	raw := frozenTestMessages(302)
