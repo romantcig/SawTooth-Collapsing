@@ -492,6 +492,14 @@ func TestSessionTitleSSEResponseState(t *testing.T) {
 	testSessionTitleResponseState(t, true)
 }
 
+func TestSubagentJSONResponseState(t *testing.T) {
+	testSubagentResponseState(t, false)
+}
+
+func TestSubagentSSEResponseState(t *testing.T) {
+	testSubagentResponseState(t, true)
+}
+
 func TestForwardSawtoothStatePolicy(t *testing.T) {
 	if !(*requestMeta)(nil).tracksSawtoothState() {
 		t.Fatal("nil meta 必须默认跟踪 Sawtooth 状态")
@@ -536,7 +544,13 @@ func testSessionTitleResponseState(t *testing.T, sse bool) {
 	server := newPipelineTestServer(t, upstream.URL)
 	server.Config.Proxy.Deflation = 0.5
 	server.Config.Debug = DebugConfig{Enabled: true, DataDir: t.TempDir()}
-	server.Sawtooth.UpdateAfterResponse(sessionID, 777, 9)
+	missingFingerprint := fingerprintTopLevelJSON(nil)
+	server.Sawtooth.UpdatePressureBaseline(sessionID, 777, 9, missingFingerprint, missingFingerprint)
+	baselineBefore := server.Sawtooth.PressureBaseline(sessionID)
+	requestSeqBefore := server.Sawtooth.GetRequestSeq(sessionID)
+	frozenMessages := []Message{{Role: "user", Content: mustMarshal("title-response-frozen")}}
+	server.Frozen.Store(sessionID, frozenMessages, 1, frozenMessages[0], 10, 20)
+	frozenBefore := server.Frozen.LengthFor(sessionID)
 	server.Sawtooth.mu.RLock()
 	beforeTime := server.Sawtooth.lastRequestTime[sessionID]
 	beforeLoaded := server.Sawtooth.loadedFromDB[sessionID]
@@ -563,6 +577,15 @@ func testSessionTitleResponseState(t *testing.T, sse bool) {
 	server.Sawtooth.mu.RUnlock()
 	if gotTokens != 777 || gotMessages != 9 || !gotTime.Equal(beforeTime) || gotLoaded != beforeLoaded {
 		t.Fatalf("session title 改写 Sawtooth 状态: tokens=%d messages=%d time_changed=%v loaded=%v", gotTokens, gotMessages, !gotTime.Equal(beforeTime), gotLoaded)
+	}
+	if baselineAfter := server.Sawtooth.PressureBaseline(sessionID); baselineAfter != baselineBefore {
+		t.Fatalf("session title 改写 pressure baseline\nbefore=%+v\nafter=%+v", baselineBefore, baselineAfter)
+	}
+	if got := server.Sawtooth.GetRequestSeq(sessionID); got != requestSeqBefore {
+		t.Fatalf("session title request sequence=%d, want unchanged %d", got, requestSeqBefore)
+	}
+	if got := server.Frozen.LengthFor(sessionID); got != frozenBefore {
+		t.Fatalf("session title Frozen length=%d, want unchanged %d", got, frozenBefore)
 	}
 	if strings.Contains(recorder.Body.String(), `"input_tokens":196`) || !strings.Contains(recorder.Body.String(), `"input_tokens":98`) {
 		t.Fatalf("session title 客户端 deflation 行为变化: %s", recorder.Body.String())
@@ -603,6 +626,86 @@ func testSessionTitleResponseState(t *testing.T, sse bool) {
 	server.Sawtooth.mu.RUnlock()
 	if ordinaryTokens != 93252 || ordinaryMessages != 1 {
 		t.Fatalf("ordinary state tokens/messages=%d/%d, want 93252/1", ordinaryTokens, ordinaryMessages)
+	}
+}
+
+func testSubagentResponseState(t *testing.T, sse bool) {
+	t.Helper()
+	const sessionID = "subagent-response-state"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if sse {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "event: message_start\n"+
+				`data: {"type":"message_start","message":{"usage":{"input_tokens":196,"cache_creation_input_tokens":0,"cache_read_input_tokens":93056,"output_tokens":20}}}`+"\n\n")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"type":"message","usage":{"input_tokens":196,"cache_creation_input_tokens":0,"cache_read_input_tokens":93056,"output_tokens":20}}`)
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	server.Config.Proxy.Deflation = 0.5
+	server.Config.Debug = DebugConfig{Enabled: true, DataDir: t.TempDir()}
+	missingFingerprint := fingerprintTopLevelJSON(nil)
+	server.Sawtooth.UpdatePressureBaseline(sessionID, 888, 11, missingFingerprint, missingFingerprint)
+	baselineBefore := server.Sawtooth.PressureBaseline(sessionID)
+	requestSeqBefore := server.Sawtooth.GetRequestSeq(sessionID)
+	frozenMessages := []Message{{Role: "user", Content: mustMarshal("subagent-response-frozen")}}
+	server.Frozen.Store(sessionID, frozenMessages, 1, frozenMessages[0], 10, 20)
+	frozenBefore := server.Frozen.LengthFor(sessionID)
+	archivesBefore := archiveCount(t, server.Store)
+	persistCalls := 0
+	server.Sawtooth.SetPersistFunc(func(_ string, _ string) { persistCalls++ })
+
+	body, err := json.Marshal(map[string]any{
+		"model":    "same-model",
+		"stream":   sse,
+		"messages": pipelineMessages(2, 3),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Claude-Code-Session-Id", sessionID)
+	req.Header.Set("x-anthropic-billing-header", "cc_is_subagent=true")
+	recorder := httptest.NewRecorder()
+	server.HandleMessages(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("subagent status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if persistCalls != 0 {
+		t.Fatalf("subagent persist calls=%d, want 0", persistCalls)
+	}
+	if baselineAfter := server.Sawtooth.PressureBaseline(sessionID); baselineAfter != baselineBefore {
+		t.Fatalf("subagent 改写 pressure baseline\nbefore=%+v\nafter=%+v", baselineBefore, baselineAfter)
+	}
+	if got := server.Sawtooth.GetRequestSeq(sessionID); got != requestSeqBefore {
+		t.Fatalf("subagent request sequence=%d, want unchanged %d", got, requestSeqBefore)
+	}
+	if got := server.Frozen.LengthFor(sessionID); got != frozenBefore {
+		t.Fatalf("subagent Frozen length=%d, want unchanged %d", got, frozenBefore)
+	}
+	if got := archiveCount(t, server.Store); got != archivesBefore {
+		t.Fatalf("subagent archive rows=%d, want unchanged %d", got, archivesBefore)
+	}
+	if strings.Contains(recorder.Body.String(), `"input_tokens":196`) || !strings.Contains(recorder.Body.String(), `"input_tokens":98`) {
+		t.Fatalf("subagent 客户端 deflation 行为变化: %s", recorder.Body.String())
+	}
+	facts := readDebugFactFiles(t, server.Config.Debug.DataDir, sessionID)
+	usageFacts := 0
+	for _, data := range facts {
+		var fact debugFact
+		if json.Unmarshal(data, &fact) == nil && fact.Stage == debugStageResponseUsage {
+			usageFacts++
+			if fact.TotalInputTokens != 93252 {
+				t.Fatalf("subagent usage total=%d, want 93252", fact.TotalInputTokens)
+			}
+		}
+	}
+	if usageFacts != 1 {
+		t.Fatalf("subagent response usage facts=%d, want 1", usageFacts)
 	}
 }
 

@@ -46,12 +46,21 @@ func TestTotalInputTokens(t *testing.T) {
 	}
 }
 
-func TestHandleSSECacheUsagePersistsTotalBeforeDeflation(t *testing.T) {
+func TestHandleSSEPressureBaseline(t *testing.T) {
 	trigger := NewSawtoothTrigger(time.Hour, 50000, 1000)
 	var persisted string
 	trigger.SetPersistFunc(func(_ string, value string) { persisted = value })
 	s := NewServer(Config{Proxy: ProxyConfig{Deflation: 0.5}})
 	s.Sawtooth = trigger
+	system := json.RawMessage(`[{"type":"text","text":"sse system"}]`)
+	tools := json.RawMessage(`[{"name":"sse_tool","input_schema":{"type":"object"}}]`)
+	meta := newRequestMeta(1, "sse-cache")
+	meta.PressureDecision = pressureDecision{
+		Available:         true,
+		MessageCount:      37,
+		SystemFingerprint: fingerprintTopLevelJSON(system),
+		ToolsFingerprint:  fingerprintTopLevelJSON(tools),
+	}
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": {"text/event-stream"}},
@@ -59,40 +68,49 @@ func TestHandleSSECacheUsagePersistsTotalBeforeDeflation(t *testing.T) {
 			"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":196,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":93056,\"output_tokens\":20}}}\n\n")),
 	}
 	recorder := httptest.NewRecorder()
-	s.handleSSE(recorder, resp, newRequestMeta(1, "sse-cache"), time.Now(), "model", 25)
+	s.handleSSE(recorder, resp, meta, time.Now(), "model", 4)
 
 	var state persistedState
 	if err := json.Unmarshal([]byte(persisted), &state); err != nil {
 		t.Fatalf("解析持久状态: %v; raw=%q", err, persisted)
 	}
-	if state.Tokens != 93252 || state.MsgCount != 25 {
-		t.Fatalf("SSE 持久状态=%+v, want tokens=93252 msg_count=25", state)
+	if state.Tokens != 93252 || state.MsgCount != meta.PressureDecision.MessageCount || state.SystemFingerprint != meta.PressureDecision.SystemFingerprint || state.ToolsFingerprint != meta.PressureDecision.ToolsFingerprint {
+		t.Fatalf("SSE 持久状态=%+v, want actual=93252 original_count=%d fingerprints=%q/%q", state, meta.PressureDecision.MessageCount, meta.PressureDecision.SystemFingerprint, meta.PressureDecision.ToolsFingerprint)
 	}
 	if strings.Contains(recorder.Body.String(), `"input_tokens":196`) || !strings.Contains(recorder.Body.String(), `"input_tokens":98`) {
 		t.Fatalf("客户端 deflation 行为变化: %s", recorder.Body.String())
 	}
 }
 
-func TestHandleJSONCacheUsagePersistsTotalAndColdStartTriggers(t *testing.T) {
+func TestHandleJSONPressureBaseline(t *testing.T) {
 	trigger := NewSawtoothTrigger(time.Hour, 50000, 1000)
 	var persisted string
 	trigger.SetPersistFunc(func(_ string, value string) { persisted = value })
 	s := NewServer(Config{Proxy: ProxyConfig{Deflation: 0.5}})
 	s.Sawtooth = trigger
+	system := json.RawMessage(`[{"type":"text","text":"json system"}]`)
+	tools := json.RawMessage(`[{"name":"json_tool","input_schema":{"type":"object"}}]`)
+	meta := newRequestMeta(2, "json-cache")
+	meta.PressureDecision = pressureDecision{
+		Available:         true,
+		MessageCount:      41,
+		SystemFingerprint: fingerprintTopLevelJSON(system),
+		ToolsFingerprint:  fingerprintTopLevelJSON(tools),
+	}
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": {"application/json"}},
 		Body:       io.NopCloser(strings.NewReader(`{"type":"message","usage":{"input_tokens":196,"cache_creation_input_tokens":0,"cache_read_input_tokens":93056,"output_tokens":20}}`)),
 	}
 	recorder := httptest.NewRecorder()
-	s.handleJSON(recorder, resp, newRequestMeta(2, "json-cache"), time.Now(), "model", 25)
+	s.handleJSON(recorder, resp, meta, time.Now(), "model", 3)
 
 	var state persistedState
 	if err := json.Unmarshal([]byte(persisted), &state); err != nil {
 		t.Fatalf("解析持久状态: %v; raw=%q", err, persisted)
 	}
-	if state.Tokens != 93252 || state.MsgCount != 25 {
-		t.Fatalf("JSON 持久状态=%+v, want tokens=93252 msg_count=25", state)
+	if state.Tokens != 93252 || state.MsgCount != meta.PressureDecision.MessageCount || state.SystemFingerprint != meta.PressureDecision.SystemFingerprint || state.ToolsFingerprint != meta.PressureDecision.ToolsFingerprint {
+		t.Fatalf("JSON 持久状态=%+v, want actual=93252 original_count=%d fingerprints=%q/%q", state, meta.PressureDecision.MessageCount, meta.PressureDecision.SystemFingerprint, meta.PressureDecision.ToolsFingerprint)
 	}
 	if strings.Contains(recorder.Body.String(), `"input_tokens":196`) || !strings.Contains(recorder.Body.String(), `"input_tokens":98`) {
 		t.Fatalf("客户端 deflation 行为变化: %s", recorder.Body.String())
@@ -104,6 +122,165 @@ func TestHandleJSONCacheUsagePersistsTotalAndColdStartTriggers(t *testing.T) {
 	})
 	if got := restored.ShouldTrigger("json-cache", 1); got != TriggerTokens {
 		t.Fatalf("冷启动 trigger=%q, want %q", got, TriggerTokens)
+	}
+}
+
+func TestHandleJSONAuxiliaryDoesNotUpdate(t *testing.T) {
+	testHandleAuxiliaryDoesNotUpdate(t, false)
+}
+
+func TestHandleSSEAuxiliaryDoesNotUpdate(t *testing.T) {
+	testHandleAuxiliaryDoesNotUpdate(t, true)
+}
+
+func testHandleAuxiliaryDoesNotUpdate(t *testing.T, sse bool) {
+	t.Helper()
+	for _, tc := range []struct {
+		name string
+		meta *requestMeta
+	}{
+		{name: "session title", meta: &requestMeta{RequestKind: requestKindSessionTitle}},
+		{name: "subagent", meta: &requestMeta{AgentRole: agentRoleSubagent}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const sessionID = "auxiliary-baseline"
+			trigger := NewSawtoothTrigger(time.Hour, 50000, 1000)
+			oldSystem := fingerprintTopLevelJSON(json.RawMessage(`"old system"`))
+			oldTools := fingerprintTopLevelJSON(json.RawMessage(`[]`))
+			trigger.UpdatePressureBaseline(sessionID, 777, 9, oldSystem, oldTools)
+			before := trigger.PressureBaseline(sessionID)
+			persistCalls := 0
+			trigger.SetPersistFunc(func(_ string, _ string) { persistCalls++ })
+			s := NewServer(Config{Proxy: ProxyConfig{Deflation: 0.5}})
+			s.Sawtooth = trigger
+			meta := newRequestMeta(10, sessionID)
+			meta.RequestKind = tc.meta.RequestKind
+			meta.AgentRole = tc.meta.AgentRole
+			meta.PressureDecision = pressureDecision{
+				Available:         true,
+				MessageCount:      20,
+				SystemFingerprint: fingerprintTopLevelJSON(json.RawMessage(`"new system"`)),
+				ToolsFingerprint:  fingerprintTopLevelJSON(json.RawMessage(`[{"name":"new"}]`)),
+			}
+			recorder := httptest.NewRecorder()
+			if sse {
+				resp := &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"text/event-stream"}},
+					Body: io.NopCloser(strings.NewReader("event: message_start\n" +
+						"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":196,\"cache_read_input_tokens\":93056}}}\n\n")),
+				}
+				s.handleSSE(recorder, resp, meta, time.Now(), "model", 2)
+			} else {
+				resp := &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"usage":{"input_tokens":196,"cache_read_input_tokens":93056}}`)),
+				}
+				s.handleJSON(recorder, resp, meta, time.Now(), "model", 2)
+			}
+			if persistCalls != 0 {
+				t.Fatalf("auxiliary persisted baseline %d times", persistCalls)
+			}
+			if after := trigger.PressureBaseline(sessionID); after != before {
+				t.Fatalf("auxiliary changed baseline\nbefore=%+v\nafter=%+v", before, after)
+			}
+			if strings.Contains(recorder.Body.String(), `"input_tokens":196`) || !strings.Contains(recorder.Body.String(), `"input_tokens":98`) {
+				t.Fatalf("auxiliary deflation changed: %s", recorder.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandleJSONFailureDoesNotUpdate(t *testing.T) {
+	testHandleFailureDoesNotUpdate(t, false)
+	t.Run("upstream transport", func(t *testing.T) {
+		const sessionID = "upstream-failure-baseline"
+		trigger := NewSawtoothTrigger(time.Hour, 50000, 1000)
+		fingerprint := fingerprintTopLevelJSON(nil)
+		trigger.UpdatePressureBaseline(sessionID, 777, 9, fingerprint, fingerprint)
+		before := trigger.PressureBaseline(sessionID)
+		persistCalls := 0
+		trigger.SetPersistFunc(func(_ string, _ string) { persistCalls++ })
+		s := NewServer(Config{Proxy: ProxyConfig{Target: "https://upstream.invalid", Deflation: 0.5}})
+		s.Sawtooth = trigger
+		s.HTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, io.ErrUnexpectedEOF
+		})}
+		meta := newRequestMeta(21, sessionID)
+		meta.PressureDecision = pressureDecision{Available: true, MessageCount: 10, SystemFingerprint: fingerprint, ToolsFingerprint: fingerprint}
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"test","messages":[]}`))
+		recorder := httptest.NewRecorder()
+		s.forwardRaw(recorder, req, meta)
+		if persistCalls != 0 {
+			t.Fatalf("upstream failure persisted baseline %d times", persistCalls)
+		}
+		if after := trigger.PressureBaseline(sessionID); after != before {
+			t.Fatalf("upstream failure changed baseline\nbefore=%+v\nafter=%+v", before, after)
+		}
+	})
+}
+
+func TestHandleSSEFailureDoesNotUpdate(t *testing.T) {
+	testHandleFailureDoesNotUpdate(t, true)
+}
+
+func testHandleFailureDoesNotUpdate(t *testing.T, sse bool) {
+	t.Helper()
+	cases := []struct {
+		name       string
+		statusCode int
+		body       string
+	}{
+		{name: "non-2xx", statusCode: http.StatusBadGateway, body: `{"usage":{"input_tokens":99999}}`},
+		{name: "parse failure", statusCode: http.StatusOK, body: `{not-json`},
+		{name: "no usage", statusCode: http.StatusOK, body: `{"type":"message"}`},
+		{name: "empty usage", statusCode: http.StatusOK, body: `{"usage":{}}`},
+	}
+	if sse {
+		cases = []struct {
+			name       string
+			statusCode int
+			body       string
+		}{
+			{name: "parse failure", statusCode: http.StatusOK, body: "event: message_start\ndata: {not-json\n\n"},
+			{name: "no message start", statusCode: http.StatusOK, body: "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":99999}}\n\n"},
+			{name: "message start without usage", statusCode: http.StatusOK, body: "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\n"},
+			{name: "empty usage", statusCode: http.StatusOK, body: "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\n"},
+		}
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			const sessionID = "failure-baseline"
+			trigger := NewSawtoothTrigger(time.Hour, 50000, 1000)
+			fingerprint := fingerprintTopLevelJSON(nil)
+			trigger.UpdatePressureBaseline(sessionID, 777, 9, fingerprint, fingerprint)
+			before := trigger.PressureBaseline(sessionID)
+			persistCalls := 0
+			trigger.SetPersistFunc(func(_ string, _ string) { persistCalls++ })
+			s := NewServer(Config{Proxy: ProxyConfig{Deflation: 0.5}})
+			s.Sawtooth = trigger
+			meta := newRequestMeta(20, sessionID)
+			meta.PressureDecision = pressureDecision{Available: true, MessageCount: 10, SystemFingerprint: fingerprint, ToolsFingerprint: fingerprint}
+			resp := &http.Response{
+				StatusCode: tc.statusCode,
+				Header:     http.Header{"Content-Type": {"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(tc.body)),
+			}
+			recorder := httptest.NewRecorder()
+			if sse {
+				resp.Header.Set("Content-Type", "text/event-stream")
+				s.handleSSE(recorder, resp, meta, time.Now(), "model", 2)
+			} else {
+				s.handleJSON(recorder, resp, meta, time.Now(), "model", 2)
+			}
+			if persistCalls != 0 {
+				t.Fatalf("failure path persisted baseline %d times", persistCalls)
+			}
+			if after := trigger.PressureBaseline(sessionID); after != before {
+				t.Fatalf("failure path changed baseline\nbefore=%+v\nafter=%+v", before, after)
+			}
+		})
 	}
 }
 
