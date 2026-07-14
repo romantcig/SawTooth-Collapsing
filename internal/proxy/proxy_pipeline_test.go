@@ -610,6 +610,47 @@ func TestHandleMessagesCollapseFreezeLifecycle(t *testing.T) {
 	}
 }
 
+func TestHandleMessagesPreviousUsageAboveThresholdTriggersCollapse(t *testing.T) {
+	var forwarded []Message
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []Message `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		forwarded = deepCopyMessages(body.Messages)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	sessionID := "previous-usage-trigger"
+	var raw []Message
+	for words := 20; words <= 300; words += 10 {
+		candidate := pipelineMessages(120, words)
+		estimate := server.TokenCounter.CountMessagesTokens(candidate)
+		if estimate >= 11000 && estimate < server.Config.Stubify.TokenThreshold {
+			raw = candidate
+			break
+		}
+	}
+	if len(raw) == 0 {
+		t.Fatal("未构造出低于阈值且具有可折叠历史的消息")
+	}
+	server.Sawtooth.UpdateAfterResponse(sessionID, server.Config.Stubify.TokenThreshold+1, len(raw))
+
+	servePipelineRequest(t, server, sessionID, raw)
+
+	if got := archiveCount(t, server.Store); got == 0 {
+		t.Fatal("上次真实 usage 已超阈值，但本次未产生 collapse archive")
+	}
+	if len(forwarded) >= len(raw) {
+		t.Fatalf("forwarded message count=%d, want shorter than raw=%d", len(forwarded), len(raw))
+	}
+}
+
 func TestHandleMessagesCollapseThenRestore(t *testing.T) {
 	var forwarded [][]Message
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

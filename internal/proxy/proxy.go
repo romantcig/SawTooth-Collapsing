@@ -543,11 +543,19 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		// 先基于 frozen+tail 判定 frozen 是否仍有效，确定本请求唯一的权威基础消息。
 		totalTokens := contextTokens + s.TokenCounter.CountMessagesTokens(messages)
 		threshold := s.Config.Stubify.TokenThreshold
+		pressureTrigger := TriggerNone
+		if s.Sawtooth != nil {
+			// 上次上游响应的 total_input_tokens 包含 system/tools/cache 等
+			// messages 本地估算看不到的真实上下文压力，必须能直接打开压缩入口。
+			// 此处传 0 只查历史 usage/pause；当前 rawEstimate 已由 totalTokens 门禁覆盖，
+			// 否则会让已有效的 frozen prefix 因原始长历史被每轮强制失效。
+			pressureTrigger = s.Sawtooth.ShouldTrigger(sessionID, 0)
+		}
 
 		// ── YesMem shouldInvalidateFrozen ──
 		// frozen prefix 存在时，若 frozen+tail 仍在阈值内则跳过压缩管线。
 		// 对标 YesMem proxy.go:1230: shouldInvalidateFrozen(combinedTokens, threshold)
-		needCompress := totalTokens >= threshold
+		needCompress := totalTokens >= threshold || pressureTrigger != TriggerNone
 		if frozenPrefixLen > 0 && needCompress {
 			// 用原始消息切片计算 tail tokens——防止 frozen prefix 替换后
 			// len(messages) < raw cutoff 导致切片越界
@@ -556,7 +564,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				tailTokens = s.TokenCounter.CountMessagesTokens(originalMessages[frozenRawCutoff:])
 			}
 			combinedTokens := contextTokens + frozenTokens + tailTokens
-			if combinedTokens <= threshold {
+			if combinedTokens <= threshold && pressureTrigger == TriggerNone {
 				needCompress = false
 				meta.Logger.Info("frozen prefix 仍在阈值内，跳过压缩",
 					"frozen_tokens", frozenTokens,
@@ -595,7 +603,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 		// 召回后的消息才是最终压缩输入；Frozen 失效分支不再重跑召回。
 		totalTokens = contextTokens + s.TokenCounter.CountMessagesTokens(messages)
-		needCompress = totalTokens >= threshold
+		needCompress = totalTokens >= threshold || pressureTrigger != TriggerNone
 		if needCompress {
 			// 提取 pivot text：使用最新一条 user 消息的内容文本
 			pivotText := extractLatestUserText(messages)
@@ -711,7 +719,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 					if s.Sawtooth != nil && s.Frozen != nil {
 						trigger := s.Sawtooth.ShouldTrigger(sessionID, rawEstimate)
-						if trigger != "" {
+						if trigger != TriggerNone {
 							meta.Logger.Info("SawtoothTrigger 触发",
 								"reason", trigger,
 								"raw_estimate", rawEstimate,
@@ -809,7 +817,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			// 持久化的 prefix bytes 与本次实际上游 wire prefix 完全一致。
 			if s.Sawtooth != nil && s.Frozen != nil {
 				trigger := s.Sawtooth.ShouldTrigger(sessionID, rawEstimate)
-				if trigger != "" {
+				if trigger != TriggerNone {
 					meta.Logger.Info("SawtoothTrigger 触发",
 						"reason", trigger,
 						"raw_estimate", rawEstimate,
@@ -837,11 +845,6 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			r.Body = io.NopCloser(bytes.NewReader(newBody))
 
 		} else {
-			// 低于阈值：仍检查 SawtoothTrigger（用于状态跟踪，不执行 Store）
-			if s.Sawtooth != nil {
-				_ = s.Sawtooth.ShouldTrigger(sessionID, rawEstimate)
-			}
-
 			// Phase 5: 每个主代理请求都主动清理已被后续 assistant 消化的旧 tool_result。
 			if s.EagerStub != nil {
 				freshStubs := 0
