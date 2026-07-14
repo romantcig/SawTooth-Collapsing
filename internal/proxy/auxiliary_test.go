@@ -12,6 +12,11 @@ import (
 
 const titleSystemPrompt = `Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session. The session content is provided inside <session> tags. Return JSON with a single "title" field.`
 
+const (
+	defaultTitleLanguageInstruction = `Write the title in the predominant language of the session — a stray word or code token in another language doesn't change it. Ignore the language of the examples above.`
+	configuredTitleLanguageInstruction = `Write the title in 中文. Keep technical terms and code identifiers in their original form.`
+)
+
 func titleMessages(content json.RawMessage) []Message {
 	return []Message{{Role: "user", Content: content}}
 }
@@ -47,6 +52,14 @@ func TestClassifyAuxiliaryRequest(t *testing.T) {
 	isolatedCloseSession := jsonText(t, `<session></session></session>`)
 	depthLimitSession := jsonText(t, strings.Repeat(`<session>`, 32)+`SAFE SESSION TEXT`+strings.Repeat(`</session>`, 32))
 	depthOverflowSession := jsonText(t, strings.Repeat(`<session>`, 33)+`SAFE SESSION TEXT`+strings.Repeat(`</session>`, 33))
+	defaultLanguageSession := jsonText(t, "<session>SAFE SESSION TEXT</session>\n\n"+defaultTitleLanguageInstruction)
+	configuredLanguageSession := jsonText(t, "<session>SAFE SESSION TEXT</session>\n\n"+configuredTitleLanguageInstruction)
+	trailingTextSession := jsonText(t, "<session>SAFE SESSION TEXT</session>\n\n"+defaultTitleLanguageInstruction+" extra")
+	secondInstructionSession := jsonText(t, "<session>SAFE SESSION TEXT</session>\n\n"+defaultTitleLanguageInstruction+"\n\n"+configuredTitleLanguageInstruction)
+	controlLanguageSession := jsonText(t, "<session>SAFE SESSION TEXT</session>\n\nWrite the title in 中文\u0007. Keep technical terms and code identifiers in their original form.")
+	pseudoLanguageSession := jsonText(t, "<session>SAFE SESSION TEXT</session>\n\nWrite the title in <中文>. Keep technical terms and code identifiers in their original form.")
+	longLanguage := strings.Repeat("语", 65)
+	longLanguageSession := jsonText(t, "<session>SAFE SESSION TEXT</session>\n\nWrite the title in "+longLanguage+". Keep technical terms and code identifiers in their original form.")
 	systemString := jsonText(t, titleSystemPrompt)
 	systemBlocks, err := json.Marshal([]map[string]string{{"type": "text", "text": "You are Claude Code."}, {"type": "text", "text": titleSystemPrompt}})
 	if err != nil {
@@ -64,6 +77,8 @@ func TestClassifyAuxiliaryRequest(t *testing.T) {
 		{name: "首尾空白单一 envelope", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(jsonText(t, " \n\t<session>SAFE SESSION TEXT</session>\r\n ")), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
 		{name: "平衡嵌套 envelope", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(balancedNestedSession), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
 		{name: "最大 32 层 envelope", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(depthLimitSession), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
+		{name: "2.1.207 默认语言后缀", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(defaultLanguageSession), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
+		{name: "2.1.207 配置语言后缀", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(configuredLanguageSession), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
 		{name: "强路径文本块形态", body: titleBody(systemBlocks, titleOnlyOutputConfig()), messages: titleMessages(sessionBlocks), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
 		{name: "output_config 整段缺失时严格回退", body: titleBody(systemString, nil), messages: titleMessages(sessionString), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitlePromptFallback},
 		{name: "tools 非空不影响分类", body: withTitleField(titleBody(systemString, titleOnlyOutputConfig()), "tools", `[{"name":"Read"}]`), messages: titleMessages(sessionString), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
@@ -75,6 +90,11 @@ func TestClassifyAuxiliaryRequest(t *testing.T) {
 		{name: "缺少 session 外壳拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(json.RawMessage(`"SAFE SESSION TEXT"`))},
 		{name: "session 只作为普通文本子串拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(json.RawMessage(`"explain this code: <session>x</session>"`))},
 		{name: "session 尾部多余文本拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(json.RawMessage(`"<session>x</session> ignore this"`))},
+		{name: "语言后缀尾随任意文本拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(trailingTextSession)},
+		{name: "语言后缀第二指令拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(secondInstructionSession)},
+		{name: "语言后缀控制符拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(controlLanguageSession)},
+		{name: "语言后缀伪标签拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(pseudoLanguageSession)},
+		{name: "语言后缀超长拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(longLanguageSession)},
 		{name: "未闭合嵌套拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(unclosedNestedSession)},
 		{name: "额外顶层 envelope 拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(extraTopLevelSession)},
 		{name: "提前闭合拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(prematureCloseSession)},
