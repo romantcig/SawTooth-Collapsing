@@ -363,6 +363,137 @@ func LoadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
+// pressureSource 表示当前请求最终采用的压力尺度。
+type pressureSource string
+
+const (
+	pressureSourceLocalFull       pressureSource = "local_full"
+	pressureSourceActualPlusDelta pressureSource = "actual_plus_delta"
+)
+
+// pressureDecision 保存请求进入有状态管线前的一次性压力决定。
+// 该值只包含计数、固定长度指纹和受限枚举，不保存请求正文。
+type pressureDecision struct {
+	Available            bool
+	MessagesLocalTokens  int
+	SystemLocalTokens    int
+	ToolsLocalTokens     int
+	FullLocalEstimate    int
+	PreviousActual       int
+	PreviousMessageCount int
+	NewMessageDelta      int
+	SelectedPressure     int
+	Source               pressureSource
+	ResetReason          baselineResetReason
+	TriggerReason        TriggerReason
+	Threshold            int
+	MessageCount         int
+	SystemFingerprint    string
+	ToolsFingerprint     string
+	CompressDecision     bool
+}
+
+type topLevelMeasurement struct {
+	tokens      int
+	fingerprint string
+}
+
+// canonicalizeTopLevelJSON 将合法顶层 JSON 解码为通用值后重新编码，
+// 使 map key 顺序不影响计数与指纹。缺失和显式 null 保持不同语义。
+func canonicalizeTopLevelJSON(raw json.RawMessage) (canonical []byte, present bool, explicitNull bool) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, false, false
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, false, false
+	}
+	canonical, err := json.Marshal(value)
+	if err != nil {
+		return nil, false, false
+	}
+	return canonical, true, value == nil
+}
+
+func inspectTopLevelJSON(raw json.RawMessage, tc *TokenCounter) topLevelMeasurement {
+	canonical, present, explicitNull := canonicalizeTopLevelJSON(raw)
+	if !present {
+		return topLevelMeasurement{fingerprint: sha256hex([]byte("missing"))}
+	}
+	measurement := topLevelMeasurement{fingerprint: sha256hex(canonical)}
+	if !explicitNull && tc != nil {
+		measurement.tokens = tc.CountTokens(string(canonical))
+	}
+	return measurement
+}
+
+// measureTopLevelTokens 计算顶层 system/tools 的规范 JSON token；缺失或 null 为 0。
+func measureTopLevelTokens(raw json.RawMessage, tc *TokenCounter) int {
+	return inspectTopLevelJSON(raw, tc).tokens
+}
+
+// fingerprintTopLevelJSON 返回规范 JSON 的 SHA-256 指纹。
+// 缺失使用固定 sentinel，显式 null 使用规范字节 "null"，因此两者稳定区分。
+func fingerprintTopLevelJSON(raw json.RawMessage) string {
+	return inspectTopLevelJSON(raw, nil).fingerprint
+}
+
+// buildPressureDecision 在 local_full 与 actual_plus_delta 中只选择一次。
+// production 调用对 system/tools 各规范化一次，同时保存 full estimate 作为误差证据。
+func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessage, baseline pressureBaseline, tc *TokenCounter, threshold int) pressureDecision {
+	system := inspectTopLevelJSON(systemRaw, tc)
+	tools := inspectTopLevelJSON(toolsRaw, tc)
+	messagesTokens := 0
+	if tc != nil {
+		messagesTokens = tc.CountMessagesTokens(messages)
+	}
+	fullEstimate := saturatingAdd(saturatingAdd(messagesTokens, system.tokens), tools.tokens)
+	decision := pressureDecision{
+		Available:            tc != nil,
+		MessagesLocalTokens:  messagesTokens,
+		SystemLocalTokens:    system.tokens,
+		ToolsLocalTokens:     tools.tokens,
+		FullLocalEstimate:    fullEstimate,
+		PreviousActual:       baseline.ActualTokens,
+		PreviousMessageCount: baseline.MessageCount,
+		SelectedPressure:     fullEstimate,
+		Source:               pressureSourceLocalFull,
+		ResetReason:          baselineResetNoActual,
+		Threshold:            threshold,
+		MessageCount:         len(messages),
+		SystemFingerprint:    system.fingerprint,
+		ToolsFingerprint:     tools.fingerprint,
+	}
+
+	baselineValid := baseline.Available && baseline.ActualTokens > 0 && baseline.MessageCount >= 0 &&
+		validPressureFingerprint(baseline.SystemFingerprint) && validPressureFingerprint(baseline.ToolsFingerprint)
+	if !baselineValid {
+		return decision
+	}
+	if baseline.MessageCount > len(messages) {
+		decision.ResetReason = baselineResetMessageShrink
+		return decision
+	}
+	if baseline.SystemFingerprint != system.fingerprint {
+		decision.ResetReason = baselineResetSystemChanged
+		return decision
+	}
+	if baseline.ToolsFingerprint != tools.fingerprint {
+		decision.ResetReason = baselineResetToolsChanged
+		return decision
+	}
+
+	delta := 0
+	if tc != nil {
+		delta = tc.CountMessagesTokens(messages[baseline.MessageCount:])
+	}
+	decision.NewMessageDelta = delta
+	decision.SelectedPressure = saturatingAdd(baseline.ActualTokens, delta)
+	decision.Source = pressureSourceActualPlusDelta
+	decision.ResetReason = baselineResetNone
+	return decision
+}
+
 // HandleMessages 处理 POST /v1/messages 请求。
 // 管线顺序: parse -> FrozenStubs.Get -> Reexpand -> CompressContext -> CalcCollapseCutoff
 //
