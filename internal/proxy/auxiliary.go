@@ -183,6 +183,25 @@ func inspectAuxiliaryOutputConfig(bodyMap map[string]json.RawMessage) auxiliaryO
 	if len(raw) == 0 || strings.TrimSpace(string(raw)) == "null" {
 		return auxiliaryOutputConfigInvalid
 	}
+	outputFields, ok := decodeJSONObjectWithKeys(raw, "effort", "format")
+	if !ok {
+		return auxiliaryOutputConfigInvalid
+	}
+	formatFields, ok := decodeJSONObjectWithKeys(outputFields["format"], "type", "schema")
+	if !ok {
+		return auxiliaryOutputConfigInvalid
+	}
+	schemaFields, ok := decodeJSONObjectWithKeys(formatFields["schema"], "type", "properties", "required", "additionalProperties")
+	if !ok {
+		return auxiliaryOutputConfigInvalid
+	}
+	propertiesFields, ok := decodeJSONObjectWithKeys(schemaFields["properties"], "title")
+	if !ok {
+		return auxiliaryOutputConfigInvalid
+	}
+	if _, ok := decodeJSONObjectWithKeys(propertiesFields["title"], "type"); !ok {
+		return auxiliaryOutputConfigInvalid
+	}
 
 	var outputConfig struct {
 		Format struct {
@@ -214,6 +233,26 @@ func inspectAuxiliaryOutputConfig(bodyMap map[string]json.RawMessage) auxiliaryO
 		return auxiliaryOutputConfigInvalid
 	}
 	return auxiliaryOutputConfigTitleOnly
+}
+
+func decodeJSONObjectWithKeys(raw json.RawMessage, allowed ...string) (map[string]json.RawMessage, bool) {
+	if len(raw) == 0 {
+		return nil, false
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil || fields == nil {
+		return nil, false
+	}
+	allowedKeys := make(map[string]struct{}, len(allowed))
+	for _, key := range allowed {
+		allowedKeys[key] = struct{}{}
+	}
+	for key := range fields {
+		if _, ok := allowedKeys[key]; !ok {
+			return nil, false
+		}
+	}
+	return fields, true
 }
 
 func logAuxiliaryClassification(logger *slog.Logger, classification auxiliaryClassification, messageCount int) {

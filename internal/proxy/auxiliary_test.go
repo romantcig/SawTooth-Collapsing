@@ -60,6 +60,8 @@ func TestClassifyAuxiliaryRequest(t *testing.T) {
 	pseudoLanguageSession := jsonText(t, "<session>SAFE SESSION TEXT</session>\n\nWrite the title in <中文>. Keep technical terms and code identifiers in their original form.")
 	longLanguage := strings.Repeat("语", 65)
 	longLanguageSession := jsonText(t, "<session>SAFE SESSION TEXT</session>\n\nWrite the title in "+longLanguage+". Keep technical terms and code identifiers in their original form.")
+	maxLanguage := strings.Repeat("语", 64)
+	maxLanguageSession := jsonText(t, "<session>SAFE SESSION TEXT</session>\n\nWrite the title in "+maxLanguage+". Keep technical terms and code identifiers in their original form.")
 	systemString := jsonText(t, titleSystemPrompt)
 	systemBlocks, err := json.Marshal([]map[string]string{{"type": "text", "text": "You are Claude Code."}, {"type": "text", "text": titleSystemPrompt}})
 	if err != nil {
@@ -79,6 +81,7 @@ func TestClassifyAuxiliaryRequest(t *testing.T) {
 		{name: "最大 32 层 envelope", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(depthLimitSession), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
 		{name: "2.1.207 默认语言后缀", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(defaultLanguageSession), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
 		{name: "2.1.207 配置语言后缀", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(configuredLanguageSession), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
+		{name: "2.1.207 配置语言 64 字符边界", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(maxLanguageSession), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
 		{name: "2.1.207 默认语言后缀缺失 output_config 回退", body: titleBody(systemString, nil), messages: titleMessages(defaultLanguageSession), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitlePromptFallback},
 		{name: "2.1.207 配置语言后缀缺失 output_config 回退", body: titleBody(systemString, nil), messages: titleMessages(configuredLanguageSession), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitlePromptFallback},
 		{name: "强路径文本块形态", body: titleBody(systemBlocks, titleOnlyOutputConfig()), messages: titleMessages(sessionBlocks), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
@@ -108,6 +111,7 @@ func TestClassifyAuxiliaryRequest(t *testing.T) {
 		{name: "2.1.207 后缀 output_config null 不得回退", body: titleBody(systemString, json.RawMessage(`null`)), messages: titleMessages(defaultLanguageSession)},
 		{name: "output_config 畸形不得回退", body: titleBody(systemString, json.RawMessage(`{"format":`)), messages: titleMessages(sessionString)},
 		{name: "output_config 额外 property 拒绝", body: titleBody(systemString, json.RawMessage(`{"format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}},"extra":"nope"}`)), messages: titleMessages(defaultLanguageSession)},
+		{name: "output_config 非 json_schema 拒绝", body: titleBody(systemString, json.RawMessage(`{"format":{"type":"text","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}}}`)), messages: titleMessages(defaultLanguageSession)},
 		{name: "conversation name schema 拒绝", body: titleBody(systemString, json.RawMessage(`{"format":{"type":"json_schema","schema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}}}`)), messages: titleMessages(sessionString)},
 		{name: "title branch schema 拒绝", body: titleBody(systemString, json.RawMessage(`{"format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"},"branch":{"type":"string"}},"required":["title","branch"],"additionalProperties":false}}}`)), messages: titleMessages(sessionString)},
 		{name: "允许额外 schema 字段时拒绝", body: titleBody(systemString, json.RawMessage(`{"format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":true}}}`)), messages: titleMessages(sessionString)},
