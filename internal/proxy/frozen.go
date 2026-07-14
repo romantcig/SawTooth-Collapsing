@@ -524,8 +524,10 @@ const (
 
 // persistedState 是持久化到 proxy_state 的 JSON 结构。
 type persistedState struct {
-	Tokens   int `json:"tokens"`
-	MsgCount int `json:"msg_count"`
+	Tokens            int    `json:"tokens"`
+	MsgCount          int    `json:"msg_count"`
+	SystemFingerprint string `json:"system_fingerprint,omitempty"`
+	ToolsFingerprint  string `json:"tools_fingerprint,omitempty"`
 }
 
 // baselineResetReason 表示 pressure baseline 不能沿用时的受限原因。
@@ -691,19 +693,61 @@ func (st *SawtoothTrigger) ShouldTrigger(threadID string, rawEstimate int) Trigg
 	return TriggerNone
 }
 
-// UpdateAfterResponse 在 API 响应后记录实际 token 数、消息数和时间。
+// UpdateAfterResponse 是三参数 legacy 兼容入口。
+// 它保留 actual 与消息坐标，但主动清空上下文指纹，强制下一轮完整重基线。
 func (st *SawtoothTrigger) UpdateAfterResponse(threadID string, totalInputTokens, messageCount int) {
+	st.UpdatePressureBaseline(threadID, totalInputTokens, messageCount, "", "")
+}
+
+// UpdatePressureBaseline 在成功主响应后原子写回完整 pressure baseline。
+// 指纹只接受固定 64 位小写 SHA-256 十六进制；非法值按空值持久化。
+func (st *SawtoothTrigger) UpdatePressureBaseline(threadID string, totalInputTokens, messageCount int, systemFingerprint, toolsFingerprint string) {
+	systemFingerprint = sanitizePressureFingerprint(systemFingerprint)
+	toolsFingerprint = sanitizePressureFingerprint(toolsFingerprint)
+	if totalInputTokens <= 0 || messageCount < 0 {
+		totalInputTokens = 0
+		messageCount = 0
+		systemFingerprint = ""
+		toolsFingerprint = ""
+	}
+
+	state := persistedState{
+		Tokens:            totalInputTokens,
+		MsgCount:          messageCount,
+		SystemFingerprint: systemFingerprint,
+		ToolsFingerprint:  toolsFingerprint,
+	}
+
 	st.mu.Lock()
-	st.lastTotalTokens[threadID] = totalInputTokens
-	st.lastMessageCount[threadID] = messageCount
-	st.lastRequestTime[threadID] = time.Now()
+	if totalInputTokens > 0 {
+		st.lastTotalTokens[threadID] = totalInputTokens
+		st.lastMessageCount[threadID] = messageCount
+		st.systemFingerprints[threadID] = systemFingerprint
+		st.toolsFingerprints[threadID] = toolsFingerprint
+		st.lastRequestTime[threadID] = time.Now()
+	} else {
+		delete(st.lastTotalTokens, threadID)
+		delete(st.lastMessageCount, threadID)
+		delete(st.systemFingerprints, threadID)
+		delete(st.toolsFingerprints, threadID)
+		delete(st.lastRequestTime, threadID)
+	}
 	st.loadedFromDB[threadID] = true
+	persistFn := st.persistFn
 	st.mu.Unlock()
 
-	if st.persistFn != nil {
-		data, _ := json.Marshal(persistedState{Tokens: totalInputTokens, MsgCount: messageCount})
-		st.persistFn("sawtooth:"+threadID, string(data))
+	if persistFn != nil {
+		if data, err := json.Marshal(state); err == nil {
+			persistFn("sawtooth:"+threadID, string(data))
+		}
 	}
+}
+
+func sanitizePressureFingerprint(fingerprint string) string {
+	if validPressureFingerprint(fingerprint) {
+		return fingerprint
+	}
+	return ""
 }
 
 // IncrementRequestSeq 递增指定 thread 的请求序号并返回新值。
@@ -758,6 +802,11 @@ func (st *SawtoothTrigger) loadSawtoothFromDB(threadID string) {
 	if state.Tokens <= 0 {
 		return // 无效状态
 	}
+	if state.MsgCount < 0 {
+		return
+	}
+	state.SystemFingerprint = sanitizePressureFingerprint(state.SystemFingerprint)
+	state.ToolsFingerprint = sanitizePressureFingerprint(state.ToolsFingerprint)
 
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -767,6 +816,8 @@ func (st *SawtoothTrigger) loadSawtoothFromDB(threadID string) {
 	}
 	st.lastTotalTokens[threadID] = state.Tokens
 	st.lastMessageCount[threadID] = state.MsgCount
+	st.systemFingerprints[threadID] = state.SystemFingerprint
+	st.toolsFingerprints[threadID] = state.ToolsFingerprint
 	// 不设置 lastRequestTime —— 保持零值，ShouldTrigger 中 hasTime=false 会跳过 Pause 检查。
 	// 下次 API 响应后 UpdateAfterResponse 才会设置真实时间。
 
