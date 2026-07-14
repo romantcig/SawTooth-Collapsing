@@ -13,7 +13,7 @@ import (
 const titleSystemPrompt = `Generate a concise, sentence-case title (3-7 words) that captures the main topic or goal of this coding session. The session content is provided inside <session> tags. Return JSON with a single "title" field.`
 
 const (
-	defaultTitleLanguageInstruction = `Write the title in the predominant language of the session — a stray word or code token in another language doesn't change it. Ignore the language of the examples above.`
+	defaultTitleLanguageInstruction    = `Write the title in the predominant language of the session — a stray word or code token in another language doesn't change it. Ignore the language of the examples above.`
 	configuredTitleLanguageInstruction = `Write the title in 中文. Keep technical terms and code identifiers in their original form.`
 )
 

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"log/slog"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 type requestKind string
@@ -39,7 +41,10 @@ func classifyAuxiliaryRequest(bodyMap map[string]json.RawMessage, messages []Mes
 		return auxiliaryClassification{}
 	}
 	userText, ok := extractAuxiliaryText(messages[0].Content)
-	if !ok || !hasCompleteSessionEnvelope(userText) {
+	if !ok {
+		return auxiliaryClassification{}
+	}
+	if _, ok := splitSessionTitleEnvelope(userText); !ok {
 		return auxiliaryClassification{}
 	}
 	systemText, ok := extractAuxiliaryText(bodyMap["system"])
@@ -83,7 +88,16 @@ func extractAuxiliaryText(raw json.RawMessage) (string, bool) {
 	return strings.Join(parts, "\n"), true
 }
 
-func hasCompleteSessionEnvelope(text string) bool {
+const (
+	sessionTitleDefaultLanguageInstruction = "Write the title in the predominant language of the session — a stray word or code token in another language doesn't change it. Ignore the language of the examples above."
+	sessionTitleLanguagePrefix             = "Write the title in "
+	sessionTitleLanguageSuffix             = ". Keep technical terms and code identifiers in their original form."
+)
+
+// splitSessionTitleEnvelope validates the single session envelope and returns
+// its optional, exact 2.1.207 language instruction. It deliberately never
+// exposes or interprets the envelope body.
+func splitSessionTitleEnvelope(text string) (string, bool) {
 	const (
 		openTag         = "<session>"
 		closeTag        = "</session>"
@@ -92,7 +106,7 @@ func hasCompleteSessionEnvelope(text string) bool {
 
 	trimmed := strings.TrimSpace(text)
 	if !strings.HasPrefix(trimmed, openTag) {
-		return false
+		return "", false
 	}
 
 	depth := 1
@@ -101,13 +115,13 @@ func hasCompleteSessionEnvelope(text string) bool {
 		nextOpen := strings.Index(trimmed[position:], openTag)
 		nextClose := strings.Index(trimmed[position:], closeTag)
 		if nextClose < 0 {
-			return false
+			return "", false
 		}
 
 		if nextOpen >= 0 && nextOpen < nextClose {
 			depth++
 			if depth > maxSessionDepth {
-				return false
+				return "", false
 			}
 			position += nextOpen + len(openTag)
 			continue
@@ -115,15 +129,41 @@ func hasCompleteSessionEnvelope(text string) bool {
 
 		depth--
 		if depth < 0 {
-			return false
+			return "", false
 		}
 		position += nextClose + len(closeTag)
 		if depth == 0 {
-			return position == len(trimmed)
+			suffix := strings.TrimSpace(trimmed[position:])
+			if suffix == "" {
+				return "", true
+			}
+			if !isSessionTitleLanguageInstruction(suffix) {
+				return "", false
+			}
+			return suffix, true
 		}
 	}
 
-	return false
+	return "", false
+}
+
+func isSessionTitleLanguageInstruction(text string) bool {
+	if text == sessionTitleDefaultLanguageInstruction {
+		return true
+	}
+	if !strings.HasPrefix(text, sessionTitleLanguagePrefix) || !strings.HasSuffix(text, sessionTitleLanguageSuffix) {
+		return false
+	}
+	language := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(text, sessionTitleLanguagePrefix), sessionTitleLanguageSuffix))
+	if language == "" || utf8.RuneCountInString(language) > 64 {
+		return false
+	}
+	for _, r := range language {
+		if r == '<' || r == '>' || unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
 }
 
 func isSessionTitleSystem(text string) bool {
