@@ -4,15 +4,15 @@ milestone: v1.1
 milestone_name: 锯齿折叠对齐与可靠性闭环
 current_phase: 10
 current_phase_name: Token 压力与触发统一
-status: ready_to_plan
-stopped_at: Phase 10 context gathered
-last_updated: "2026-07-14T20:41:10.263Z"
-last_activity: 2026-07-14
-last_activity_desc: Phase 09 complete, transitioned to Phase 10
+status: ready_to_execute
+stopped_at: Phase 10 planned (5 plans, 3 waves); ready to execute
+last_updated: "2026-07-14T21:55:54Z"
+last_activity: 2026-07-15
+last_activity_desc: Phase 10 planning complete — 5 plans ready
 progress:
   total_phases: 5
   completed_phases: 1
-  total_plans: 3
+  total_plans: 8
   completed_plans: 3
   percent: 20
 ---
@@ -30,11 +30,11 @@ See: `.planning/ROADMAP.md`
 
 v1.0 已于 2026-07-14 归档。Phase 08.1 的 9/9 must-haves 已由自动化证据重验证通过；无法可靠肉眼判断、且仅重复要求接受内部证据的人工 UAT 项已明确关闭并记录为 skipped。
 
-v1.1 的 Phase 09 已通过独立复验：61 行差距矩阵的 373 个显式锚点与 39 个 none-found 范围全部可解析，八个必要缺口已路由到 Phase 10–13，18 个外围项保持明确不移植。当前进入 Phase 10 的讨论与规划阶段。
+v1.1 的 Phase 09 已通过独立复验：61 行差距矩阵的 373 个显式锚点与 39 个 none-found 范围全部可解析，八个必要缺口已路由到 Phase 10–13，18 个外围项保持明确不移植。Phase 10 已完成研究与规划，共 5 个计划、3 个执行波次，当前可进入执行阶段。
 
 ## Active Plan
 
-无活跃计划；下一步讨论并规划 Phase 10，按 Phase 09 的证据化必要缺口统一本地估算、API actual、辅助请求隔离与压缩触发。
+Phase 10 已规划 5 个计划：Wave 1 并行建立 pressure baseline、session title 分类和 subagent request role；Wave 2 接入统一 pressure 决策与 JSON/SSE 写回；Wave 3 完成双阶段 Debug facts 和单条压力摘要。下一步从 `10-01`、`10-02`、`10-03` 开始执行。
 
 ### Quick Tasks Completed
 
@@ -52,10 +52,10 @@ v1.1 的 Phase 09 已通过独立复验：61 行差距矩阵的 373 个显式锚
 | 260711-4e0 | 修复上游 Base URL 尾斜杠导致请求路径错误，并添加回归测试 | 2026-07-11 | 1fa804d |  | [260711-4e0-base-url](./quick/260711-4e0-base-url/) |
 | 260714-019 | 重构 Claude Code 上游生命周期，以分层 timeout 取代固定 120 秒总限制 | 2026-07-14 | e4fc5f8 | Verified | [260714-019-claude-code-120-hard-limit-header](./quick/260714-019-claude-code-120-hard-limit-header/) |
 
-Last activity: 2026-07-14 — Phase 09 complete, transitioned to Phase 10
+Last activity: 2026-07-15 — Phase 10 planning complete; 5 plans ready in 3 waves
 
 ---
-*Last updated: 2026-07-14*
+*Last updated: 2026-07-15*
 
 ## Accumulated Context
 
@@ -123,17 +123,17 @@ Last activity: 2026-07-14 — Phase 09 complete, transitioned to Phase 10
 
 ## Session
 
-**Last session:** 2026-07-14T20:41:10.253Z
-**Stopped at:** Phase 10 context gathered
-**Resume file:** .planning/phases/10-token/10-CONTEXT.md
+**Last session:** 2026-07-14T21:55:54Z
+**Stopped at:** Phase 10 planned (5 plans, 3 waves); ready to execute
+**Resume file:** .planning/phases/10-token/10-01-PLAN.md
 
 ## Current Position
 
 Phase: 10 — Token 压力与触发统一
-Plan: Not started
-Status: Ready to discuss and plan
-Last activity: 2026-07-15 — Phase 09 passed independent verification and transitioned to Phase 10
+Plan: 0 of 5
+Status: Ready to execute
+Last activity: 2026-07-15 — Phase 10 planning complete
 
 ## Operator Next Steps
 
-- Run `$gsd-discuss-phase 10` to lock the pressure model, auxiliary-request isolation, and trigger evidence contract before planning.
+- Run `$gsd-execute-phase 10` to execute the 5 plans in 3 dependency waves.
