@@ -177,6 +177,22 @@ func TestPressureDecisionThresholdBehavior(t *testing.T) {
 	if got := above.ShouldTrigger("above", decision.SelectedPressure); got != TriggerTokens {
 		t.Fatalf("超过配置阈值未按精确阈值触发: %q", got)
 	}
+	emergency := NewSawtoothTrigger(time.Hour, 1000, 100)
+	if got := emergency.ShouldTrigger("emergency", 11001); got != TriggerEmergency {
+		t.Fatalf("明显超限压力未触发 emergency: %q", got)
+	}
+	pause := NewSawtoothTrigger(0, 1000, 100)
+	fingerprint := fingerprintTopLevelJSON(nil)
+	pause.UpdatePressureBaseline("pause", 200, 1, fingerprint, fingerprint)
+	pause.mu.Lock()
+	pause.lastRequestTime["pause"] = time.Now().Add(-time.Second)
+	pause.mu.Unlock()
+	if got := pause.ShouldTrigger("pause", 200); got != TriggerPause {
+		t.Fatalf("选定压力超过 minimum 后未保留 pause 语义: %q", got)
+	}
+	if got := pause.ShouldTrigger("pause", 100); got != TriggerNone {
+		t.Fatalf("选定压力未超过 minimum 却触发 pause: %q", got)
+	}
 }
 
 func TestRequestMetaConcurrentIDsUnique(t *testing.T) {
