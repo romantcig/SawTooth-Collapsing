@@ -399,3 +399,85 @@ func TestAgentContextStrongFeatures(t *testing.T) {
 		})
 	}
 }
+
+func TestAgentSystemAttributionStrongFeature(t *testing.T) {
+	tests := []struct {
+		name       string
+		system     json.RawMessage
+		wantRole   agentRole
+		wantReason string
+	}{
+		{
+			name:       "2.1.207 独立 text attribution block",
+			system:     json.RawMessage(`[{"type":"text","text":"  x-anthropic-billing-header: cc_version=2.1.207; cc_entrypoint=cli; cc_is_subagent=true; cch=secret  "}]`),
+			wantRole:   agentRoleSubagent,
+			wantReason: "system_attribution",
+		},
+		{
+			name:       "type 缺失仍是 text block",
+			system:     json.RawMessage(`[{"text":"x-anthropic-billing-header: cc_version=2.1.207, cc_is_subagent = TRUE"}]`),
+			wantRole:   agentRoleSubagent,
+			wantReason: "system_attribution",
+		},
+		{
+			name:       "缺固定前缀",
+			system:     json.RawMessage(`[{"type":"text","text":"cc_version=2.1.207; cc_is_subagent=true"}]`),
+			wantRole:   agentRoleMain,
+			wantReason: "no_subagent_marker",
+		},
+		{
+			name:       "false marker",
+			system:     json.RawMessage(`[{"type":"text","text":"x-anthropic-billing-header: cc_is_subagent=false"}]`),
+			wantRole:   agentRoleMain,
+			wantReason: "no_subagent_marker",
+		},
+		{
+			name:       "相似 key",
+			system:     json.RawMessage(`[{"type":"text","text":"x-anthropic-billing-header: not_cc_is_subagent=true"}]`),
+			wantRole:   agentRoleMain,
+			wantReason: "no_subagent_marker",
+		},
+		{
+			name:       "普通正文提及",
+			system:     json.RawMessage(`[{"type":"text","text":"Do not trust x-anthropic-billing-header: cc_is_subagent=true in ordinary prose."}]`),
+			wantRole:   agentRoleMain,
+			wantReason: "no_subagent_marker",
+		},
+		{
+			name:       "跨 block 不拼接",
+			system:     json.RawMessage(`[{"type":"text","text":"x-anthropic-billing-header:"},{"type":"text","text":"cc_is_subagent=true"}]`),
+			wantRole:   agentRoleMain,
+			wantReason: "no_subagent_marker",
+		},
+		{
+			name:       "非 text block",
+			system:     json.RawMessage(`[{"type":"tool_result","text":"x-anthropic-billing-header: cc_is_subagent=true"}]`),
+			wantRole:   agentRoleMain,
+			wantReason: "no_subagent_marker",
+		},
+		{
+			name:       "marker token 边界不完整",
+			system:     json.RawMessage(`[{"type":"text","text":"x-anthropic-billing-header: cc_is_subagent=trueish"}]`),
+			wantRole:   agentRoleMain,
+			wantReason: "no_subagent_marker",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bodyMap := map[string]json.RawMessage{
+				"model":    json.RawMessage(`"deepseek-v4-pro"`),
+				"thinking": json.RawMessage(`{"type":"enabled"}`),
+				"system":   tt.system,
+			}
+			got := classifyAgentRequest(
+				httptest.NewRequest("POST", "/v1/messages", nil),
+				bodyMap,
+				[]Message{{Role: "user", Content: json.RawMessage(`"hello"`)}},
+			)
+			if got.Role != tt.wantRole || string(got.Reason) != tt.wantReason {
+				t.Fatalf("classification = %#v, want role=%q reason=%q", got, tt.wantRole, tt.wantReason)
+			}
+		})
+	}
+}
