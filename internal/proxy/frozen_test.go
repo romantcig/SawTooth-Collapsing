@@ -9,6 +9,107 @@ import (
 	"testing"
 )
 
+func TestSawtoothPressureBaselineSnapshot(t *testing.T) {
+	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+	const threadID = "pressure-snapshot"
+	systemFingerprint := strings.Repeat("a", 64)
+	toolsFingerprint := strings.Repeat("b", 64)
+
+	trigger.mu.Lock()
+	trigger.lastTotalTokens[threadID] = 91_234
+	trigger.lastMessageCount[threadID] = 27
+	trigger.systemFingerprints[threadID] = systemFingerprint
+	trigger.toolsFingerprints[threadID] = toolsFingerprint
+	trigger.loadedFromDB[threadID] = true
+	trigger.mu.Unlock()
+
+	got := trigger.PressureBaseline(threadID)
+	if !got.Available || got.ResetReason != baselineResetNone {
+		t.Fatalf("baseline availability = %t, reset = %q", got.Available, got.ResetReason)
+	}
+	if got.ActualTokens != 91_234 || got.MessageCount != 27 {
+		t.Fatalf("baseline coordinates = actual %d, messages %d", got.ActualTokens, got.MessageCount)
+	}
+	if got.SystemFingerprint != systemFingerprint || got.ToolsFingerprint != toolsFingerprint {
+		t.Fatalf("baseline fingerprints = (%q, %q)", got.SystemFingerprint, got.ToolsFingerprint)
+	}
+}
+
+func TestSawtoothPressureBaselineConcurrentAtomicity(t *testing.T) {
+	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+	const threadID = "pressure-concurrent"
+	type version struct {
+		actual int
+		count  int
+		system string
+		tools  string
+	}
+	versions := []version{
+		{actual: 10_001, count: 101, system: strings.Repeat("1", 64), tools: strings.Repeat("2", 64)},
+		{actual: 20_002, count: 202, system: strings.Repeat("3", 64), tools: strings.Repeat("4", 64)},
+	}
+	writeVersion := func(value version) {
+		trigger.mu.Lock()
+		trigger.lastTotalTokens[threadID] = value.actual
+		trigger.lastMessageCount[threadID] = value.count
+		trigger.systemFingerprints[threadID] = value.system
+		trigger.toolsFingerprints[threadID] = value.tools
+		trigger.loadedFromDB[threadID] = true
+		trigger.mu.Unlock()
+	}
+	writeVersion(versions[0])
+
+	const iterations = 20_000
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		for i := 0; i < iterations; i++ {
+			writeVersion(versions[i%len(versions)])
+		}
+	}()
+	close(start)
+	for i := 0; i < iterations; i++ {
+		got := trigger.PressureBaseline(threadID)
+		matches := false
+		for _, want := range versions {
+			if got.ActualTokens == want.actual && got.MessageCount == want.count &&
+				got.SystemFingerprint == want.system && got.ToolsFingerprint == want.tools {
+				matches = true
+				break
+			}
+		}
+		if !matches {
+			t.Fatalf("observed torn baseline: %+v", got)
+		}
+	}
+	wg.Wait()
+}
+
+func TestSawtoothPressureBaselineMissingState(t *testing.T) {
+	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+	loadCalls := 0
+	trigger.SetLoadFunc(func(string) (string, bool) {
+		loadCalls++
+		return "", false
+	})
+
+	for i := 0; i < 2; i++ {
+		got := trigger.PressureBaseline("pressure-missing")
+		if got.Available || got.ResetReason != baselineResetNoActual {
+			t.Fatalf("missing baseline = %+v", got)
+		}
+		if got.ActualTokens != 0 || got.MessageCount != 0 || got.SystemFingerprint != "" || got.ToolsFingerprint != "" {
+			t.Fatalf("missing baseline exposed invented state: %+v", got)
+		}
+	}
+	if loadCalls != 1 {
+		t.Fatalf("cold-start load calls = %d, want 1", loadCalls)
+	}
+}
+
 func TestFrozenStoreKeepsRawCutoffSeparateFromFrozenPrefixLength(t *testing.T) {
 	frozen := NewFrozenStubs()
 	raw := frozenTestMessages(302)
