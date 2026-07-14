@@ -641,8 +641,10 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 				if msg, ok := data["message"].(map[string]any); ok {
 					if usage, ok := msg["usage"].(map[string]any); ok {
 						s.writeUsageDebugFacts(meta, timestamp, usage)
-						if s.Sawtooth != nil && meta.tracksSawtoothState() {
-							s.Sawtooth.UpdateAfterResponse(sessionID, totalInputTokens(usage), messageCount)
+						actual := totalInputTokens(usage)
+						if actual > 0 && s.Sawtooth != nil && meta != nil && meta.tracksSawtoothState() && meta.PressureDecision.Available {
+							decision := meta.PressureDecision
+							s.Sawtooth.UpdatePressureBaseline(sessionID, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint)
 						}
 						usageRecorded = true
 					}
@@ -766,8 +768,10 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *re
 			// 在客户端 usage deflation 之前记录完整 usage；只有有状态请求写回 Sawtooth。
 			if usage, ok := body["usage"].(map[string]any); ok {
 				s.writeUsageDebugFacts(meta, timestamp, usage)
-				if s.Sawtooth != nil && meta.tracksSawtoothState() {
-					s.Sawtooth.UpdateAfterResponse(sessionID, totalInputTokens(usage), messageCount)
+				actual := totalInputTokens(usage)
+				if actual > 0 && s.Sawtooth != nil && meta != nil && meta.tracksSawtoothState() && meta.PressureDecision.Available {
+					decision := meta.PressureDecision
+					s.Sawtooth.UpdatePressureBaseline(sessionID, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint)
 				}
 			}
 
