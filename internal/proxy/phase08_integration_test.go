@@ -134,6 +134,7 @@ func TestPhase08AgentIsolationMatrix(t *testing.T) {
 	}{
 		{name: "billing subagent", headers: map[string]string{"x-anthropic-billing-header": "cch=1, cc_is_subagent=true"}},
 		{name: "agentContext subagent", extra: map[string]any{"agentContext": map[string]any{"agentType": "subagent", "parentSessionId": "parent-secret"}}},
+		{name: "system attribution subagent", extra: map[string]any{"system": []map[string]any{{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.207; cc_is_subagent=true"}}}},
 		{name: "unknown is main", wantSearch: 1, wantArchive: 1},
 	}
 	for _, tt := range tests {

@@ -336,8 +336,17 @@ func TestForwardSawtoothStatePolicy(t *testing.T) {
 	if !(&requestMeta{}).tracksSawtoothState() {
 		t.Fatal("零值 meta 必须默认跟踪 Sawtooth 状态")
 	}
+	if !(&requestMeta{AgentRole: agentRoleMain}).tracksSawtoothState() {
+		t.Fatal("main meta 必须跟踪 Sawtooth 状态")
+	}
+	if !(&requestMeta{AgentRole: agentRoleUnknown}).tracksSawtoothState() {
+		t.Fatal("unknown meta 必须按 main 跟踪 Sawtooth 状态")
+	}
 	if (&requestMeta{RequestKind: requestKindSessionTitle}).tracksSawtoothState() {
 		t.Fatal("session_title meta 不得跟踪 Sawtooth 状态")
+	}
+	if (&requestMeta{AgentRole: agentRoleSubagent}).tracksSawtoothState() {
+		t.Fatal("subagent meta 不得跟踪 Sawtooth 状态")
 	}
 }
 
