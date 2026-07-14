@@ -49,6 +49,7 @@ const (
 	agentReasonBillingMarker      agentClassificationReason = "billing_marker"
 	agentReasonAgentContextType   agentClassificationReason = "agent_context_type"
 	agentReasonAgentContextParent agentClassificationReason = "agent_context_parent"
+	agentReasonSystemAttribution  agentClassificationReason = "system_attribution"
 	agentReasonNoSubagentMarker   agentClassificationReason = "no_subagent_marker"
 )
 
@@ -62,6 +63,8 @@ const (
 	agentContextTypeMalformed agentContextType = "malformed"
 )
 
+const systemAttributionPrefix = "x-anthropic-billing-header:"
+
 var billingSubagentMarkerPattern = regexp.MustCompile(`(?i)(?:^|[\s,;])cc_is_subagent\s*=\s*true(?:$|[\s,;])`)
 
 type agentClassification struct {
@@ -72,19 +75,20 @@ type agentClassification struct {
 // agentRequestFeatures 只保存代理分类所需的脱敏事实。
 // 字段类型限定为布尔或受限枚举，避免 prompt、消息正文、凭证和完整 ID 进入日志或 fixture。
 type agentRequestFeatures struct {
-	ModelFamily           agentModelFamily    `json:"model_family"`
-	ThinkingPresent       bool                `json:"thinking_present"`
-	SystemPresent         bool                `json:"system_present"`
-	SystemShape           agentSystemShape    `json:"system_shape"`
-	SDKTSMarkerPresent    bool                `json:"sdk_ts_marker_present"`
-	MetadataPresent       bool                `json:"metadata_present"`
-	SessionHeaderPresent  bool                `json:"session_header_present"`
-	ParentMarkerPresent   bool                `json:"parent_marker_present"`
-	ParentRelation        agentParentRelation `json:"parent_relation"`
-	BillingSubagentMarker bool                `json:"billing_subagent_marker"`
-	AgentContextType      agentContextType    `json:"agent_context_type"`
-	ParentSessionPresent  bool                `json:"parent_session_present"`
-	MessagesPresent       bool                `json:"messages_present"`
+	ModelFamily               agentModelFamily    `json:"model_family"`
+	ThinkingPresent           bool                `json:"thinking_present"`
+	SystemPresent             bool                `json:"system_present"`
+	SystemShape               agentSystemShape    `json:"system_shape"`
+	SDKTSMarkerPresent        bool                `json:"sdk_ts_marker_present"`
+	MetadataPresent           bool                `json:"metadata_present"`
+	SessionHeaderPresent      bool                `json:"session_header_present"`
+	ParentMarkerPresent       bool                `json:"parent_marker_present"`
+	ParentRelation            agentParentRelation `json:"parent_relation"`
+	BillingSubagentMarker     bool                `json:"billing_subagent_marker"`
+	SystemAttributionSubagent bool                `json:"system_attribution_subagent"`
+	AgentContextType          agentContextType    `json:"agent_context_type"`
+	ParentSessionPresent      bool                `json:"parent_session_present"`
+	MessagesPresent           bool                `json:"messages_present"`
 }
 
 func extractAgentRequestFeatures(r *http.Request, bodyMap map[string]json.RawMessage, messages []Message) agentRequestFeatures {
@@ -110,7 +114,7 @@ func extractAgentRequestFeatures(r *http.Request, bodyMap map[string]json.RawMes
 		return features
 	}
 	features.SystemPresent = true
-	features.SystemShape, features.SDKTSMarkerPresent = inspectAgentSystem(systemRaw)
+	features.SystemShape, features.SDKTSMarkerPresent, features.SystemAttributionSubagent = inspectAgentSystem(systemRaw)
 	return features
 }
 
@@ -122,6 +126,8 @@ func classifyAgentFeatures(features agentRequestFeatures) agentClassification {
 		return agentClassification{Role: agentRoleSubagent, Reason: agentReasonAgentContextType}
 	case features.ParentSessionPresent:
 		return agentClassification{Role: agentRoleSubagent, Reason: agentReasonAgentContextParent}
+	case features.SystemAttributionSubagent:
+		return agentClassification{Role: agentRoleSubagent, Reason: agentReasonSystemAttribution}
 	default:
 		return agentClassification{Role: agentRoleMain, Reason: agentReasonNoSubagentMarker}
 	}
@@ -197,25 +203,42 @@ func extractAgentModelFamily(raw json.RawMessage) agentModelFamily {
 	}
 }
 
-func inspectAgentSystem(raw json.RawMessage) (agentSystemShape, bool) {
+func inspectAgentSystem(raw json.RawMessage) (agentSystemShape, bool, bool) {
 	var systemString string
 	if json.Unmarshal(raw, &systemString) == nil {
-		return agentSystemShapeString, strings.Contains(systemString, "cc_entrypoint=sdk-ts")
+		return agentSystemShapeString, strings.Contains(systemString, "cc_entrypoint=sdk-ts"), false
 	}
 
 	var systemArray []json.RawMessage
 	if json.Unmarshal(raw, &systemArray) != nil {
-		return agentSystemShapeUnknown, false
+		return agentSystemShapeUnknown, false, false
 	}
+	sdkTSMarkerPresent := false
+	systemAttributionSubagent := false
 	for _, item := range systemArray {
 		var block struct {
+			Type string `json:"type"`
 			Text string `json:"text"`
 		}
-		if json.Unmarshal(item, &block) == nil && strings.Contains(block.Text, "cc_entrypoint=sdk-ts") {
-			return agentSystemShapeArray, true
+		if json.Unmarshal(item, &block) != nil {
+			continue
+		}
+		if strings.Contains(block.Text, "cc_entrypoint=sdk-ts") {
+			sdkTSMarkerPresent = true
+		}
+		if block.Type != "" && block.Type != "text" {
+			continue
+		}
+		text := strings.TrimSpace(block.Text)
+		if !strings.HasPrefix(text, systemAttributionPrefix) {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(text, systemAttributionPrefix))
+		if billingSubagentMarkerPattern.MatchString(payload) {
+			systemAttributionSubagent = true
 		}
 	}
-	return agentSystemShapeArray, false
+	return agentSystemShapeArray, sdkTSMarkerPresent, systemAttributionSubagent
 }
 
 func logAgentRequestFeatures(logger *slog.Logger, features agentRequestFeatures) {
@@ -233,6 +256,7 @@ func logAgentRequestFeatures(logger *slog.Logger, features agentRequestFeatures)
 		"parent_marker_present", features.ParentMarkerPresent,
 		"parent_relation", features.ParentRelation,
 		"billing_subagent_marker", features.BillingSubagentMarker,
+		"system_attribution_subagent", features.SystemAttributionSubagent,
 		"agent_context_type", features.AgentContextType,
 		"parent_session_present", features.ParentSessionPresent,
 		"messages_present", features.MessagesPresent,
