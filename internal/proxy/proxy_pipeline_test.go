@@ -16,6 +16,169 @@ import (
 	"time"
 )
 
+func TestPressureDecisionLocalFullIncludesTopLevelComponents(t *testing.T) {
+	tokenCounter, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	messages := []Message{
+		{Role: "user", Content: mustMarshal("hello pressure")},
+		{Role: "assistant", Content: mustMarshal("measured reply")},
+	}
+	system := json.RawMessage(`{"b":"two","a":"one"}`)
+	tools := json.RawMessage(`[{"name":"search","input_schema":{"type":"object"}}]`)
+
+	decision := buildPressureDecision(messages, system, tools, pressureBaseline{}, tokenCounter, 1000)
+	wantMessages := tokenCounter.CountMessagesTokens(messages)
+	wantSystem := measureTopLevelTokens(system, tokenCounter)
+	wantTools := measureTopLevelTokens(tools, tokenCounter)
+	wantFull := saturatingAdd(saturatingAdd(wantMessages, wantSystem), wantTools)
+
+	if decision.MessagesLocalTokens != wantMessages || decision.SystemLocalTokens != wantSystem || decision.ToolsLocalTokens != wantTools {
+		t.Fatalf("local components=%d/%d/%d, want %d/%d/%d", decision.MessagesLocalTokens, decision.SystemLocalTokens, decision.ToolsLocalTokens, wantMessages, wantSystem, wantTools)
+	}
+	if decision.FullLocalEstimate != wantFull || decision.SelectedPressure != wantFull {
+		t.Fatalf("full/selected=%d/%d, want %d/%d", decision.FullLocalEstimate, decision.SelectedPressure, wantFull, wantFull)
+	}
+	if decision.Source != pressureSourceLocalFull || decision.ResetReason != baselineResetNoActual {
+		t.Fatalf("source/reset=%q/%q, want %q/%q", decision.Source, decision.ResetReason, pressureSourceLocalFull, baselineResetNoActual)
+	}
+	if !decision.Available || decision.MessageCount != len(messages) || decision.Threshold != 1000 {
+		t.Fatalf("request metadata=%+v", decision)
+	}
+
+	orderedA := json.RawMessage(`{"a":1,"b":{"x":2,"y":3}}`)
+	orderedB := json.RawMessage(`{"b":{"y":3,"x":2},"a":1}`)
+	if gotA, gotB := fingerprintTopLevelJSON(orderedA), fingerprintTopLevelJSON(orderedB); gotA != gotB {
+		t.Fatalf("同语义不同 key 顺序 fingerprint 不一致: %q != %q", gotA, gotB)
+	}
+	missingA := fingerprintTopLevelJSON(nil)
+	missingB := fingerprintTopLevelJSON(json.RawMessage{})
+	nullA := fingerprintTopLevelJSON(json.RawMessage(`null`))
+	nullB := fingerprintTopLevelJSON(json.RawMessage(" null "))
+	if missingA != missingB || nullA != nullB || missingA == nullA {
+		t.Fatalf("missing/null fingerprint 不稳定或未区分: missing=%q/%q null=%q/%q", missingA, missingB, nullA, nullB)
+	}
+}
+
+func TestPressureDecisionUsesActualPlusDelta(t *testing.T) {
+	tokenCounter, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	messages := pipelineMessages(3, 12)
+	system := json.RawMessage(`[{"type":"text","text":"stable system"}]`)
+	tools := json.RawMessage(`[{"name":"stable_tool","input_schema":{"type":"object"}}]`)
+	baseline := pressureBaseline{
+		ActualTokens:      9000,
+		MessageCount:      2,
+		SystemFingerprint: fingerprintTopLevelJSON(system),
+		ToolsFingerprint:  fingerprintTopLevelJSON(tools),
+		Available:         true,
+		ResetReason:       baselineResetNone,
+	}
+
+	decision := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 16000)
+	wantDelta := tokenCounter.CountMessagesTokens(messages[2:])
+	wantSelected := saturatingAdd(baseline.ActualTokens, wantDelta)
+	if decision.NewMessageDelta != wantDelta || decision.SelectedPressure != wantSelected {
+		t.Fatalf("delta/selected=%d/%d, want %d/%d", decision.NewMessageDelta, decision.SelectedPressure, wantDelta, wantSelected)
+	}
+	if decision.Source != pressureSourceActualPlusDelta || decision.ResetReason != baselineResetNone {
+		t.Fatalf("source/reset=%q/%q", decision.Source, decision.ResetReason)
+	}
+	if decision.SelectedPressure == saturatingAdd(wantSelected, saturatingAdd(decision.SystemLocalTokens, decision.ToolsLocalTokens)) {
+		t.Fatal("actual+delta 路径重复叠加 system/tools overhead")
+	}
+	if decision.PreviousActual != baseline.ActualTokens || decision.PreviousMessageCount != baseline.MessageCount {
+		t.Fatalf("previous baseline facts=%d/%d, want %d/%d", decision.PreviousActual, decision.PreviousMessageCount, baseline.ActualTokens, baseline.MessageCount)
+	}
+}
+
+func TestPressureDecisionResetsOnMessageShrink(t *testing.T) {
+	tokenCounter, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	messages := pipelineMessages(2, 5)
+	system := json.RawMessage(`"stable"`)
+	tools := json.RawMessage(`[]`)
+	baseline := pressureBaseline{
+		ActualTokens:      20000,
+		MessageCount:      3,
+		SystemFingerprint: fingerprintTopLevelJSON(system),
+		ToolsFingerprint:  fingerprintTopLevelJSON(tools),
+		Available:         true,
+	}
+	decision := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 16000)
+	if decision.Source != pressureSourceLocalFull || decision.ResetReason != baselineResetMessageShrink || decision.SelectedPressure != decision.FullLocalEstimate {
+		t.Fatalf("message shrink decision=%+v", decision)
+	}
+}
+
+func TestPressureDecisionResetsOnSystemChange(t *testing.T) {
+	tokenCounter, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	messages := pipelineMessages(2, 5)
+	system := json.RawMessage(`"new system"`)
+	tools := json.RawMessage(`[]`)
+	baseline := pressureBaseline{
+		ActualTokens:      20000,
+		MessageCount:      2,
+		SystemFingerprint: fingerprintTopLevelJSON(json.RawMessage(`"old system"`)),
+		ToolsFingerprint:  fingerprintTopLevelJSON(tools),
+		Available:         true,
+	}
+	decision := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 16000)
+	if decision.Source != pressureSourceLocalFull || decision.ResetReason != baselineResetSystemChanged || decision.SelectedPressure != decision.FullLocalEstimate {
+		t.Fatalf("system change decision=%+v", decision)
+	}
+}
+
+func TestPressureDecisionResetsOnToolsChange(t *testing.T) {
+	tokenCounter, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	messages := pipelineMessages(2, 5)
+	system := json.RawMessage(`"stable system"`)
+	tools := json.RawMessage(`[{"name":"new_tool"}]`)
+	baseline := pressureBaseline{
+		ActualTokens:      20000,
+		MessageCount:      2,
+		SystemFingerprint: fingerprintTopLevelJSON(system),
+		ToolsFingerprint:  fingerprintTopLevelJSON(json.RawMessage(`[{"name":"old_tool"}]`)),
+		Available:         true,
+	}
+	decision := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 16000)
+	if decision.Source != pressureSourceLocalFull || decision.ResetReason != baselineResetToolsChanged || decision.SelectedPressure != decision.FullLocalEstimate {
+		t.Fatalf("tools change decision=%+v", decision)
+	}
+}
+
+func TestPressureDecisionThresholdBehavior(t *testing.T) {
+	tokenCounter, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	messages := pipelineMessages(4, 20)
+	decision := buildPressureDecision(messages, nil, nil, pressureBaseline{}, tokenCounter, 0)
+	if decision.SelectedPressure < 2 {
+		t.Fatalf("fixture pressure 太小: %d", decision.SelectedPressure)
+	}
+
+	below := NewSawtoothTrigger(time.Hour, decision.SelectedPressure+1, 1)
+	if got := below.ShouldTrigger("below", decision.SelectedPressure); got != TriggerNone {
+		t.Fatalf("明显低于配置阈值仍触发: %q", got)
+	}
+	above := NewSawtoothTrigger(time.Hour, decision.SelectedPressure-1, 1)
+	if got := above.ShouldTrigger("above", decision.SelectedPressure); got != TriggerTokens {
+		t.Fatalf("超过配置阈值未按精确阈值触发: %q", got)
+	}
+}
+
 func TestRequestMetaConcurrentIDsUnique(t *testing.T) {
 	server := NewServer(DefaultConfig())
 	const requestCount = 64
