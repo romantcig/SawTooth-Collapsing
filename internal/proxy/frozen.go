@@ -643,49 +643,30 @@ func (st *SawtoothTrigger) SetLoadFunc(fn LoadFunc) {
 }
 
 // ShouldTrigger 判断是否应为此 thread 执行桩化周期。
-// rawEstimate 是 API 调用前的 token 预估算（用于紧急制动）。
-func (st *SawtoothTrigger) ShouldTrigger(threadID string, rawEstimate int) TriggerReason {
+// selectedPressure 是调用方已经在 local_full 与 actual_plus_delta 中唯一选定的压力值。
+// 历史 actual 不在此处再次参与 token 判定；它只应通过 pressureDecision 进入。
+func (st *SawtoothTrigger) ShouldTrigger(threadID string, selectedPressure int) TriggerReason {
 	st.mu.RLock()
-	defer st.mu.RUnlock()
-
 	emergencyThreshold := st.tokenThreshold + 10_000 // 比阈值多 10k 安全边距
+	tokenThreshold := st.tokenThreshold
+	tokenMinimum := st.tokenMinimum
+	pauseThreshold := st.pauseThreshold
+	lastTime, hasTime := st.lastRequestTime[threadID]
+	st.mu.RUnlock()
 
-	// 紧急制动 —— 原始估算过高，无需历史数据
-	if rawEstimate > emergencyThreshold {
+	// 紧急制动 —— 当前选定压力明显过高。
+	if selectedPressure > emergencyThreshold {
 		return TriggerEmergency
 	}
 
-	// 基于原始估算的 token 阈值（即使没有历史 API 数据也能触发）
-	if rawEstimate > st.tokenThreshold {
+	// 正常 token 线只使用当前选定压力，不叠加或重读旧 actual。
+	if selectedPressure > tokenThreshold {
 		return TriggerTokens
 	}
 
-	tokens, hasTokens := st.lastTotalTokens[threadID]
-	lastTime, hasTime := st.lastRequestTime[threadID]
-
-	// 无历史数据且低于阈值 → 无需桩化
-	if !hasTokens {
-		// 冷启动：尝试从 DB 加载
-		if !st.loadedFromDB[threadID] {
-			st.mu.RUnlock()
-			st.loadSawtoothFromDB(threadID)
-			st.mu.RLock()
-			tokens, hasTokens = st.lastTotalTokens[threadID]
-			lastTime, hasTime = st.lastRequestTime[threadID]
-		}
-		if !hasTokens {
-			return TriggerNone
-		}
-	}
-
-	// 基于上次 API 响应的 token 阈值（比估算更精确）
-	if tokens > st.tokenThreshold {
-		return TriggerTokens
-	}
-
-	// 暂停检测：cache TTL 过期后，token 量足够则重新桩化
-	if hasTime && tokens > st.tokenMinimum {
-		if time.Since(lastTime) > st.pauseThreshold {
+	// 暂停检测保留既有时间语义，但最低压力也使用同一 selectedPressure。
+	if hasTime && selectedPressure > tokenMinimum {
+		if time.Since(lastTime) > pauseThreshold {
 			return TriggerPause
 		}
 	}

@@ -120,8 +120,9 @@ func TestHandleJSONPressureBaseline(t *testing.T) {
 	restored.SetLoadFunc(func(key string) (string, bool) {
 		return persisted, key == "sawtooth:json-cache"
 	})
-	if got := restored.ShouldTrigger("json-cache", 1); got != TriggerTokens {
-		t.Fatalf("冷启动 trigger=%q, want %q", got, TriggerTokens)
+	restoredBaseline := restored.PressureBaseline("json-cache")
+	if got := restored.ShouldTrigger("json-cache", restoredBaseline.ActualTokens); got != TriggerEmergency {
+		t.Fatalf("冷启动 trigger=%q, want %q", got, TriggerEmergency)
 	}
 }
 
