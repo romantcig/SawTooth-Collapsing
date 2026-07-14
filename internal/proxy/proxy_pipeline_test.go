@@ -608,6 +608,7 @@ func testSessionTitleResponseState(t *testing.T, sse bool) {
 
 func testHandleMessagesDirectAgentBypass(t *testing.T, _ ...string) {
 	t.Helper()
+	const sessionID = "thread-agent-subagent"
 	var forwardedBodies [][]byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -621,6 +622,16 @@ func testHandleMessagesDirectAgentBypass(t *testing.T, _ ...string) {
 	defer upstream.Close()
 
 	server := newPipelineTestServer(t, upstream.URL)
+	missingFingerprint := fingerprintTopLevelJSON(nil)
+	server.Sawtooth.UpdatePressureBaseline(sessionID, 777, 9, missingFingerprint, missingFingerprint)
+	baselineBefore := server.Sawtooth.PressureBaseline(sessionID)
+	requestSeqBefore := server.Sawtooth.GetRequestSeq(sessionID)
+	frozenMessages := []Message{{Role: "user", Content: mustMarshal("subagent-frozen-sentinel")}}
+	server.Frozen.Store(sessionID, frozenMessages, 1, frozenMessages[0], 10, 20)
+	frozenBefore := server.Frozen.LengthFor(sessionID)
+	archivesBefore := archiveCount(t, server.Store)
+	persistCalls := 0
+	server.Sawtooth.SetPersistFunc(func(_ string, _ string) { persistCalls++ })
 	searchCalls := 0
 	server.searchAndExpandFn = func(messages []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, _ *requestMeta) RecallOutcome {
 		searchCalls++
@@ -634,7 +645,7 @@ func testHandleMessagesDirectAgentBypass(t *testing.T, _ ...string) {
 	body := []byte(fmt.Sprintf("{ \"model\" : \"same-model\", \"thinking\" : {\"type\":\"enabled\"}, \"system\" : \"cc_entrypoint=sdk-ts\", \"messages\" : %s }", messagesJSON))
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Claude-Code-Session-Id", "thread-agent-subagent")
+	req.Header.Set("X-Claude-Code-Session-Id", sessionID)
 	req.Header.Set("x-anthropic-billing-header", "cch=12345, cc_is_subagent=true")
 	recorder := httptest.NewRecorder()
 	server.HandleMessages(recorder, req)
@@ -645,8 +656,20 @@ func testHandleMessagesDirectAgentBypass(t *testing.T, _ ...string) {
 	if searchCalls != 0 {
 		t.Fatalf("SearchAndExpand calls = %d, want 0", searchCalls)
 	}
-	if got := archiveCount(t, server.Store); got != 0 {
-		t.Fatalf("archive rows = %d, want 0", got)
+	if got := archiveCount(t, server.Store); got != archivesBefore {
+		t.Fatalf("archive rows = %d, want unchanged %d", got, archivesBefore)
+	}
+	if got := server.Sawtooth.GetRequestSeq(sessionID); got != requestSeqBefore {
+		t.Fatalf("subagent request sequence=%d, want unchanged %d", got, requestSeqBefore)
+	}
+	if got := server.Frozen.LengthFor(sessionID); got != frozenBefore {
+		t.Fatalf("subagent Frozen length=%d, want unchanged %d", got, frozenBefore)
+	}
+	if persistCalls != 0 {
+		t.Fatalf("subagent response persisted pressure baseline %d times", persistCalls)
+	}
+	if baselineAfter := server.Sawtooth.PressureBaseline(sessionID); baselineAfter != baselineBefore {
+		t.Fatalf("subagent response changed pressure baseline\nbefore=%+v\nafter=%+v", baselineBefore, baselineAfter)
 	}
 	if len(forwardedBodies) != 1 {
 		t.Fatalf("forward calls = %d, want 1", len(forwardedBodies))
@@ -799,6 +822,11 @@ func TestHandleMessagesPreviousUsageAboveThresholdTriggersCollapse(t *testing.T)
 
 	server := newPipelineTestServer(t, upstream.URL)
 	sessionID := "previous-usage-trigger"
+	var captured pressureDecision
+	server.searchAndExpandFn = func(messages []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, meta *requestMeta) RecallOutcome {
+		captured = meta.PressureDecision
+		return RecallOutcome{Messages: messages}
+	}
 	var raw []Message
 	for words := 20; words <= 300; words += 10 {
 		candidate := pipelineMessages(120, words)
@@ -811,15 +839,197 @@ func TestHandleMessagesPreviousUsageAboveThresholdTriggersCollapse(t *testing.T)
 	if len(raw) == 0 {
 		t.Fatal("未构造出低于阈值且具有可折叠历史的消息")
 	}
-	server.Sawtooth.UpdateAfterResponse(sessionID, server.Config.Stubify.TokenThreshold+1, len(raw))
+	missingFingerprint := fingerprintTopLevelJSON(nil)
+	server.Sawtooth.UpdatePressureBaseline(sessionID, server.Config.Stubify.TokenThreshold+1, len(raw), missingFingerprint, missingFingerprint)
 
 	servePipelineRequest(t, server, sessionID, raw)
 
+	if captured.Source != pressureSourceActualPlusDelta || captured.SelectedPressure != server.Config.Stubify.TokenThreshold+1 || captured.TriggerReason != TriggerTokens || !captured.CompressDecision {
+		t.Fatalf("历史 actual 未进入唯一压缩 decision: %+v", captured)
+	}
 	if got := archiveCount(t, server.Store); got == 0 {
 		t.Fatal("上次真实 usage 已超阈值，但本次未产生 collapse archive")
 	}
 	if len(forwarded) >= len(raw) {
 		t.Fatalf("forwarded message count=%d, want shorter than raw=%d", len(forwarded), len(raw))
+	}
+}
+
+func TestHandleMessagesPreviousUsageAboveThresholdDoesNotForceCollapse(t *testing.T) {
+	var forwarded []Message
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []Message `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		forwarded = deepCopyMessages(body.Messages)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	sessionID := "previous-usage-short-history"
+	raw := pipelineMessages(2, 3)
+	missingFingerprint := fingerprintTopLevelJSON(nil)
+	server.Sawtooth.UpdatePressureBaseline(sessionID, server.Config.Stubify.TokenThreshold+1, len(raw), missingFingerprint, missingFingerprint)
+	var captured pressureDecision
+	server.searchAndExpandFn = func(messages []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, meta *requestMeta) RecallOutcome {
+		captured = meta.PressureDecision
+		return RecallOutcome{Messages: messages}
+	}
+
+	servePipelineRequest(t, server, sessionID, raw)
+
+	if captured.TriggerReason != TriggerTokens || !captured.CompressDecision || captured.Source != pressureSourceActualPlusDelta {
+		t.Fatalf("短历史未进入历史 actual decision: %+v", captured)
+	}
+	if got := archiveCount(t, server.Store); got != 0 {
+		t.Fatalf("短历史被历史 actual 无条件 Collapse，archive rows=%d", got)
+	}
+	if len(forwarded) != len(raw) {
+		t.Fatalf("短历史 forwarded=%d, want %d", len(forwarded), len(raw))
+	}
+}
+
+func TestHandleMessagesLocalFullSystemToolsTrigger(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	messages := pipelineMessages(2, 3)
+	system := strings.Repeat("system pressure ", 6000)
+	tools := []map[string]any{{
+		"name":        "pressure_tool",
+		"description": strings.Repeat("tool pressure ", 6000),
+		"input_schema": map[string]any{
+			"type": "object",
+		},
+	}}
+	if got := server.TokenCounter.CountMessagesTokens(messages); got >= server.Config.Stubify.TokenThreshold {
+		t.Fatalf("messages fixture=%d, want below threshold %d", got, server.Config.Stubify.TokenThreshold)
+	}
+	var captured pressureDecision
+	server.searchAndExpandFn = func(current []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, meta *requestMeta) RecallOutcome {
+		captured = meta.PressureDecision
+		return RecallOutcome{Messages: current}
+	}
+
+	servePipelineRequestWith(t, server, "local-full-system-tools", messages, map[string]any{"system": system, "tools": tools}, nil)
+
+	if captured.Source != pressureSourceLocalFull || captured.ResetReason != baselineResetNoActual || captured.TriggerReason == TriggerNone || !captured.CompressDecision {
+		t.Fatalf("system/tools 未驱动 local-full trigger: %+v", captured)
+	}
+	if captured.MessagesLocalTokens >= server.Config.Stubify.TokenThreshold || captured.SelectedPressure <= server.Config.Stubify.TokenThreshold {
+		t.Fatalf("system/tools 分量未改变阈值结果: %+v", captured)
+	}
+}
+
+func TestHandleMessagesActualPlusDelta(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	sessionID := "handle-actual-plus-delta"
+	base := pipelineMessages(2, 5)
+	messages := append(deepCopyMessages(base), pipelineMessages(1, 7)...)
+	systemRaw := json.RawMessage(`[{"type":"text","text":"stable system"}]`)
+	toolsRaw := json.RawMessage(`[{"name":"stable_tool","input_schema":{"type":"object"}}]`)
+	server.Sawtooth.UpdatePressureBaseline(sessionID, 7000, len(base), fingerprintTopLevelJSON(systemRaw), fingerprintTopLevelJSON(toolsRaw))
+	var captured pressureDecision
+	server.searchAndExpandFn = func(current []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, meta *requestMeta) RecallOutcome {
+		captured = meta.PressureDecision
+		return RecallOutcome{Messages: current}
+	}
+	var system any
+	var tools any
+	if err := json.Unmarshal(systemRaw, &system); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(toolsRaw, &tools); err != nil {
+		t.Fatal(err)
+	}
+
+	servePipelineRequestWith(t, server, sessionID, messages, map[string]any{"system": system, "tools": tools}, nil)
+
+	wantDelta := server.TokenCounter.CountMessagesTokens(messages[len(base):])
+	if captured.Source != pressureSourceActualPlusDelta || captured.NewMessageDelta != wantDelta || captured.SelectedPressure != 7000+wantDelta {
+		t.Fatalf("HandleMessages actual+delta=%+v, want delta=%d selected=%d", captured, wantDelta, 7000+wantDelta)
+	}
+	if captured.TriggerReason != TriggerNone || captured.CompressDecision {
+		t.Fatalf("低压 actual+delta 被错误触发: %+v", captured)
+	}
+}
+
+func TestHandleMessagesPressureBaselineReset(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	tests := []struct {
+		name          string
+		messages      []Message
+		baselineCount int
+		baselineSys   json.RawMessage
+		baselineTools json.RawMessage
+		currentSys    json.RawMessage
+		currentTools  json.RawMessage
+		wantReason    baselineResetReason
+	}{
+		{
+			name: "message shrink", messages: pipelineMessages(2, 4), baselineCount: 3,
+			baselineSys: json.RawMessage(`"stable"`), baselineTools: json.RawMessage(`[]`),
+			currentSys: json.RawMessage(`"stable"`), currentTools: json.RawMessage(`[]`),
+			wantReason: baselineResetMessageShrink,
+		},
+		{
+			name: "system changed", messages: pipelineMessages(2, 4), baselineCount: 2,
+			baselineSys: json.RawMessage(`"old"`), baselineTools: json.RawMessage(`[]`),
+			currentSys: json.RawMessage(`"new"`), currentTools: json.RawMessage(`[]`),
+			wantReason: baselineResetSystemChanged,
+		},
+		{
+			name: "tools changed", messages: pipelineMessages(2, 4), baselineCount: 2,
+			baselineSys: json.RawMessage(`"stable"`), baselineTools: json.RawMessage(`[{"name":"old"}]`),
+			currentSys: json.RawMessage(`"stable"`), currentTools: json.RawMessage(`[{"name":"new"}]`),
+			wantReason: baselineResetToolsChanged,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newPipelineTestServer(t, upstream.URL)
+			sessionID := "baseline-reset-" + strings.ReplaceAll(tc.name, " ", "-")
+			server.Sawtooth.UpdatePressureBaseline(sessionID, 20000, tc.baselineCount, fingerprintTopLevelJSON(tc.baselineSys), fingerprintTopLevelJSON(tc.baselineTools))
+			var captured pressureDecision
+			server.searchAndExpandFn = func(current []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, meta *requestMeta) RecallOutcome {
+				captured = meta.PressureDecision
+				return RecallOutcome{Messages: current}
+			}
+			var system any
+			var tools any
+			if err := json.Unmarshal(tc.currentSys, &system); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(tc.currentTools, &tools); err != nil {
+				t.Fatal(err)
+			}
+
+			servePipelineRequestWith(t, server, sessionID, tc.messages, map[string]any{"system": system, "tools": tools}, nil)
+
+			if captured.Source != pressureSourceLocalFull || captured.ResetReason != tc.wantReason || captured.SelectedPressure != captured.FullLocalEstimate {
+				t.Fatalf("reset decision=%+v, want reason=%q", captured, tc.wantReason)
+			}
+		})
 	}
 }
 
