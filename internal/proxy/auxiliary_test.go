@@ -79,6 +79,8 @@ func TestClassifyAuxiliaryRequest(t *testing.T) {
 		{name: "最大 32 层 envelope", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(depthLimitSession), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
 		{name: "2.1.207 默认语言后缀", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(defaultLanguageSession), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
 		{name: "2.1.207 配置语言后缀", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(configuredLanguageSession), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
+		{name: "2.1.207 默认语言后缀缺失 output_config 回退", body: titleBody(systemString, nil), messages: titleMessages(defaultLanguageSession), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitlePromptFallback},
+		{name: "2.1.207 配置语言后缀缺失 output_config 回退", body: titleBody(systemString, nil), messages: titleMessages(configuredLanguageSession), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitlePromptFallback},
 		{name: "强路径文本块形态", body: titleBody(systemBlocks, titleOnlyOutputConfig()), messages: titleMessages(sessionBlocks), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
 		{name: "output_config 整段缺失时严格回退", body: titleBody(systemString, nil), messages: titleMessages(sessionString), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitlePromptFallback},
 		{name: "tools 非空不影响分类", body: withTitleField(titleBody(systemString, titleOnlyOutputConfig()), "tools", `[{"name":"Read"}]`), messages: titleMessages(sessionString), wantKind: requestKindSessionTitle, wantReason: auxiliaryReasonTitleSchema},
@@ -103,12 +105,14 @@ func TestClassifyAuxiliaryRequest(t *testing.T) {
 		{name: "普通 XML 代码拒绝", body: titleBody(systemString, titleOnlyOutputConfig()), messages: titleMessages(json.RawMessage(`"<session id=\\"x\\">code</session>"`))},
 		{name: "泛化 system 拒绝", body: titleBody(json.RawMessage(`"Return a title"`), titleOnlyOutputConfig()), messages: titleMessages(sessionString)},
 		{name: "output_config null 不得回退", body: titleBody(systemString, json.RawMessage(`null`)), messages: titleMessages(sessionString)},
+		{name: "2.1.207 后缀 output_config null 不得回退", body: titleBody(systemString, json.RawMessage(`null`)), messages: titleMessages(defaultLanguageSession)},
 		{name: "output_config 畸形不得回退", body: titleBody(systemString, json.RawMessage(`{"format":`)), messages: titleMessages(sessionString)},
+		{name: "output_config 额外 property 拒绝", body: titleBody(systemString, json.RawMessage(`{"format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}},"extra":"nope"}`)), messages: titleMessages(defaultLanguageSession)},
 		{name: "conversation name schema 拒绝", body: titleBody(systemString, json.RawMessage(`{"format":{"type":"json_schema","schema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}}}`)), messages: titleMessages(sessionString)},
 		{name: "title branch schema 拒绝", body: titleBody(systemString, json.RawMessage(`{"format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"},"branch":{"type":"string"}},"required":["title","branch"],"additionalProperties":false}}}`)), messages: titleMessages(sessionString)},
 		{name: "允许额外 schema 字段时拒绝", body: titleBody(systemString, json.RawMessage(`{"format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":true}}}`)), messages: titleMessages(sessionString)},
 		{name: "title 非 string 拒绝", body: titleBody(systemString, json.RawMessage(`{"format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"number"}},"required":["title"],"additionalProperties":false}}}`)), messages: titleMessages(sessionString)},
-		{name: "rename 提示拒绝", body: titleBody(json.RawMessage(`"Generate a new name for this conversation and return JSON with a single name field."`), titleOnlyOutputConfig()), messages: titleMessages(json.RawMessage(`"<conversation>x</conversation>"`))},
+		{name: "rename 提示拒绝", body: titleBody(json.RawMessage(`"Generate a new name for this conversation and return JSON with a single name field."`), titleOnlyOutputConfig()), messages: titleMessages(defaultLanguageSession)},
 		{name: "teleport 提示拒绝", body: titleBody(json.RawMessage(`"Generate a teleport title and branch."`), titleOnlyOutputConfig()), messages: titleMessages(sessionString)},
 		{name: "compact 提示拒绝", body: titleBody(json.RawMessage(`"Compact this conversation for continuation."`), titleOnlyOutputConfig()), messages: titleMessages(sessionString)},
 		{name: "prompt suggestion 提示拒绝", body: titleBody(json.RawMessage(`"Suggest the next prompt."`), titleOnlyOutputConfig()), messages: titleMessages(sessionString)},
@@ -171,11 +175,15 @@ func TestAuxiliaryClassificationLog(t *testing.T) {
 		secretSessionID = "TOP-SECRET-SESSION-ID"
 		secretSession   = "TOP-SECRET-SESSION-CONTENT"
 		secretSystem    = "TOP-SECRET-SYSTEM-CONTENT"
+		secretLanguage  = "TOP-SECRET-LANGUAGE"
 		secretAuth      = "Bearer TOP-SECRET-CREDENTIAL"
 	)
+	languageInstruction := `Write the title in ` + secretLanguage + `. Keep technical terms and code identifiers in their original form.`
 	classification := classifyAuxiliaryRequest(
 		titleBody(jsonText(t, `Generate a concise coding session title (3-7 words). `+secretSystem+` Return JSON with a single title field.`), titleOnlyOutputConfig()),
-		titleMessages(jsonText(t, `<session>`+secretSession+`</session>`)),
+		titleMessages(jsonText(t, `<session>`+secretSession+`</session>
+
+`+languageInstruction)),
 	)
 
 	var output bytes.Buffer
@@ -193,7 +201,7 @@ func TestAuxiliaryClassificationLog(t *testing.T) {
 			t.Errorf("审计日志缺少白名单字段 %q: %s", field, got)
 		}
 	}
-	for _, secret := range []string{secretSessionID, secretSession, secretSystem, secretAuth} {
+	for _, secret := range []string{secretSessionID, secretSession, secretSystem, secretLanguage, secretAuth} {
 		if strings.Contains(got, secret) {
 			t.Fatalf("审计日志泄漏敏感值 %q: %s", secret, got)
 		}
