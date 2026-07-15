@@ -707,6 +707,88 @@ func countMessages(body []byte) int {
 	return len(data.Messages)
 }
 
+type sseBaselineState struct {
+	usage   map[string]any
+	actual  int
+	started bool
+	stopped bool
+	invalid bool
+}
+
+func (state *sseBaselineState) invalidate() {
+	state.usage = nil
+	state.actual = 0
+	state.invalid = true
+}
+
+// observe 只接受 event/data 类型一致的单一 message_start → message_stop 生命周期。
+// 任意乱序、重复或类型错配都会永久废弃本流的 baseline 候选。
+func (state *sseBaselineState) observe(event []string) {
+	if state.invalid {
+		return
+	}
+	var eventName string
+	var dataLine string
+	eventFields := 0
+	dataFields := 0
+	for _, line := range event {
+		switch {
+		case strings.HasPrefix(line, "event:"):
+			eventFields++
+			eventName = strings.TrimSpace(line[len("event:"):])
+		case strings.HasPrefix(line, "data:"):
+			dataFields++
+			dataLine = strings.TrimSpace(line[len("data:"):])
+		}
+	}
+
+	data, decoded := decodeJSONObjectUseNumber([]byte(dataLine))
+	dataType, _ := data["type"].(string)
+	baselineEvent := eventName == "message_start" || eventName == "message_stop" ||
+		dataType == "message_start" || dataType == "message_stop"
+	if !baselineEvent {
+		return
+	}
+	if eventFields != 1 || dataFields != 1 || !decoded || eventName != dataType {
+		state.invalidate()
+		return
+	}
+
+	switch dataType {
+	case "message_start":
+		if state.started || state.stopped {
+			state.invalidate()
+			return
+		}
+		message, ok := data["message"].(map[string]any)
+		if !ok {
+			state.invalidate()
+			return
+		}
+		usage, actual, ok := parseAnthropicMessageInputUsage(message)
+		if !ok {
+			state.invalidate()
+			return
+		}
+		state.usage = make(map[string]any, len(usage))
+		for key, value := range usage {
+			state.usage[key] = value
+		}
+		state.actual = actual
+		state.started = true
+	case "message_stop":
+		if !state.started || state.stopped {
+			state.invalidate()
+			return
+		}
+		state.stopped = true
+	}
+}
+
+func (state *sseBaselineState) complete() bool {
+	return !state.invalid && state.started && state.stopped && state.usage != nil && state.actual > 0
+}
+
 // handleSSE 处理 SSE 流式响应。
 // 逐行扫描，对 message_start 和 message_delta 事件执行 usage deflation，
 // 其他事件原样转发。每个事件后 flush。
@@ -735,9 +817,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 
 	var eventBuf []string
 	var fullResponse strings.Builder
-	var pendingUsage map[string]any
-	pendingActual := 0
-	sawMessageStop := false
+	var baselineState sseBaselineState
 	var downstreamErr error
 	committed := false
 	commit := func() {
@@ -759,6 +839,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 		if downstreamErr != nil {
 			return
 		}
+		baselineState.observe(event)
 		commit()
 		processed := s.processSSEEvent(event)
 		for _, line := range processed {
@@ -779,33 +860,6 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 
 	for scanner.Scan() {
 		line := scanner.Text()
-
-		// message_start 的 usage 在 processSSEEvent deflation 前缓存；只有完整流成功结束后才提交。
-		if pendingUsage == nil && strings.HasPrefix(line, "data:") && strings.Contains(line, "message_start") {
-			dataStr := strings.TrimSpace(line[5:])
-			if data, ok := decodeJSONObjectUseNumber([]byte(dataStr)); ok {
-				if eventType, _ := data["type"].(string); eventType == "message_start" {
-					if msg, ok := data["message"].(map[string]any); ok {
-						if usage, actual, ok := parseAnthropicMessageInputUsage(msg); ok {
-							pendingUsage = make(map[string]any, len(usage))
-							for key, value := range usage {
-								pendingUsage[key] = value
-							}
-							pendingActual = actual
-						}
-					}
-				}
-			}
-		}
-		if strings.HasPrefix(line, "data:") && strings.Contains(line, "message_stop") {
-			dataStr := strings.TrimSpace(line[5:])
-			if data, ok := decodeJSONObjectUseNumber([]byte(dataStr)); ok {
-				eventType, _ := data["type"].(string)
-				if eventType == "message_stop" {
-					sawMessageStop = true
-				}
-			}
-		}
 
 		if line == "" {
 			// 空行 = 事件边界，flush 整个事件
@@ -830,9 +884,9 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 	if downstreamErr != nil {
 		return upstreamResponseResult{err: downstreamErr, committed: committed}
 	}
-	if pendingUsage != nil && sawMessageStop {
-		s.writeUsageDebugFacts(meta, timestamp, pendingUsage)
-		s.applyPressureBaselineUsage(meta, pendingActual)
+	if baselineState.complete() {
+		s.writeUsageDebugFacts(meta, timestamp, baselineState.usage)
+		s.applyPressureBaselineUsage(meta, baselineState.actual)
 	}
 	if !committed {
 		commit()

@@ -484,6 +484,55 @@ func TestHandleSSERejectsUntrustedUsageBaseline(t *testing.T) {
 	}
 }
 
+func TestHandleSSERejectsInvalidMessageLifecycleBaseline(t *testing.T) {
+	validStart := "event: message_start\n" +
+		`data: {"type":"message_start","message":{"type":"message","usage":{"input_tokens":321}}}` + "\n\n"
+	validStop := "event: message_stop\n" + `data: {"type":"message_stop"}` + "\n\n"
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "stop before start", body: validStop + validStart},
+		{name: "repeated start", body: validStart + validStart + validStop},
+		{name: "repeated stop", body: validStart + validStop + validStop},
+		{name: "start after stop", body: validStart + validStop + validStart},
+		{name: "event data start mismatch", body: "event: message_delta\n" + `data: {"type":"message_start","message":{"type":"message","usage":{"input_tokens":321}}}` + "\n\n" + validStop},
+		{name: "event data stop mismatch", body: validStart + "event: message_delta\n" + `data: {"type":"message_stop"}` + "\n\n"},
+	}
+	for index, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sessionID := fmt.Sprintf("sse-invalid-lifecycle-%d", index)
+			trigger := NewSawtoothTrigger(time.Hour, 50_000, 1000)
+			fingerprint := fingerprintTopLevelJSON(nil)
+			trigger.UpdatePressureBaseline(sessionID, 777, 9, fingerprint, fingerprint, strings.Repeat("a", 64))
+			before := trigger.PressureBaseline(sessionID)
+			persistCalls := 0
+			trigger.SetPersistFunc(func(_ string, _ string) { persistCalls++ })
+			s := NewServer(Config{Proxy: ProxyConfig{Deflation: 0.5}})
+			s.Sawtooth = trigger
+			meta := newRequestMeta(uint64(50+index), sessionID)
+			meta.PressureDecision = pressureDecision{
+				Available: true, MessageCount: 10,
+				SystemFingerprint: fingerprint, ToolsFingerprint: fingerprint,
+				MessagesPrefixFingerprint: strings.Repeat("b", 64),
+			}
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(tc.body)),
+			}
+			s.handleSSE(httptest.NewRecorder(), resp, meta, time.Now(), "model", 2)
+
+			if persistCalls != 0 {
+				t.Fatalf("invalid lifecycle persisted baseline %d times", persistCalls)
+			}
+			if after := trigger.PressureBaseline(sessionID); after != before {
+				t.Fatalf("invalid lifecycle changed baseline\nbefore=%+v\nafter=%+v", before, after)
+			}
+		})
+	}
+}
+
 func testHandleFailureDoesNotUpdate(t *testing.T, sse bool) {
 	t.Helper()
 	cases := []struct {
