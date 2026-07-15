@@ -727,13 +727,12 @@ func (st *SawtoothTrigger) UpdatePressureBaseline(threadID string, totalInputTok
 	}
 	st.loadedFromDB[threadID] = true
 	persistFn := st.persistFn
-	st.mu.Unlock()
-
 	if persistFn != nil {
 		if data, err := json.Marshal(state); err == nil {
 			persistFn("sawtooth:"+threadID, string(data))
 		}
 	}
+	st.mu.Unlock()
 }
 
 func sanitizePressureFingerprint(fingerprint string) string {

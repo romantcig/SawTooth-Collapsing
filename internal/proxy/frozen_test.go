@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestSawtoothPressureBaselineSnapshot(t *testing.T) {
@@ -259,6 +260,64 @@ func TestSawtoothPressureBaselineUpdateIsAtomic(t *testing.T) {
 		}
 	}
 	wg.Wait()
+}
+
+func TestSawtoothPressureBaselinePersistenceKeepsStateOrder(t *testing.T) {
+	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+	const threadID = "pressure-persistence-order"
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var persistedMu sync.Mutex
+	var persisted string
+	trigger.SetPersistFunc(func(_ string, value string) {
+		var state persistedState
+		if err := json.Unmarshal([]byte(value), &state); err != nil {
+			t.Errorf("unmarshal persisted state: %v", err)
+			return
+		}
+		if state.Tokens == 11_111 {
+			close(firstEntered)
+			<-releaseFirst
+		}
+		persistedMu.Lock()
+		persisted = value
+		persistedMu.Unlock()
+	})
+
+	firstDone := make(chan struct{})
+	go func() {
+		trigger.UpdatePressureBaseline(threadID, 11_111, 11, strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 64))
+		close(firstDone)
+	}()
+	<-firstEntered
+
+	secondDone := make(chan struct{})
+	go func() {
+		trigger.UpdatePressureBaseline(threadID, 22_222, 22, strings.Repeat("4", 64), strings.Repeat("5", 64), strings.Repeat("6", 64))
+		close(secondDone)
+	}()
+	select {
+	case <-secondDone:
+		t.Fatal("second update completed before the first persistence was released")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseFirst)
+	<-firstDone
+	<-secondDone
+
+	baseline := trigger.PressureBaseline(threadID)
+	persistedMu.Lock()
+	raw := persisted
+	persistedMu.Unlock()
+	var state persistedState
+	if err := json.Unmarshal([]byte(raw), &state); err != nil {
+		t.Fatalf("unmarshal final persisted state: %v", err)
+	}
+	if state.Tokens != baseline.ActualTokens || state.MsgCount != baseline.MessageCount ||
+		state.SystemFingerprint != baseline.SystemFingerprint || state.ToolsFingerprint != baseline.ToolsFingerprint ||
+		state.MessagesPrefixFingerprint != baseline.MessagesPrefixFingerprint {
+		t.Fatalf("persistent baseline diverged\nstate=%+v\nbaseline=%+v", state, baseline)
+	}
 }
 
 func TestFrozenStoreKeepsRawCutoffSeparateFromFrozenPrefixLength(t *testing.T) {
