@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: 锯齿折叠对齐与可靠性闭环
-current_phase: 10
-current_phase_name: Token 压力与触发统一
-status: ready_to_execute
-stopped_at: Phase 10 planned (5 plans, 3 waves); ready to execute
-last_updated: "2026-07-14T21:55:54Z"
+current_phase: 11
+current_phase_name: Collapse/Frozen/Archive 闭环对齐
+status: planning
+stopped_at: Phase 10 completed and verified; ready to plan Phase 11
+last_updated: "2026-07-15T11:06:59Z"
 last_activity: 2026-07-15
-last_activity_desc: Phase 10 planning complete — 5 plans ready
+last_activity_desc: Phase 10 complete and independently verified; Phase 11 ready to plan
 progress:
   total_phases: 5
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 8
-  completed_plans: 3
-  percent: 20
+  completed_plans: 8
+  percent: 40
 ---
 
 # State: Sawtooth Proxy
@@ -30,11 +30,11 @@ See: `.planning/ROADMAP.md`
 
 v1.0 已于 2026-07-14 归档。Phase 08.1 的 9/9 must-haves 已由自动化证据重验证通过；无法可靠肉眼判断、且仅重复要求接受内部证据的人工 UAT 项已明确关闭并记录为 skipped。
 
-v1.1 的 Phase 09 已通过独立复验：61 行差距矩阵的 373 个显式锚点与 39 个 none-found 范围全部可解析，八个必要缺口已路由到 Phase 10–13，18 个外围项保持明确不移植。Phase 10 已完成研究与规划，共 5 个计划、3 个执行波次，当前可进入执行阶段。
+v1.1 的 Phase 09 已通过独立复验：61 行差距矩阵的 373 个显式锚点与 39 个 none-found 范围全部可解析，八个必要缺口已路由到 Phase 10–13，18 个外围项保持明确不移植。Phase 10 的 5 个计划已全部执行，最终 deep review 为 clean，独立 verifier 以 15/15 must-haves、PRESSURE-01–05 全满足、0 gaps 完成验收。当前进入 Phase 11 规划阶段。
 
 ## Active Plan
 
-Phase 10 已规划 5 个计划：Wave 1 并行建立 pressure baseline、session title 分类和 subagent request role；Wave 2 接入统一 pressure 决策与 JSON/SSE 写回；Wave 3 完成双阶段 Debug facts 和单条压力摘要。下一步从 `10-01`、`10-02`、`10-03` 开始执行。
+当前没有活动计划。Phase 11 将规划 Trigger → CompressContext → Collapse → Archive → Frozen → Recall 的单一闭环、字节契约、协议安全与并发幂等验证。
 
 ### Quick Tasks Completed
 
@@ -52,7 +52,7 @@ Phase 10 已规划 5 个计划：Wave 1 并行建立 pressure baseline、session
 | 260711-4e0 | 修复上游 Base URL 尾斜杠导致请求路径错误，并添加回归测试 | 2026-07-11 | 1fa804d |  | [260711-4e0-base-url](./quick/260711-4e0-base-url/) |
 | 260714-019 | 重构 Claude Code 上游生命周期，以分层 timeout 取代固定 120 秒总限制 | 2026-07-14 | e4fc5f8 | Verified | [260714-019-claude-code-120-hard-limit-header](./quick/260714-019-claude-code-120-hard-limit-header/) |
 
-Last activity: 2026-07-15 — Phase 10 planning complete; 5 plans ready in 3 waves
+Last activity: 2026-07-15 — Phase 10 complete and independently verified; Phase 11 ready to plan
 
 ---
 *Last updated: 2026-07-15*
@@ -85,6 +85,11 @@ Last activity: 2026-07-15 — Phase 10 planning complete; 5 plans ready in 3 wav
 | Phase 09-yesmem P01 | 11min | 2 tasks | 2 files |
 | Phase 09 P02 | 65m | 2 tasks | 4 files |
 | Phase 09 P03 | 25min | 2 tasks | 3 files |
+| Phase 10 P01 | 12min | 2 tasks | 2 files |
+| Phase 10 P02 | 9min | 2 tasks | 2 files |
+| Phase 10 P03 | 14min | 2 tasks | 5 files |
+| Phase 10 P04 | 43min | 3 tasks | 6 files |
+| Phase 10 P05 | 29min | 2 tasks | 7 files |
 
 ## Decisions
 
@@ -120,20 +125,24 @@ Last activity: 2026-07-15 — Phase 10 planning complete; 5 plans ready in 3 wav
 - [Phase 09-yesmem]: 仅 PRESSURE-004 与 TRIGGER-003 标记 working-tree-only。 — 未提交 pressure patch 不冒充 committed 事实。
 - [Phase 09-yesmem]: 八个必要缺口交接 Phase 10–13，D-23 的 18 个外围项保持明确不移植。 — 后续实现范围只由证据化必要缺口驱动。
 - [Phase 09-yesmem]: 对全部 61 行的四个证据列机械解析 path#Symbol、path#TestName 与 none-found scope；最终 373 个显式锚点、39 个检索范围均为 0 失效。 — 防止字段非空但引用过期造成审计误放行。
+- [Phase 10]: PressureBaseline 通过单一 RWMutex 复合快照暴露 actual、消息坐标与两项指纹。 — 避免调用方跨锁拼接不同瞬间的 pressure 事实。
+- [Phase 10]: Legacy UpdateAfterResponse 清空 system/tools 指纹并强制下一轮重基线。 — 保持 Wave 1 源兼容，同时禁止旧指纹与新 actual 形成可复用撕裂 baseline。
+- [Phase 10]: System attribution 只在单个 text block 内通过固定前缀与严格 marker 边界识别，不拼接、不全文搜索。 — 阻止普通 prompt 文本伪造 subagent 旁路，同时保持 2.1.207 原生 wire 兼容。
+- [Phase 10]: requestMeta 的 Sawtooth 权限 predicate 仅排除 session_title 与可靠 subagent，nil/zero/main/unknown 默认跟踪。 — 不确定请求继续获得主会话压力保护，可靠辅助请求拥有单一只读权限表达。
 
 ## Session
 
-**Last session:** 2026-07-14T21:55:54Z
-**Stopped at:** Phase 10 planned (5 plans, 3 waves); ready to execute
-**Resume file:** .planning/phases/10-token/10-01-PLAN.md
+**Last session:** 2026-07-15T11:06:59Z
+**Stopped at:** Phase 10 completed and verified; ready to plan Phase 11
+**Resume file:** None
 
 ## Current Position
 
-Phase: 10 — Token 压力与触发统一
-Plan: 0 of 5
-Status: Ready to execute
-Last activity: 2026-07-15 — Phase 10 planning complete
+Phase: 11 — Collapse/Frozen/Archive 闭环对齐
+Plan: Not started
+Status: Ready to plan
+Last activity: 2026-07-15 — Phase 10 complete and independently verified
 
 ## Operator Next Steps
 
-- Run `$gsd-execute-phase 10` to execute the 5 plans in 3 dependency waves.
+- Run `$gsd-plan-phase 11` when ready to plan the next phase.
