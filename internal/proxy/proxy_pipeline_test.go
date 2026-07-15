@@ -236,8 +236,8 @@ func TestHandleMessagesDebugStages(t *testing.T) {
 	servePipelineRequest(t, server, "debug-stage-session-secret", raw)
 
 	files := readDebugFactFiles(t, dataDir, "debug-stage-session-secret")
-	if len(files) != 3 {
-		t.Fatalf("facts 文件数=%d, want raw+forwarded+usage 共 3", len(files))
+	if len(files) != 4 {
+		t.Fatalf("facts 文件数=%d, want raw+pressure+forwarded+usage 共 4", len(files))
 	}
 	stageCounts := make(map[debugStage]int)
 	requestIDs := make(map[uint64]bool)
@@ -252,7 +252,7 @@ func TestHandleMessagesDebugStages(t *testing.T) {
 		stageCounts[fact.Stage]++
 		requestIDs[fact.RequestID] = true
 	}
-	for _, stage := range []debugStage{debugStageRawInbound, debugStageForwarded, debugStageResponseUsage} {
+	for _, stage := range []debugStage{debugStageRawInbound, debugStagePressureDecision, debugStageForwarded, debugStageResponseUsage} {
 		if stageCounts[stage] != 1 {
 			t.Fatalf("stage %q count=%d, want 1; all=%v", stage, stageCounts[stage], stageCounts)
 		}

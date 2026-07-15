@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -177,6 +178,81 @@ func TestDebugFactsForwardedDoesNotReplacePressure(t *testing.T) {
 	}
 }
 
+func TestFormatApproxTokens(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		tokens int
+		want   string
+	}{
+		{name: "zero", tokens: 0, want: "0"},
+		{name: "below thousand", tokens: 999, want: "999"},
+		{name: "exact thousand", tokens: 1000, want: "1k"},
+		{name: "round down", tokens: 1049, want: "1k"},
+		{name: "one decimal", tokens: 1050, want: "1.1k"},
+		{name: "large one decimal", tokens: 17500, want: "17.5k"},
+		{name: "round carry", tokens: 19950, want: "20k"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatApproxTokens(tc.tokens); got != tc.want {
+				t.Fatalf("formatApproxTokens(%d)=%q, want %q", tc.tokens, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPressureSummarySingleMainOnly(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(NewLogHandler(&logs, slog.LevelInfo)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	mainMeta := newRequestMeta(401, "SUMMARY-SESSION-MUST-NOT-LEAK")
+	mainMeta.PressureDecision = pressureDecision{
+		Available: true, SelectedPressure: 17500, Threshold: 16000,
+		Source: pressureSourceActualPlusDelta, TriggerReason: TriggerTokens,
+		ResetReason: baselineResetNone, CompressDecision: true,
+	}
+	titleMeta := newRequestMeta(402, "TITLE-SESSION-MUST-NOT-LEAK")
+	titleMeta.RequestKind = requestKindSessionTitle
+	titleMeta.PressureDecision = mainMeta.PressureDecision
+	subagentMeta := newRequestMeta(403, "SUBAGENT-SESSION-MUST-NOT-LEAK")
+	subagentMeta.AgentRole = agentRoleSubagent
+	subagentMeta.PressureDecision = mainMeta.PressureDecision
+
+	logPressureSummary(mainMeta)
+	logPressureSummary(mainMeta)
+	logPressureSummary(titleMeta)
+	logPressureSummary(subagentMeta)
+
+	var summaryLines []string
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if strings.Contains(line, "pressure 摘要") {
+			summaryLines = append(summaryLines, line)
+		}
+	}
+	if len(summaryLines) != 1 {
+		t.Fatalf("pressure 摘要条数=%d, want 1:\n%s", len(summaryLines), logs.String())
+	}
+	line := summaryLines[0]
+	for _, want := range []string{
+		"request_id=401", "pressure=17.5k", "threshold=16k",
+		"source=actual_plus_delta", "trigger_reason=tokens",
+		"baseline_reset_reason=none", "compress=true",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("摘要缺少 %q: %s", want, line)
+		}
+	}
+	for _, forbidden := range []string{
+		"17500", "16000", "forwarded", "SUMMARY-SESSION-MUST-NOT-LEAK",
+		"TITLE-SESSION-MUST-NOT-LEAK", "SUBAGENT-SESSION-MUST-NOT-LEAK",
+	} {
+		if strings.Contains(line, forbidden) {
+			t.Fatalf("摘要泄漏或混淆 %q: %s", forbidden, line)
+		}
+	}
+}
+
 func TestDebugFactsSchemaAndSecretSafety(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := DefaultConfig()
@@ -187,11 +263,26 @@ func TestDebugFactsSchemaAndSecretSafety(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.TokenCounter = tc
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(NewLogHandler(&logs, slog.LevelInfo)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
 	meta := newRequestMeta(77, "SESSION-ID-MUST-NOT-LEAK")
+	meta.PressureDecision = pressureDecision{
+		Available: true, MessagesLocalTokens: 1000, SystemLocalTokens: 200,
+		ToolsLocalTokens: 300, FullLocalEstimate: 1500, PreviousActual: 1400,
+		PreviousMessageCount: 2, NewMessageDelta: 100, SelectedPressure: 1500,
+		Threshold: 16000, Source: pressureSourceActualPlusDelta,
+		ResetReason: baselineResetNone, TriggerReason: TriggerNone,
+		SystemFingerprint: "FULL-SYSTEM-FINGERPRINT-MUST-NOT-LEAK",
+		ToolsFingerprint:  "FULL-TOOLS-FINGERPRINT-MUST-NOT-LEAK",
+	}
 	base64Marker := base64.StdEncoding.EncodeToString([]byte("UNIQUE-BASE64-PAYLOAD-MUST-NOT-LEAK"))
 	body := []byte(`{
 		"model":"claude-secret-model-suffix",
 		"system":"SYSTEM-PROMPT-MUST-NOT-LEAK",
+		"tools":[{"name":"TOOLS-SCHEMA-MUST-NOT-LEAK","description":"TOOLS-DESCRIPTION-MUST-NOT-LEAK","input_schema":{"type":"object","properties":{"secret":{"const":"TOOLS-CONST-MUST-NOT-LEAK"}}}}],
+		"metadata":{"title":"SESSION-TITLE-MUST-NOT-LEAK"},
 		"agentContext":{"agentType":"subagent","parentSessionId":"PARENT-ID-MUST-NOT-LEAK"},
 		"messages":[
 			{"role":"user","isMeta":true,"content":[{"type":"text","text":"<system-reminder>\n# claudeMd\nCALL-ME-BOSS-SECRET\n</system-reminder>"}]},
@@ -200,49 +291,72 @@ func TestDebugFactsSchemaAndSecretSafety(t *testing.T) {
 	}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer AUTHORIZATION-MUST-NOT-LEAK")
+	req.Header.Set("x-api-key", "API-KEY-MUST-NOT-LEAK")
+	req.Header.Set("anthropic-api-key", "ANTHROPIC-KEY-MUST-NOT-LEAK")
 	req.Header.Set("x-anthropic-billing-header", "cc_is_subagent=true; BILLING-MUST-NOT-LEAK")
 	req.Header.Set("X-Claude-Code-Session-Id", "HEADER-SESSION-MUST-NOT-LEAK")
 
-	s.writeRequestDebugFacts(meta, time.Date(2026, 7, 12, 1, 2, 3, 4, time.UTC), debugStageRawInbound, body, req)
+	stamp := time.Date(2026, 7, 12, 1, 2, 3, 4, time.UTC)
+	s.writeRequestDebugFacts(meta, stamp, debugStageRawInbound, body, req)
+	s.writePressureDecisionDebugFacts(meta, stamp)
+	logPressureSummary(meta)
 	files := readDebugFactFiles(t, dataDir, meta.RequestSessionID)
-	if len(files) != 1 {
-		t.Fatalf("facts 文件数=%d, want 1", len(files))
+	if len(files) != 2 {
+		t.Fatalf("facts 文件数=%d, want raw+pressure 共 2", len(files))
 	}
-	data := files[0]
-	for _, secret := range []string{
+	secrets := []string{
 		"SESSION-ID-MUST-NOT-LEAK", "claude-secret-model-suffix", "SYSTEM-PROMPT-MUST-NOT-LEAK",
 		"PARENT-ID-MUST-NOT-LEAK", "CALL-ME-BOSS-SECRET", base64Marker,
 		"AUTHORIZATION-MUST-NOT-LEAK", "BILLING-MUST-NOT-LEAK", "HEADER-SESSION-MUST-NOT-LEAK",
-	} {
-		if bytes.Contains(data, []byte(secret)) {
-			t.Fatalf("facts 泄漏 %q: %s", secret, data)
+		"API-KEY-MUST-NOT-LEAK", "ANTHROPIC-KEY-MUST-NOT-LEAK",
+		"TOOLS-SCHEMA-MUST-NOT-LEAK", "TOOLS-DESCRIPTION-MUST-NOT-LEAK", "TOOLS-CONST-MUST-NOT-LEAK",
+		"SESSION-TITLE-MUST-NOT-LEAK", "FULL-SYSTEM-FINGERPRINT-MUST-NOT-LEAK", "FULL-TOOLS-FINGERPRINT-MUST-NOT-LEAK",
+	}
+	var rawFact debugFact
+	for _, data := range files {
+		for _, secret := range secrets {
+			if bytes.Contains(data, []byte(secret)) {
+				t.Fatalf("facts 泄漏 %q: %s", secret, data)
+			}
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			t.Fatalf("facts 不是完整 JSON: %v: %s", err, data)
+		}
+		for key, value := range fields {
+			if !allowedDebugFactKeys[key] {
+				t.Fatalf("facts 顶层出现非白名单 key %q", key)
+			}
+			var nested map[string]any
+			if json.Unmarshal(value, &nested) == nil && nested != nil {
+				t.Fatalf("facts key %q 包含嵌套对象: %s", key, value)
+			}
+			var nestedSlice []any
+			if json.Unmarshal(value, &nestedSlice) == nil && nestedSlice != nil {
+				t.Fatalf("facts key %q 包含嵌套数组: %s", key, value)
+			}
+		}
+		var fact debugFact
+		if err := json.Unmarshal(data, &fact); err != nil {
+			t.Fatal(err)
+		}
+		if fact.Stage == debugStageRawInbound {
+			rawFact = fact
 		}
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil {
-		t.Fatalf("facts 不是完整 JSON: %v: %s", err, data)
-	}
-	for key, value := range fields {
-		if !allowedDebugFactKeys[key] {
-			t.Fatalf("facts 顶层出现非白名单 key %q", key)
-		}
-		var nested map[string]any
-		if json.Unmarshal(value, &nested) == nil && nested != nil {
-			t.Fatalf("facts key %q 包含嵌套对象: %s", key, value)
+	for _, secret := range secrets {
+		if strings.Contains(logs.String(), secret) {
+			t.Fatalf("pressure 摘要泄漏 %q: %s", secret, logs.String())
 		}
 	}
-	var fact debugFact
-	if err := json.Unmarshal(data, &fact); err != nil {
-		t.Fatal(err)
+	if rawFact.Stage != debugStageRawInbound || rawFact.MessageCount != 2 || !rawFact.HasClaudeMDContext {
+		t.Fatalf("raw fact 基本字段错误: %+v", rawFact)
 	}
-	if fact.Stage != debugStageRawInbound || fact.MessageCount != 2 || !fact.HasClaudeMDContext {
-		t.Fatalf("raw fact 基本字段错误: %+v", fact)
+	if rawFact.ImageCount != 1 || rawFact.DocumentCount != 1 || rawFact.DecodedByteCount == 0 || rawFact.EstimatedTokens == 0 {
+		t.Fatalf("多模态 facts 错误: %+v", rawFact)
 	}
-	if fact.ImageCount != 1 || fact.DocumentCount != 1 || fact.DecodedByteCount == 0 || fact.EstimatedTokens == 0 {
-		t.Fatalf("多模态 facts 错误: %+v", fact)
-	}
-	if fact.AgentRole != agentRoleSubagent || fact.AgentReason != agentReasonBillingMarker {
-		t.Fatalf("agent facts 错误: %+v", fact)
+	if rawFact.AgentRole != agentRoleSubagent || rawFact.AgentReason != agentReasonBillingMarker {
+		t.Fatalf("agent facts 错误: %+v", rawFact)
 	}
 }
 
