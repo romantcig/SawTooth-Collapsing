@@ -944,6 +944,49 @@ func TestHandleMessagesCollapseFreezeLifecycle(t *testing.T) {
 	}
 }
 
+func TestHandleMessagesCollapsedActualDoesNotCalibrateRawHistory(t *testing.T) {
+	var forwarded [][]Message
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []Message `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		forwarded = append(forwarded, deepCopyMessages(body.Messages))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":100,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	sessionID := "collapsed-actual-raw-history"
+	raw := pipelineMessages(300, 80)
+	var decisions []pressureDecision
+	server.searchAndExpandFn = func(messages []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, meta *requestMeta) RecallOutcome {
+		decisions = append(decisions, meta.PressureDecision)
+		return RecallOutcome{Messages: messages}
+	}
+
+	servePipelineRequest(t, server, sessionID, raw)
+	if baseline := server.Sawtooth.PressureBaseline(sessionID); baseline.Available {
+		t.Fatalf("压缩响应的低 actual 建立了 raw baseline: %+v", baseline)
+	}
+
+	nextRaw := append(deepCopyMessages(raw), pipelineMessages(1, 20)...)
+	servePipelineRequest(t, server, sessionID, nextRaw)
+
+	if len(decisions) != 2 {
+		t.Fatalf("pressure decisions=%d, want 2", len(decisions))
+	}
+	if decisions[1].Source != pressureSourceLocalFull || decisions[1].ResetReason != baselineResetNoActual {
+		t.Fatalf("第二轮复用了压缩 actual: %+v", decisions[1])
+	}
+	if len(forwarded) != 2 || len(forwarded[0]) >= len(raw) || len(forwarded[1]) >= len(nextRaw) {
+		t.Fatalf("两轮均应压缩 raw 历史: forwarded=%v raw=%d/%d", []int{len(forwarded[0]), len(forwarded[1])}, len(raw), len(nextRaw))
+	}
+}
+
 func TestHandleMessagesPreviousUsageAboveThresholdTriggersCollapse(t *testing.T) {
 	var forwarded []Message
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

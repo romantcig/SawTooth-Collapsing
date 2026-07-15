@@ -158,7 +158,8 @@ func (s *Server) writeUsageDebugFacts(meta *requestMeta, timestamp time.Time, us
 		return
 	}
 	actual := totalInputTokens(usage)
-	meta.BaselineUpdated = actual > 0 && s.Sawtooth != nil && meta.tracksSawtoothState() && meta.PressureDecision.Available
+	meta.BaselineUpdated = actual > 0 && s.Sawtooth != nil && meta.tracksSawtoothState() &&
+		meta.PressureDecision.Available && !meta.PressureDecision.ForwardedCoordinatesChanged
 	if !s.Config.Debug.Enabled {
 		return
 	}

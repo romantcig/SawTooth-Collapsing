@@ -468,6 +468,7 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 
 	model := extractModelFromBody(body)
 	messageCount := countMessages(body)
+	markForwardedPressureCoordinates(meta, body)
 	stream := streamRequest(body)
 	meta.logEntry(model, messageCount)
 	logger.Info("上游请求发送",
@@ -541,6 +542,38 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 		return
 	}
 	writeClassifiedGatewayError(w, decision, "failed to read upstream response", false)
+}
+
+// markForwardedPressureCoordinates 证明上游 actual 对应的消息坐标仍与原始 pressure decision 一致。
+// 任何压缩、桩化或修复只要改变了消息历史，就不能把压缩后 actual 绑定回原始历史前缀。
+func markForwardedPressureCoordinates(meta *requestMeta, body []byte) {
+	if meta == nil || !meta.PressureDecision.Available {
+		return
+	}
+	var payload struct {
+		Messages []Message `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil ||
+		len(payload.Messages) != meta.PressureDecision.MessageCount ||
+		fingerprintMessagesPrefix(payload.Messages, len(payload.Messages)) != meta.PressureDecision.MessagesPrefixFingerprint {
+		meta.PressureDecision.ForwardedCoordinatesChanged = true
+	}
+}
+
+// applyPressureBaselineUsage 只在 actual 与原始消息坐标一致时建立可复用 baseline。
+// 若本轮改写了历史，则清空旧 baseline，确保下一轮从 local_full 重新校准。
+func (s *Server) applyPressureBaselineUsage(meta *requestMeta, actual int) {
+	if meta == nil || actual <= 0 || s.Sawtooth == nil || !meta.tracksSawtoothState() || !meta.PressureDecision.Available {
+		return
+	}
+	decision := meta.PressureDecision
+	if decision.ForwardedCoordinatesChanged {
+		s.Sawtooth.UpdatePressureBaseline(meta.RequestSessionID, 0, 0, "", "", "")
+		return
+	}
+	if meta.BaselineUpdated {
+		s.Sawtooth.UpdatePressureBaseline(meta.RequestSessionID, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint)
+	}
 }
 
 func streamRequest(body []byte) bool {
@@ -678,7 +711,6 @@ func countMessages(body []byte) int {
 // 逐行扫描，对 message_start 和 message_delta 事件执行 usage deflation，
 // 其他事件原样转发。每个事件后 flush。
 func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *requestMeta, timestamp time.Time, model string, messageCount int) upstreamResponseResult {
-	sessionID := meta.RequestSessionID
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return upstreamResponseResult{err: errors.New("ResponseWriter 不支持 Flush")}
@@ -800,10 +832,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 	}
 	if pendingUsage != nil && sawMessageStop {
 		s.writeUsageDebugFacts(meta, timestamp, pendingUsage)
-		if meta.BaselineUpdated {
-			decision := meta.PressureDecision
-			s.Sawtooth.UpdatePressureBaseline(sessionID, pendingActual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint)
-		}
+		s.applyPressureBaselineUsage(meta, pendingActual)
 	}
 	if !committed {
 		commit()
@@ -871,7 +900,6 @@ func (s *Server) processSSEEvent(event []string) []string {
 // handleJSON 处理 JSON 非流式响应。
 // 2xx 响应 deflate usage，非 2xx 不修改。
 func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *requestMeta, timestamp time.Time, model string, messageCount int) upstreamResponseResult {
-	sessionID := meta.RequestSessionID
 	logger := meta.Logger
 	// gzip 解压（若上游返回了压缩响应）
 	var bodyReader io.Reader = resp.Body
@@ -901,10 +929,7 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *re
 			// 只有严格合法的 Anthropic message usage 才能生成 facts 或校准 baseline。
 			if usage, actual, ok := parseAnthropicMessageInputUsage(body); ok {
 				s.writeUsageDebugFacts(meta, timestamp, usage)
-				if meta.BaselineUpdated {
-					decision := meta.PressureDecision
-					s.Sawtooth.UpdatePressureBaseline(sessionID, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint)
-				}
+				s.applyPressureBaselineUsage(meta, actual)
 			}
 
 			if usage, ok := body["usage"].(map[string]any); ok {

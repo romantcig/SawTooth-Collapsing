@@ -374,26 +374,27 @@ const (
 // pressureDecision 保存请求进入有状态管线前的一次性压力决定。
 // 该值只包含计数、固定长度指纹和受限枚举，不保存请求正文。
 type pressureDecision struct {
-	Available                 bool
-	MessagesLocalTokens       int
-	SystemLocalTokens         int
-	ToolsLocalTokens          int
-	FullLocalEstimate         int
-	PreviousActual            int
-	PreviousMessageCount      int
-	NewMessageDelta           int
-	SelectedPressure          int
-	Source                    pressureSource
-	ResetReason               baselineResetReason
-	TriggerReason             TriggerReason
-	Threshold                 int
-	MessageCount              int
-	SystemFingerprint         string
-	ToolsFingerprint          string
-	MessagesPrefixFingerprint string
-	SystemFingerprintChanged  bool
-	ToolsFingerprintChanged   bool
-	CompressDecision          bool
+	Available                   bool
+	MessagesLocalTokens         int
+	SystemLocalTokens           int
+	ToolsLocalTokens            int
+	FullLocalEstimate           int
+	PreviousActual              int
+	PreviousMessageCount        int
+	NewMessageDelta             int
+	SelectedPressure            int
+	Source                      pressureSource
+	ResetReason                 baselineResetReason
+	TriggerReason               TriggerReason
+	Threshold                   int
+	MessageCount                int
+	SystemFingerprint           string
+	ToolsFingerprint            string
+	MessagesPrefixFingerprint   string
+	ForwardedCoordinatesChanged bool
+	SystemFingerprintChanged    bool
+	ToolsFingerprintChanged     bool
+	CompressDecision            bool
 }
 
 type topLevelMeasurement struct {
