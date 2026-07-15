@@ -300,6 +300,14 @@ func TestDebugFactsUsageUsesTotalInputTokens(t *testing.T) {
 	if fact.Stage != debugStageResponseUsage || fact.InputTokens != 196 || fact.CacheReadInputTokens != 93056 || fact.TotalInputTokens != 93252 {
 		t.Fatalf("usage fact=%+v", fact)
 	}
+	maxInt := int(^uint(0) >> 1)
+	minInt := -maxInt - 1
+	if got := saturatingSubtract(maxInt, -1); got != maxInt {
+		t.Fatalf("正向饱和差值=%d, want %d", got, maxInt)
+	}
+	if got := saturatingSubtract(minInt, 1); got != minInt {
+		t.Fatalf("负向饱和差值=%d, want %d", got, minInt)
+	}
 }
 
 func TestDecodedBase64SizeValidatesInput(t *testing.T) {

@@ -16,9 +16,10 @@ import (
 type debugStage string
 
 const (
-	debugStageRawInbound    debugStage = "raw_inbound"
-	debugStageForwarded     debugStage = "forwarded"
-	debugStageResponseUsage debugStage = "response_usage"
+	debugStageRawInbound       debugStage = "raw_inbound"
+	debugStageForwarded        debugStage = "forwarded"
+	debugStagePressureDecision debugStage = "pressure_decision"
+	debugStageResponseUsage    debugStage = "response_usage"
 )
 
 type debugError string
@@ -34,23 +35,40 @@ const maxDebugBase64Chars = 8 * 1024 * 1024
 // debugFact 是唯一允许写入默认 debug 文件的结构。
 // 所有字段均为时间、受限枚举、bool 或数字，不持有 header、正文或 session ID。
 type debugFact struct {
-	Timestamp                string                    `json:"timestamp"`
-	RequestID                uint64                    `json:"request_id"`
-	Stage                    debugStage                `json:"stage"`
-	ModelFamily              agentModelFamily          `json:"model_family"`
-	MessageCount             int                       `json:"message_count"`
-	HasClaudeMDContext       bool                      `json:"has_claude_md_context"`
-	ImageCount               int                       `json:"image_count"`
-	DocumentCount            int                       `json:"document_count"`
-	DecodedByteCount         int                       `json:"decoded_byte_count"`
-	EstimatedTokens          int                       `json:"estimated_tokens"`
-	AgentRole                agentRole                 `json:"agent_role"`
-	AgentReason              agentClassificationReason `json:"agent_reason"`
-	InputTokens              int                       `json:"input_tokens"`
-	CacheCreationInputTokens int                       `json:"cache_creation_input_tokens"`
-	CacheReadInputTokens     int                       `json:"cache_read_input_tokens"`
-	TotalInputTokens         int                       `json:"total_input_tokens"`
-	Error                    debugError                `json:"error"`
+	Timestamp                 string                    `json:"timestamp"`
+	RequestID                 uint64                    `json:"request_id"`
+	Stage                     debugStage                `json:"stage"`
+	ModelFamily               agentModelFamily          `json:"model_family"`
+	MessageCount              int                       `json:"message_count"`
+	HasClaudeMDContext        bool                      `json:"has_claude_md_context"`
+	ImageCount                int                       `json:"image_count"`
+	DocumentCount             int                       `json:"document_count"`
+	DecodedByteCount          int                       `json:"decoded_byte_count"`
+	EstimatedTokens           int                       `json:"estimated_tokens"`
+	AgentRole                 agentRole                 `json:"agent_role"`
+	AgentReason               agentClassificationReason `json:"agent_reason"`
+	InputTokens               int                       `json:"input_tokens"`
+	CacheCreationInputTokens  int                       `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens      int                       `json:"cache_read_input_tokens"`
+	TotalInputTokens          int                       `json:"total_input_tokens"`
+	MessagesLocalTokens       *int                      `json:"messages_local_tokens,omitempty"`
+	SystemLocalTokens         *int                      `json:"system_local_tokens,omitempty"`
+	ToolsLocalTokens          *int                      `json:"tools_local_tokens,omitempty"`
+	FullLocalTokens           *int                      `json:"full_local_tokens,omitempty"`
+	PreviousActualTokens      *int                      `json:"previous_actual_tokens,omitempty"`
+	PreviousMessageCount      *int                      `json:"previous_message_count,omitempty"`
+	NewMessageDeltaTokens     *int                      `json:"new_message_delta_tokens,omitempty"`
+	SelectedPressureTokens    *int                      `json:"selected_pressure_tokens,omitempty"`
+	PressureThresholdTokens   *int                      `json:"pressure_threshold_tokens,omitempty"`
+	PressureSource            *pressureSource           `json:"pressure_source,omitempty"`
+	TriggerReason             *TriggerReason            `json:"trigger_reason,omitempty"`
+	BaselineResetReason       *baselineResetReason      `json:"baseline_reset_reason,omitempty"`
+	CompressDecision          *bool                     `json:"compress_decision,omitempty"`
+	SystemFingerprintChanged  *bool                     `json:"system_fingerprint_changed,omitempty"`
+	ToolsFingerprintChanged   *bool                     `json:"tools_fingerprint_changed,omitempty"`
+	BaselineUpdated           *bool                     `json:"baseline_updated,omitempty"`
+	ActualMinusSelectedTokens *int                      `json:"actual_minus_selected_tokens,omitempty"`
+	Error                     debugError                `json:"error"`
 }
 
 func (s *Server) writeRequestDebugFacts(meta *requestMeta, timestamp time.Time, stage debugStage, body []byte, request *http.Request) {
@@ -102,11 +120,50 @@ func (s *Server) writeRequestDebugFacts(meta *requestMeta, timestamp time.Time, 
 	})
 }
 
+func (s *Server) writePressureDecisionDebugFacts(meta *requestMeta, timestamp time.Time) {
+	if !s.Config.Debug.Enabled || meta == nil || !meta.tracksSawtoothState() || !meta.PressureDecision.Available {
+		return
+	}
+	meta.pressureFactsOnce.Do(func() {
+		decision := meta.PressureDecision
+		fact := debugFact{
+			Timestamp:                timestamp.UTC().Format(time.RFC3339Nano),
+			RequestID:                meta.ID,
+			Stage:                    debugStagePressureDecision,
+			ModelFamily:              agentModelFamilyUnknown,
+			AgentRole:                meta.AgentRole,
+			AgentReason:              meta.AgentReason,
+			MessagesLocalTokens:      &decision.MessagesLocalTokens,
+			SystemLocalTokens:        &decision.SystemLocalTokens,
+			ToolsLocalTokens:         &decision.ToolsLocalTokens,
+			FullLocalTokens:          &decision.FullLocalEstimate,
+			PreviousActualTokens:     &decision.PreviousActual,
+			PreviousMessageCount:     &decision.PreviousMessageCount,
+			NewMessageDeltaTokens:    &decision.NewMessageDelta,
+			SelectedPressureTokens:   &decision.SelectedPressure,
+			PressureThresholdTokens:  &decision.Threshold,
+			PressureSource:           &decision.Source,
+			TriggerReason:            &decision.TriggerReason,
+			BaselineResetReason:      &decision.ResetReason,
+			CompressDecision:         &decision.CompressDecision,
+			SystemFingerprintChanged: &decision.SystemFingerprintChanged,
+			ToolsFingerprintChanged:  &decision.ToolsFingerprintChanged,
+		}
+		s.writeDebugFact(meta.RequestSessionID, timestamp, fact)
+	})
+}
+
 func (s *Server) writeUsageDebugFacts(meta *requestMeta, timestamp time.Time, usage map[string]any) {
-	if !s.Config.Debug.Enabled || meta == nil {
+	if meta == nil {
+		return
+	}
+	actual := totalInputTokens(usage)
+	meta.BaselineUpdated = actual > 0 && s.Sawtooth != nil && meta.tracksSawtoothState() && meta.PressureDecision.Available
+	if !s.Config.Debug.Enabled {
 		return
 	}
 	meta.usageFactsOnce.Do(func() {
+		baselineUpdated := meta.BaselineUpdated
 		fact := debugFact{
 			Timestamp:                timestamp.UTC().Format(time.RFC3339Nano),
 			RequestID:                meta.ID,
@@ -116,7 +173,12 @@ func (s *Server) writeUsageDebugFacts(meta *requestMeta, timestamp time.Time, us
 			InputTokens:              nonNegativeUsageToken(usage["input_tokens"]),
 			CacheCreationInputTokens: nonNegativeUsageToken(usage["cache_creation_input_tokens"]),
 			CacheReadInputTokens:     nonNegativeUsageToken(usage["cache_read_input_tokens"]),
-			TotalInputTokens:         totalInputTokens(usage),
+			TotalInputTokens:         actual,
+			BaselineUpdated:          &baselineUpdated,
+		}
+		if meta.tracksSawtoothState() && meta.PressureDecision.Available {
+			actualMinusSelected := saturatingSubtract(actual, meta.PressureDecision.SelectedPressure)
+			fact.ActualMinusSelectedTokens = &actualMinusSelected
 		}
 		s.writeDebugFact(meta.RequestSessionID, timestamp, fact)
 	})
@@ -225,4 +287,16 @@ func saturatingAdd(left, right int) int {
 		return int(^uint(0) >> 1)
 	}
 	return left + right
+}
+
+func saturatingSubtract(left, right int) int {
+	maxInt := int(^uint(0) >> 1)
+	minInt := -maxInt - 1
+	if right > 0 && left < minInt+right {
+		return minInt
+	}
+	if right < 0 && left > maxInt+right {
+		return maxInt
+	}
+	return left - right
 }

@@ -13,12 +13,14 @@ type requestMeta struct {
 	AgentRole            agentRole
 	AgentReason          agentClassificationReason
 	PressureDecision     pressureDecision
+	BaselineUpdated      bool
 	OriginalMessageCount int
 	Logger               *slog.Logger
 	auxiliaryAuditLogger *slog.Logger
 	entryOnce            sync.Once
 	rawFactsOnce         sync.Once
 	forwardedFactsOnce   sync.Once
+	pressureFactsOnce    sync.Once
 	usageFactsOnce       sync.Once
 	rawBodyOnce          sync.Once
 	forwardedBodyOnce    sync.Once
@@ -50,6 +52,8 @@ func (m *requestMeta) debugOnce(stage debugStage) *sync.Once {
 		return &m.rawFactsOnce
 	case debugStageForwarded:
 		return &m.forwardedFactsOnce
+	case debugStagePressureDecision:
+		return &m.pressureFactsOnce
 	default:
 		return nil
 	}

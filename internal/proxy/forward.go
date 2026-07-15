@@ -643,7 +643,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 						if usage, ok := msg["usage"].(map[string]any); ok {
 							s.writeUsageDebugFacts(meta, timestamp, usage)
 							actual := totalInputTokens(usage)
-							if actual > 0 && s.Sawtooth != nil && meta != nil && meta.tracksSawtoothState() && meta.PressureDecision.Available {
+							if meta.BaselineUpdated {
 								decision := meta.PressureDecision
 								s.Sawtooth.UpdatePressureBaseline(sessionID, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint)
 							}
@@ -771,7 +771,7 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *re
 			if usage, ok := body["usage"].(map[string]any); ok {
 				s.writeUsageDebugFacts(meta, timestamp, usage)
 				actual := totalInputTokens(usage)
-				if actual > 0 && s.Sawtooth != nil && meta != nil && meta.tracksSawtoothState() && meta.PressureDecision.Available {
+				if meta.BaselineUpdated {
 					decision := meta.PressureDecision
 					s.Sawtooth.UpdatePressureBaseline(sessionID, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint)
 				}
