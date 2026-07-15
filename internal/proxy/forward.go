@@ -165,6 +165,110 @@ func nonNegativeUsageFloat(number float64) int {
 	return int(number)
 }
 
+func decodeJSONObjectUseNumber(raw []byte) (map[string]any, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return nil, false
+	}
+	object, ok := value.(map[string]any)
+	return object, ok
+}
+
+func strictNonNegativeUsageToken(value any) (int, bool) {
+	maxInt := uint64(math.MaxInt)
+	switch number := value.(type) {
+	case int:
+		return number, number >= 0
+	case int8:
+		return int(number), number >= 0
+	case int16:
+		return int(number), number >= 0
+	case int32:
+		return int(number), number >= 0
+	case int64:
+		if number < 0 || number > int64(math.MaxInt) {
+			return 0, false
+		}
+		return int(number), true
+	case uint:
+		if uint64(number) > maxInt {
+			return 0, false
+		}
+		return int(number), true
+	case uint8:
+		return int(number), true
+	case uint16:
+		return int(number), true
+	case uint32:
+		return int(number), true
+	case uint64:
+		if number > maxInt {
+			return 0, false
+		}
+		return int(number), true
+	case float32:
+		return strictNonNegativeUsageFloat(float64(number))
+	case float64:
+		return strictNonNegativeUsageFloat(number)
+	case json.Number:
+		integer, err := number.Int64()
+		if err != nil || integer < 0 || integer > int64(math.MaxInt) {
+			return 0, false
+		}
+		return int(integer), true
+	default:
+		return 0, false
+	}
+}
+
+func strictNonNegativeUsageFloat(number float64) (int, bool) {
+	if math.IsNaN(number) || math.IsInf(number, 0) || number < 0 || math.Trunc(number) != number || number > float64(math.MaxInt) {
+		return 0, false
+	}
+	return int(number), true
+}
+
+// parseAnthropicMessageInputUsage 是 JSON 与 SSE 共用的 actual 信任边界。
+// 任一输入 token 字段畸形都会拒绝整份 usage，避免部分字段静默污染 baseline。
+func parseAnthropicMessageInputUsage(message map[string]any) (map[string]any, int, bool) {
+	messageType, _ := message["type"].(string)
+	if messageType != "message" {
+		return nil, 0, false
+	}
+	usage, ok := message["usage"].(map[string]any)
+	if !ok {
+		return nil, 0, false
+	}
+	total := 0
+	hasPositive := false
+	for _, field := range []string{"input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"} {
+		value, present := usage[field]
+		if !present {
+			continue
+		}
+		tokens, valid := strictNonNegativeUsageToken(value)
+		if !valid {
+			return nil, 0, false
+		}
+		if tokens > 0 {
+			hasPositive = true
+		}
+		if tokens > math.MaxInt-total {
+			return nil, 0, false
+		}
+		total += tokens
+	}
+	if !hasPositive {
+		return nil, 0, false
+	}
+	return usage, total, true
+}
+
 // debugEntry debug 落盘 JSON 结构（D-04）。
 // metadata 字段 + body（原始 JSON 解析后的对象）。
 type debugEntry struct {
@@ -600,6 +704,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 	var eventBuf []string
 	var fullResponse strings.Builder
 	var pendingUsage map[string]any
+	pendingActual := 0
 	sawMessageStop := false
 	var downstreamErr error
 	committed := false
@@ -644,18 +749,17 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 		line := scanner.Text()
 
 		// message_start 的 usage 在 processSSEEvent deflation 前缓存；只有完整流成功结束后才提交。
-		if pendingUsage == nil &&
-			strings.HasPrefix(line, "data:") && strings.Contains(line, "message_start") {
+		if pendingUsage == nil && strings.HasPrefix(line, "data:") && strings.Contains(line, "message_start") {
 			dataStr := strings.TrimSpace(line[5:])
-			var data map[string]any
-			if json.Unmarshal([]byte(dataStr), &data) == nil {
+			if data, ok := decodeJSONObjectUseNumber([]byte(dataStr)); ok {
 				if eventType, _ := data["type"].(string); eventType == "message_start" {
 					if msg, ok := data["message"].(map[string]any); ok {
-						if usage, ok := msg["usage"].(map[string]any); ok {
+						if usage, actual, ok := parseAnthropicMessageInputUsage(msg); ok {
 							pendingUsage = make(map[string]any, len(usage))
 							for key, value := range usage {
 								pendingUsage[key] = value
 							}
+							pendingActual = actual
 						}
 					}
 				}
@@ -663,10 +767,11 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 		}
 		if strings.HasPrefix(line, "data:") && strings.Contains(line, "message_stop") {
 			dataStr := strings.TrimSpace(line[5:])
-			var data map[string]any
-			if json.Unmarshal([]byte(dataStr), &data) == nil {
+			if data, ok := decodeJSONObjectUseNumber([]byte(dataStr)); ok {
 				eventType, _ := data["type"].(string)
-				sawMessageStop = eventType == "message_stop"
+				if eventType == "message_stop" {
+					sawMessageStop = true
+				}
 			}
 		}
 
@@ -695,10 +800,9 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 	}
 	if pendingUsage != nil && sawMessageStop {
 		s.writeUsageDebugFacts(meta, timestamp, pendingUsage)
-		actual := totalInputTokens(pendingUsage)
 		if meta.BaselineUpdated {
 			decision := meta.PressureDecision
-			s.Sawtooth.UpdatePressureBaseline(sessionID, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint)
+			s.Sawtooth.UpdatePressureBaseline(sessionID, pendingActual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint)
 		}
 	}
 	if !committed {
@@ -789,15 +893,14 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *re
 
 	// 2xx: deflate usage
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		var body map[string]any
-		if err := json.Unmarshal(respBody, &body); err != nil {
+		body, decoded := decodeJSONObjectUseNumber(respBody)
+		if !decoded {
 			// 解析失败，原样转发（T-02-05）
-			logger.Warn("无法解析上游 JSON 响应，原样转发", "error", err)
+			logger.Warn("无法解析上游 JSON 响应，原样转发")
 		} else {
-			// 在客户端 usage deflation 之前记录完整 usage；只有有状态请求写回 Sawtooth。
-			if usage, ok := body["usage"].(map[string]any); ok {
+			// 只有严格合法的 Anthropic message usage 才能生成 facts 或校准 baseline。
+			if usage, actual, ok := parseAnthropicMessageInputUsage(body); ok {
 				s.writeUsageDebugFacts(meta, timestamp, usage)
-				actual := totalInputTokens(usage)
 				if meta.BaselineUpdated {
 					decision := meta.PressureDecision
 					s.Sawtooth.UpdatePressureBaseline(sessionID, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint)

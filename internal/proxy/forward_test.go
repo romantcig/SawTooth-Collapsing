@@ -66,7 +66,7 @@ func TestHandleSSEPressureBaseline(t *testing.T) {
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": {"text/event-stream"}},
 		Body: io.NopCloser(strings.NewReader("event: message_start\n" +
-			"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":196,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":93056,\"output_tokens\":20}}}\n\n" +
+			"data: {\"type\":\"message_start\",\"message\":{\"type\":\"message\",\"usage\":{\"input_tokens\":196,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":93056,\"output_tokens\":20}}}\n\n" +
 			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")),
 	}
 	recorder := httptest.NewRecorder()
@@ -275,7 +275,7 @@ func TestHandleSSEInterruptedAfterMessageStartDiscardsPendingUsage(t *testing.T)
 		Header:     http.Header{"Content-Type": {"text/event-stream"}},
 		Body: &readThenErrorCloser{
 			reader: strings.NewReader("event: message_start\n" +
-				"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":196,\"cache_read_input_tokens\":93056}}}\n\n" +
+				"data: {\"type\":\"message_start\",\"message\":{\"type\":\"message\",\"usage\":{\"input_tokens\":196,\"cache_read_input_tokens\":93056}}}\n\n" +
 				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n"),
 			err: io.ErrUnexpectedEOF,
 		},
@@ -297,6 +297,99 @@ func TestHandleSSEInterruptedAfterMessageStartDiscardsPendingUsage(t *testing.T)
 	}
 	if _, ok := facts[debugStageResponseUsage]; ok {
 		t.Fatalf("interrupted stream wrote response_usage: %v", facts)
+	}
+}
+
+func TestHandleJSONRejectsUntrustedUsageBaseline(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "non-message", body: `{"type":"error","usage":{"input_tokens":99999}}`},
+		{name: "fractional", body: `{"type":"message","usage":{"input_tokens":1.5,"cache_read_input_tokens":2}}`},
+		{name: "negative mixed with positive", body: `{"type":"message","usage":{"input_tokens":-1,"cache_read_input_tokens":99999}}`},
+		{name: "NaN", body: `{"type":"message","usage":{"input_tokens":NaN}}`},
+		{name: "infinite exponent", body: `{"type":"message","usage":{"input_tokens":1e999}}`},
+		{name: "integer overflow", body: `{"type":"message","usage":{"input_tokens":9223372036854775808}}`},
+	}
+	for index, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sessionID := fmt.Sprintf("json-untrusted-usage-%d", index)
+			trigger := NewSawtoothTrigger(time.Hour, 50_000, 1000)
+			fingerprint := fingerprintTopLevelJSON(nil)
+			trigger.UpdatePressureBaseline(sessionID, 777, 9, fingerprint, fingerprint, strings.Repeat("a", 64))
+			before := trigger.PressureBaseline(sessionID)
+			persistCalls := 0
+			trigger.SetPersistFunc(func(_ string, _ string) { persistCalls++ })
+			dataDir := t.TempDir()
+			s := NewServer(Config{Proxy: ProxyConfig{Deflation: 0.5}, Debug: DebugConfig{Enabled: true, DataDir: dataDir}})
+			s.Sawtooth = trigger
+			meta := newRequestMeta(uint64(30+index), sessionID)
+			meta.PressureDecision = pressureDecision{
+				Available: true, SelectedPressure: 700, MessageCount: 10,
+				SystemFingerprint: fingerprint, ToolsFingerprint: fingerprint,
+				MessagesPrefixFingerprint: strings.Repeat("b", 64),
+			}
+			stamp := time.Now()
+			s.writePressureDecisionDebugFacts(meta, stamp)
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(tc.body)),
+			}
+			s.handleJSON(httptest.NewRecorder(), resp, meta, stamp, "model", 2)
+
+			if persistCalls != 0 {
+				t.Fatalf("untrusted usage persisted baseline %d times", persistCalls)
+			}
+			if after := trigger.PressureBaseline(sessionID); after != before {
+				t.Fatalf("untrusted usage changed baseline\nbefore=%+v\nafter=%+v", before, after)
+			}
+			facts := debugFactsByStage(t, dataDir, sessionID)
+			if len(facts) != 1 || facts[debugStagePressureDecision] == nil {
+				t.Fatalf("untrusted usage facts=%v, want only pressure decision", facts)
+			}
+		})
+	}
+}
+
+func TestHandleSSERejectsUntrustedUsageBaseline(t *testing.T) {
+	const sessionID = "sse-untrusted-usage"
+	trigger := NewSawtoothTrigger(time.Hour, 50_000, 1000)
+	fingerprint := fingerprintTopLevelJSON(nil)
+	trigger.UpdatePressureBaseline(sessionID, 777, 9, fingerprint, fingerprint, strings.Repeat("a", 64))
+	before := trigger.PressureBaseline(sessionID)
+	persistCalls := 0
+	trigger.SetPersistFunc(func(_ string, _ string) { persistCalls++ })
+	dataDir := t.TempDir()
+	s := NewServer(Config{Proxy: ProxyConfig{Deflation: 0.5}, Debug: DebugConfig{Enabled: true, DataDir: dataDir}})
+	s.Sawtooth = trigger
+	meta := newRequestMeta(40, sessionID)
+	meta.PressureDecision = pressureDecision{
+		Available: true, SelectedPressure: 700, MessageCount: 10,
+		SystemFingerprint: fingerprint, ToolsFingerprint: fingerprint,
+		MessagesPrefixFingerprint: strings.Repeat("b", 64),
+	}
+	stamp := time.Now()
+	s.writePressureDecisionDebugFacts(meta, stamp)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader("event: message_start\n" +
+			"data: {\"type\":\"message_start\",\"message\":{\"type\":\"message\",\"usage\":{\"input_tokens\":1.5,\"cache_read_input_tokens\":99999}}}\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")),
+	}
+	s.handleSSE(httptest.NewRecorder(), resp, meta, stamp, "model", 2)
+
+	if persistCalls != 0 {
+		t.Fatalf("untrusted SSE usage persisted baseline %d times", persistCalls)
+	}
+	if after := trigger.PressureBaseline(sessionID); after != before {
+		t.Fatalf("untrusted SSE usage changed baseline\nbefore=%+v\nafter=%+v", before, after)
+	}
+	facts := debugFactsByStage(t, dataDir, sessionID)
+	if len(facts) != 1 || facts[debugStagePressureDecision] == nil {
+		t.Fatalf("untrusted SSE usage facts=%v, want only pressure decision", facts)
 	}
 }
 

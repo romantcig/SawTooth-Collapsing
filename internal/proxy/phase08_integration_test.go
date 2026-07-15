@@ -22,7 +22,7 @@ func TestPhase08CombinedLifecycle(t *testing.T) {
 		}
 		forwarded = append(forwarded, deepCopyMessages(body.Messages))
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":196,"cache_creation_input_tokens":0,"cache_read_input_tokens":93056,"output_tokens":3}}`))
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":196,"cache_creation_input_tokens":0,"cache_read_input_tokens":93056,"output_tokens":3}}`))
 	}))
 	defer upstream.Close()
 
@@ -141,7 +141,7 @@ func TestPhase08AgentIsolationMatrix(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"usage":{"input_tokens":1}}`))
+				_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":1}}`))
 			}))
 			defer upstream.Close()
 			server := newPipelineTestServer(t, upstream.URL)
@@ -168,7 +168,7 @@ func TestPhase08AgentIsolationMatrix(t *testing.T) {
 func TestPhase08DebugStagesWithoutCompressionPipeline(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":2,"cache_read_input_tokens":3}}`))
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":2,"cache_read_input_tokens":3}}`))
 	}))
 	defer upstream.Close()
 	cfg := DefaultConfig()
