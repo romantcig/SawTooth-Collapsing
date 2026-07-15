@@ -570,6 +570,7 @@ type SawtoothTrigger struct {
 	baselineGeneration          map[string]uint64        // threadID → 响应写回版本，防止慢加载覆盖新状态
 	baselineRequestGeneration   map[string]uint64        // threadID → 请求进入有状态主管线时分配的代际
 	baselineCommittedGeneration map[string]uint64        // threadID → 最近接受的响应请求代际
+	baselinePersistLocks        map[string]*sync.Mutex   // threadID → 锁外持久化串行锁
 	requestSeq                  map[string]int           // threadID → 当前请求序号（Phase B: DecayTracker 用）
 	pauseThreshold              time.Duration            // 暂停检测阈值（cache TTL - 安全边距）
 	tokenThreshold              int                      // 超过此值触发桩化周期（来自配置）
@@ -592,6 +593,7 @@ func NewSawtoothTrigger(pauseThreshold time.Duration, tokenThreshold, tokenMinim
 		baselineGeneration:          make(map[string]uint64),
 		baselineRequestGeneration:   make(map[string]uint64),
 		baselineCommittedGeneration: make(map[string]uint64),
+		baselinePersistLocks:        make(map[string]*sync.Mutex),
 		requestSeq:                  make(map[string]int),
 		pauseThreshold:              pauseThreshold,
 		tokenThreshold:              tokenThreshold,
@@ -740,6 +742,10 @@ func (st *SawtoothTrigger) UpdatePressureBaselineForRequest(threadID string, gen
 		ToolsFingerprint:          toolsFingerprint,
 		MessagesPrefixFingerprint: messagesPrefixFingerprint,
 	}
+	data, marshalErr := json.Marshal(state)
+	persistLock := st.pressurePersistLock(threadID)
+	persistLock.Lock()
+	defer persistLock.Unlock()
 
 	st.mu.Lock()
 	if generation == 0 {
@@ -774,13 +780,22 @@ func (st *SawtoothTrigger) UpdatePressureBaselineForRequest(threadID string, gen
 		st.loadedFromDB[threadID] = false
 	}
 	persistFn := st.persistFn
-	if persistFn != nil {
-		if data, err := json.Marshal(state); err == nil {
-			persistFn("sawtooth:"+threadID, string(data))
-		}
+	st.mu.Unlock()
+	if persistFn != nil && marshalErr == nil {
+		persistFn("sawtooth:"+threadID, string(data))
+	}
+	return true
+}
+
+func (st *SawtoothTrigger) pressurePersistLock(threadID string) *sync.Mutex {
+	st.mu.Lock()
+	lock := st.baselinePersistLocks[threadID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		st.baselinePersistLocks[threadID] = lock
 	}
 	st.mu.Unlock()
-	return true
+	return lock
 }
 
 func sanitizePressureFingerprint(fingerprint string) string {

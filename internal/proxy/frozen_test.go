@@ -398,6 +398,66 @@ func TestSawtoothPressureBaselinePersistenceKeepsStateOrder(t *testing.T) {
 	}
 }
 
+func TestSawtoothPressureBaselinePersistCallbackCanReadBaseline(t *testing.T) {
+	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+	const threadID = "pressure-persist-reentrant-read"
+	callbackRead := make(chan pressureBaseline, 1)
+	trigger.SetPersistFunc(func(_ string, _ string) {
+		callbackRead <- trigger.PressureBaseline(threadID)
+	})
+	done := make(chan struct{})
+	go func() {
+		trigger.UpdatePressureBaseline(threadID, 33_333, 33, strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 64))
+		close(done)
+	}()
+
+	select {
+	case got := <-callbackRead:
+		if !got.Available || got.ActualTokens != 33_333 || got.MessageCount != 33 {
+			t.Fatalf("persist callback read stale baseline: %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("persist callback reading PressureBaseline deadlocked")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("baseline update did not return after reentrant read")
+	}
+}
+
+func TestSawtoothPressureBaselineSlowPersistenceDoesNotBlockOtherThread(t *testing.T) {
+	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	trigger.SetPersistFunc(func(key, _ string) {
+		if key == "sawtooth:slow-thread" {
+			close(firstEntered)
+			<-releaseFirst
+		}
+	})
+
+	slowDone := make(chan struct{})
+	go func() {
+		trigger.UpdatePressureBaseline("slow-thread", 11_111, 11, strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 64))
+		close(slowDone)
+	}()
+	<-firstEntered
+
+	fastDone := make(chan struct{})
+	go func() {
+		trigger.UpdatePressureBaseline("fast-thread", 22_222, 22, strings.Repeat("4", 64), strings.Repeat("5", 64), strings.Repeat("6", 64))
+		close(fastDone)
+	}()
+	select {
+	case <-fastDone:
+	case <-time.After(time.Second):
+		t.Fatal("另一个 session 被慢持久化阻塞")
+	}
+	close(releaseFirst)
+	<-slowDone
+}
+
 func TestFrozenStoreKeepsRawCutoffSeparateFromFrozenPrefixLength(t *testing.T) {
 	frozen := NewFrozenStubs()
 	raw := frozenTestMessages(302)
