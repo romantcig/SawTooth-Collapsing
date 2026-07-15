@@ -165,7 +165,11 @@ func TestForwardRawOutOfOrderResponsesKeepNewestRequestBaseline(t *testing.T) {
 		persisted = value
 		persistedMu.Unlock()
 	})
-	s := NewServer(Config{Proxy: ProxyConfig{Target: upstream.URL, Deflation: 1}})
+	debugDir := t.TempDir()
+	s := NewServer(Config{
+		Proxy: ProxyConfig{Target: upstream.URL, Deflation: 1},
+		Debug: DebugConfig{Enabled: true, DataDir: debugDir},
+	})
 	s.Sawtooth = trigger
 	fingerprint := fingerprintTopLevelJSON(nil)
 
@@ -217,6 +221,23 @@ func TestForwardRawOutOfOrderResponsesKeepNewestRequestBaseline(t *testing.T) {
 	}
 	if state.Tokens != 222 || state.MsgCount != len(messagesB) || state.MessagesPrefixFingerprint != metaB.PressureDecision.MessagesPrefixFingerprint {
 		t.Fatalf("旧响应覆盖了较新持久 baseline: %+v", state)
+	}
+	baselineUpdatedByRequest := make(map[uint64]bool)
+	for _, data := range readDebugFactFiles(t, debugDir, sessionID) {
+		var fact debugFact
+		if err := json.Unmarshal(data, &fact); err != nil {
+			t.Fatal(err)
+		}
+		if fact.Stage != debugStageResponseUsage || fact.BaselineUpdated == nil {
+			continue
+		}
+		baselineUpdatedByRequest[fact.RequestID] = *fact.BaselineUpdated
+	}
+	if updated, ok := baselineUpdatedByRequest[metaB.ID]; !ok || !updated {
+		t.Fatalf("较新响应 baseline_updated=%v present=%v, want true", updated, ok)
+	}
+	if updated, ok := baselineUpdatedByRequest[metaA.ID]; !ok || updated {
+		t.Fatalf("较旧迟到响应 baseline_updated=%v present=%v, want false", updated, ok)
 	}
 }
 

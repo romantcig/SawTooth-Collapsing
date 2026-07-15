@@ -14,7 +14,6 @@ type requestMeta struct {
 	AgentReason          agentClassificationReason
 	PressureDecision     pressureDecision
 	BaselineGeneration   uint64
-	BaselineUpdated      bool
 	OriginalMessageCount int
 	Logger               *slog.Logger
 	auxiliaryAuditLogger *slog.Logger

@@ -63,7 +63,7 @@ func TestDebugFactsPressureDecisionAndUsageJoin(t *testing.T) {
 	s.writePressureDecisionDebugFacts(meta, stamp.Add(time.Nanosecond))
 	s.writeUsageDebugFacts(meta, stamp, map[string]any{
 		"input_tokens": 19000, "cache_creation_input_tokens": 1000, "cache_read_input_tokens": 500,
-	})
+	}, true)
 
 	facts := debugFactsByStage(t, dataDir, meta.RequestSessionID)
 	if len(facts) != 2 {
@@ -134,7 +134,7 @@ func TestDebugFactsAuxiliaryUsageDoesNotClaimBaseline(t *testing.T) {
 			tc.meta.PressureDecision = pressureDecision{Available: true, SelectedPressure: 9000}
 			stamp := time.Date(2026, 7, 15, 2, 3, 4, 5, time.UTC)
 			s.writePressureDecisionDebugFacts(tc.meta, stamp)
-			s.writeUsageDebugFacts(tc.meta, stamp, map[string]any{"input_tokens": 10000})
+			s.writeUsageDebugFacts(tc.meta, stamp, map[string]any{"input_tokens": 10000}, false)
 
 			facts := debugFactsByStage(t, dataDir, tc.meta.RequestSessionID)
 			if _, ok := facts[debugStagePressureDecision]; ok {
@@ -413,7 +413,7 @@ func TestDebugFactsUsageUsesTotalInputTokens(t *testing.T) {
 	meta := newRequestMeta(9, "usage-session")
 	s.writeUsageDebugFacts(meta, time.Date(2026, 7, 12, 1, 2, 3, 4, time.UTC), map[string]any{
 		"input_tokens": 196, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 93056,
-	})
+	}, false)
 	files := readDebugFactFiles(t, dataDir, meta.RequestSessionID)
 	if len(files) != 1 {
 		t.Fatalf("usage facts 文件数=%d, want 1", len(files))

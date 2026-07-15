@@ -153,18 +153,15 @@ func (s *Server) writePressureDecisionDebugFacts(meta *requestMeta, timestamp ti
 	})
 }
 
-func (s *Server) writeUsageDebugFacts(meta *requestMeta, timestamp time.Time, usage map[string]any) {
+func (s *Server) writeUsageDebugFacts(meta *requestMeta, timestamp time.Time, usage map[string]any, baselineUpdated bool) {
 	if meta == nil {
 		return
 	}
 	actual := totalInputTokens(usage)
-	meta.BaselineUpdated = actual > 0 && s.Sawtooth != nil && meta.tracksSawtoothState() &&
-		meta.PressureDecision.Available && !meta.PressureDecision.ForwardedCoordinatesChanged
 	if !s.Config.Debug.Enabled {
 		return
 	}
 	meta.usageFactsOnce.Do(func() {
-		baselineUpdated := meta.BaselineUpdated
 		fact := debugFact{
 			Timestamp:                timestamp.UTC().Format(time.RFC3339Nano),
 			RequestID:                meta.ID,

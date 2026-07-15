@@ -561,19 +561,18 @@ func markForwardedPressureCoordinates(meta *requestMeta, body []byte) {
 }
 
 // applyPressureBaselineUsage 只在 actual 与原始消息坐标一致时建立可复用 baseline。
-// 若本轮改写了历史，则清空旧 baseline，确保下一轮从 local_full 重新校准。
-func (s *Server) applyPressureBaselineUsage(meta *requestMeta, actual int) {
+// 返回值表示 actual baseline 是否被请求代际协议真正接受，供 response_usage facts 如实记录。
+// 若本轮改写了历史，则清空旧 baseline，确保下一轮从 local_full 重新校准，但不声称建立了 actual baseline。
+func (s *Server) applyPressureBaselineUsage(meta *requestMeta, actual int) bool {
 	if meta == nil || actual <= 0 || s.Sawtooth == nil || !meta.tracksSawtoothState() || !meta.PressureDecision.Available {
-		return
+		return false
 	}
 	decision := meta.PressureDecision
 	if decision.ForwardedCoordinatesChanged {
 		s.Sawtooth.UpdatePressureBaselineForRequest(meta.RequestSessionID, meta.BaselineGeneration, 0, 0, "", "", "")
-		return
+		return false
 	}
-	if meta.BaselineUpdated {
-		s.Sawtooth.UpdatePressureBaselineForRequest(meta.RequestSessionID, meta.BaselineGeneration, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint)
-	}
+	return s.Sawtooth.UpdatePressureBaselineForRequest(meta.RequestSessionID, meta.BaselineGeneration, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint)
 }
 
 func streamRequest(body []byte) bool {
@@ -885,8 +884,8 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 		return upstreamResponseResult{err: downstreamErr, committed: committed}
 	}
 	if baselineState.complete() {
-		s.writeUsageDebugFacts(meta, timestamp, baselineState.usage)
-		s.applyPressureBaselineUsage(meta, baselineState.actual)
+		baselineUpdated := s.applyPressureBaselineUsage(meta, baselineState.actual)
+		s.writeUsageDebugFacts(meta, timestamp, baselineState.usage, baselineUpdated)
 	}
 	if !committed {
 		commit()
@@ -982,8 +981,8 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *re
 		} else {
 			// 只有严格合法的 Anthropic message usage 才能生成 facts 或校准 baseline。
 			if usage, actual, ok := parseAnthropicMessageInputUsage(body); ok {
-				s.writeUsageDebugFacts(meta, timestamp, usage)
-				s.applyPressureBaselineUsage(meta, actual)
+				baselineUpdated := s.applyPressureBaselineUsage(meta, actual)
+				s.writeUsageDebugFacts(meta, timestamp, usage, baselineUpdated)
 			}
 
 			if usage, ok := body["usage"].(map[string]any); ok {
