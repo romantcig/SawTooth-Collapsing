@@ -86,8 +86,8 @@ func TestPhase08CombinedLifecycle(t *testing.T) {
 	}
 
 	facts := readDebugFactFiles(t, debugDir, "phase08-combined")
-	if len(facts) != 6 {
-		t.Fatalf("两请求 facts=%d, want 6", len(facts))
+	if len(facts) != 8 {
+		t.Fatalf("两请求 facts=%d, want 8", len(facts))
 	}
 	stageByRequest := make(map[uint64]map[debugStage]debugFact)
 	for _, data := range facts {
@@ -107,7 +107,7 @@ func TestPhase08CombinedLifecycle(t *testing.T) {
 		t.Fatalf("facts request IDs=%d, want 2", len(stageByRequest))
 	}
 	for requestID, stages := range stageByRequest {
-		for _, stage := range []debugStage{debugStageRawInbound, debugStageForwarded, debugStageResponseUsage} {
+		for _, stage := range []debugStage{debugStageRawInbound, debugStagePressureDecision, debugStageForwarded, debugStageResponseUsage} {
 			if _, ok := stages[stage]; !ok {
 				t.Fatalf("request %d missing stage %q", requestID, stage)
 			}

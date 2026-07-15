@@ -21,6 +21,7 @@ type requestMeta struct {
 	rawFactsOnce         sync.Once
 	forwardedFactsOnce   sync.Once
 	pressureFactsOnce    sync.Once
+	pressureSummaryOnce  sync.Once
 	usageFactsOnce       sync.Once
 	rawBodyOnce          sync.Once
 	forwardedBodyOnce    sync.Once

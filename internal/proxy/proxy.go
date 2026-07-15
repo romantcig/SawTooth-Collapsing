@@ -630,6 +630,8 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		decision.CompressDecision = decision.TriggerReason != TriggerNone
 		meta.PressureDecision = decision
+		s.writePressureDecisionDebugFacts(meta, rawTimestamp)
+		logPressureSummary(meta)
 		messages = historyMessages
 
 		// Phase 4 Step 0: 保存原始 token 估算和消息数（SawtoothTrigger + frozen cutoff）
@@ -1025,6 +1027,43 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.forwardRaw(w, r, meta)
+}
+
+// formatApproxTokens 使用纯整数规则把 token 数格式化为终端近似值。
+// 千以下保留原值；千以上四舍五入到一位小数，整千不显示小数位。
+func formatApproxTokens(tokens int) string {
+	if tokens < 1000 {
+		return fmt.Sprintf("%d", tokens)
+	}
+	whole := tokens / 1000
+	tenths := (tokens%1000 + 50) / 100
+	if tenths == 10 {
+		whole++
+		tenths = 0
+	}
+	if tenths == 0 {
+		return fmt.Sprintf("%dk", whole)
+	}
+	return fmt.Sprintf("%d.%dk", whole, tenths)
+}
+
+// logPressureSummary 每条可跟踪主请求最多输出一次脱敏摘要。
+// 使用只绑定 request_id 的审计 logger，避免把 session 身份带入 pressure 日志。
+func logPressureSummary(meta *requestMeta) {
+	if meta == nil || !meta.tracksSawtoothState() || !meta.PressureDecision.Available {
+		return
+	}
+	meta.pressureSummaryOnce.Do(func() {
+		decision := meta.PressureDecision
+		meta.auxiliaryLogger().Info("pressure 摘要",
+			"pressure", formatApproxTokens(decision.SelectedPressure),
+			"threshold", formatApproxTokens(decision.Threshold),
+			"source", decision.Source,
+			"trigger_reason", decision.TriggerReason,
+			"baseline_reset_reason", decision.ResetReason,
+			"compress", decision.CompressDecision,
+		)
+	})
 }
 
 // searchAndExpand 是 HandleMessages 的唯一召回调用点；测试可注入计数 spy。
