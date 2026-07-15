@@ -104,6 +104,17 @@ func TestDebugFactsPressureDecisionAndUsageJoin(t *testing.T) {
 	if pressure["request_id"] != usage["request_id"] || pressure["request_id"] != 101.0 {
 		t.Fatalf("request_id join 失败: pressure=%v usage=%v", pressure["request_id"], usage["request_id"])
 	}
+
+	failureMeta := newRequestMeta(102, "pressure-failure-session")
+	failureMeta.PressureDecision = meta.PressureDecision
+	s.writePressureDecisionDebugFacts(failureMeta, stamp)
+	failureFacts := debugFactsByStage(t, dataDir, failureMeta.RequestSessionID)
+	if len(failureFacts) != 1 || failureFacts[debugStagePressureDecision] == nil {
+		t.Fatalf("失败响应必须只保留 decision: %v", failureFacts)
+	}
+	if _, ok := failureFacts[debugStageResponseUsage]; ok {
+		t.Fatalf("失败响应伪造 response_usage: %v", failureFacts)
+	}
 }
 
 func TestDebugFactsAuxiliaryUsageDoesNotClaimBaseline(t *testing.T) {

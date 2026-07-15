@@ -135,6 +135,9 @@ func TestPressureDecisionResetsOnSystemChange(t *testing.T) {
 	if decision.Source != pressureSourceLocalFull || decision.ResetReason != baselineResetSystemChanged || decision.SelectedPressure != decision.FullLocalEstimate {
 		t.Fatalf("system change decision=%+v", decision)
 	}
+	if !decision.SystemFingerprintChanged || decision.ToolsFingerprintChanged {
+		t.Fatalf("system/tools changed facts=%v/%v, want true/false", decision.SystemFingerprintChanged, decision.ToolsFingerprintChanged)
+	}
 }
 
 func TestPressureDecisionResetsOnToolsChange(t *testing.T) {
@@ -155,6 +158,9 @@ func TestPressureDecisionResetsOnToolsChange(t *testing.T) {
 	decision := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 16000)
 	if decision.Source != pressureSourceLocalFull || decision.ResetReason != baselineResetToolsChanged || decision.SelectedPressure != decision.FullLocalEstimate {
 		t.Fatalf("tools change decision=%+v", decision)
+	}
+	if decision.SystemFingerprintChanged || !decision.ToolsFingerprintChanged {
+		t.Fatalf("system/tools changed facts=%v/%v, want false/true", decision.SystemFingerprintChanged, decision.ToolsFingerprintChanged)
 	}
 }
 
