@@ -524,10 +524,11 @@ const (
 
 // persistedState 是持久化到 proxy_state 的 JSON 结构。
 type persistedState struct {
-	Tokens            int    `json:"tokens"`
-	MsgCount          int    `json:"msg_count"`
-	SystemFingerprint string `json:"system_fingerprint,omitempty"`
-	ToolsFingerprint  string `json:"tools_fingerprint,omitempty"`
+	Tokens                    int    `json:"tokens"`
+	MsgCount                  int    `json:"msg_count"`
+	SystemFingerprint         string `json:"system_fingerprint,omitempty"`
+	ToolsFingerprint          string `json:"tools_fingerprint,omitempty"`
+	MessagesPrefixFingerprint string `json:"messages_prefix_fingerprint,omitempty"`
 }
 
 // baselineResetReason 表示 pressure baseline 不能沿用时的受限原因。
@@ -535,54 +536,58 @@ type persistedState struct {
 type baselineResetReason string
 
 const (
-	baselineResetNone          baselineResetReason = "none"
-	baselineResetNoActual      baselineResetReason = "no_actual"
-	baselineResetMessageShrink baselineResetReason = "message_shrink"
-	baselineResetSystemChanged baselineResetReason = "system_changed"
-	baselineResetToolsChanged  baselineResetReason = "tools_changed"
+	baselineResetNone            baselineResetReason = "none"
+	baselineResetNoActual        baselineResetReason = "no_actual"
+	baselineResetMessageShrink   baselineResetReason = "message_shrink"
+	baselineResetMessagesChanged baselineResetReason = "messages_changed"
+	baselineResetSystemChanged   baselineResetReason = "system_changed"
+	baselineResetToolsChanged    baselineResetReason = "tools_changed"
 )
 
 // pressureBaseline 是后续 pressure 决策所需的单次原子快照。
 // 其中只包含数字、受限枚举和固定长度 SHA-256 十六进制指纹。
 type pressureBaseline struct {
-	ActualTokens      int
-	MessageCount      int
-	SystemFingerprint string
-	ToolsFingerprint  string
-	Available         bool
-	ResetReason       baselineResetReason
+	ActualTokens              int
+	MessageCount              int
+	SystemFingerprint         string
+	ToolsFingerprint          string
+	MessagesPrefixFingerprint string
+	Available                 bool
+	ResetReason               baselineResetReason
 }
 
 // SawtoothTrigger 根据 token 使用量和时间判断是否执行桩化周期。
 type SawtoothTrigger struct {
-	mu                 sync.RWMutex
-	lastTotalTokens    map[string]int       // threadID → 上次 API 响应 input tokens
-	lastMessageCount   map[string]int       // threadID → 上次响应时的消息数
-	systemFingerprints map[string]string    // threadID → 上次主请求 system 的 SHA-256 指纹
-	toolsFingerprints  map[string]string    // threadID → 上次主请求 tools 的 SHA-256 指纹
-	lastRequestTime    map[string]time.Time // threadID → 上次 API 响应时间
-	loadedFromDB       map[string]bool      // threadID → 已尝试从 DB 加载
-	requestSeq         map[string]int       // threadID → 当前请求序号（Phase B: DecayTracker 用）
-	pauseThreshold     time.Duration        // 暂停检测阈值（cache TTL - 安全边距）
-	tokenThreshold     int                  // 超过此值触发桩化周期（来自配置）
-	tokenMinimum       int                  // 桩化下限（来自配置）
-	persistFn          PersistFunc          // 可选：更新时持久化 token 状态到 DB
-	loadFn             LoadFunc             // 可选：冷启动时从 DB 加载 token 状态
+	mu                         sync.RWMutex
+	lastTotalTokens            map[string]int       // threadID → 上次 API 响应 input tokens
+	lastMessageCount           map[string]int       // threadID → 上次响应时的消息数
+	systemFingerprints         map[string]string    // threadID → 上次主请求 system 的 SHA-256 指纹
+	toolsFingerprints          map[string]string    // threadID → 上次主请求 tools 的 SHA-256 指纹
+	messagesPrefixFingerprints map[string]string    // threadID → 上次主请求消息前缀的 SHA-256 指纹
+	lastRequestTime            map[string]time.Time // threadID → 上次 API 响应时间
+	loadedFromDB               map[string]bool      // threadID → 已尝试从 DB 加载
+	requestSeq                 map[string]int       // threadID → 当前请求序号（Phase B: DecayTracker 用）
+	pauseThreshold             time.Duration        // 暂停检测阈值（cache TTL - 安全边距）
+	tokenThreshold             int                  // 超过此值触发桩化周期（来自配置）
+	tokenMinimum               int                  // 桩化下限（来自配置）
+	persistFn                  PersistFunc          // 可选：更新时持久化 token 状态到 DB
+	loadFn                     LoadFunc             // 可选：冷启动时从 DB 加载 token 状态
 }
 
 // NewSawtoothTrigger 创建新的触发状态跟踪器。
 func NewSawtoothTrigger(pauseThreshold time.Duration, tokenThreshold, tokenMinimum int) *SawtoothTrigger {
 	return &SawtoothTrigger{
-		lastTotalTokens:    make(map[string]int),
-		lastMessageCount:   make(map[string]int),
-		systemFingerprints: make(map[string]string),
-		toolsFingerprints:  make(map[string]string),
-		lastRequestTime:    make(map[string]time.Time),
-		loadedFromDB:       make(map[string]bool),
-		requestSeq:         make(map[string]int),
-		pauseThreshold:     pauseThreshold,
-		tokenThreshold:     tokenThreshold,
-		tokenMinimum:       tokenMinimum,
+		lastTotalTokens:            make(map[string]int),
+		lastMessageCount:           make(map[string]int),
+		systemFingerprints:         make(map[string]string),
+		toolsFingerprints:          make(map[string]string),
+		messagesPrefixFingerprints: make(map[string]string),
+		lastRequestTime:            make(map[string]time.Time),
+		loadedFromDB:               make(map[string]bool),
+		requestSeq:                 make(map[string]int),
+		pauseThreshold:             pauseThreshold,
+		tokenThreshold:             tokenThreshold,
+		tokenMinimum:               tokenMinimum,
 	}
 }
 
@@ -600,15 +605,17 @@ func (st *SawtoothTrigger) PressureBaseline(threadID string) pressureBaseline {
 
 	st.mu.RLock()
 	baseline := pressureBaseline{
-		ActualTokens:      st.lastTotalTokens[threadID],
-		MessageCount:      st.lastMessageCount[threadID],
-		SystemFingerprint: st.systemFingerprints[threadID],
-		ToolsFingerprint:  st.toolsFingerprints[threadID],
-		ResetReason:       baselineResetNoActual,
+		ActualTokens:              st.lastTotalTokens[threadID],
+		MessageCount:              st.lastMessageCount[threadID],
+		SystemFingerprint:         st.systemFingerprints[threadID],
+		ToolsFingerprint:          st.toolsFingerprints[threadID],
+		MessagesPrefixFingerprint: st.messagesPrefixFingerprints[threadID],
+		ResetReason:               baselineResetNoActual,
 	}
 	baseline.Available = baseline.ActualTokens > 0 && baseline.MessageCount >= 0 &&
 		validPressureFingerprint(baseline.SystemFingerprint) &&
-		validPressureFingerprint(baseline.ToolsFingerprint)
+		validPressureFingerprint(baseline.ToolsFingerprint) &&
+		validPressureFingerprint(baseline.MessagesPrefixFingerprint)
 	if baseline.Available {
 		baseline.ResetReason = baselineResetNone
 	}
@@ -677,26 +684,29 @@ func (st *SawtoothTrigger) ShouldTrigger(threadID string, selectedPressure int) 
 // UpdateAfterResponse 是三参数 legacy 兼容入口。
 // 它保留 actual 与消息坐标，但主动清空上下文指纹，强制下一轮完整重基线。
 func (st *SawtoothTrigger) UpdateAfterResponse(threadID string, totalInputTokens, messageCount int) {
-	st.UpdatePressureBaseline(threadID, totalInputTokens, messageCount, "", "")
+	st.UpdatePressureBaseline(threadID, totalInputTokens, messageCount, "", "", "")
 }
 
 // UpdatePressureBaseline 在成功主响应后原子写回完整 pressure baseline。
 // 指纹只接受固定 64 位小写 SHA-256 十六进制；非法值按空值持久化。
-func (st *SawtoothTrigger) UpdatePressureBaseline(threadID string, totalInputTokens, messageCount int, systemFingerprint, toolsFingerprint string) {
+func (st *SawtoothTrigger) UpdatePressureBaseline(threadID string, totalInputTokens, messageCount int, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint string) {
 	systemFingerprint = sanitizePressureFingerprint(systemFingerprint)
 	toolsFingerprint = sanitizePressureFingerprint(toolsFingerprint)
+	messagesPrefixFingerprint = sanitizePressureFingerprint(messagesPrefixFingerprint)
 	if totalInputTokens <= 0 || messageCount < 0 {
 		totalInputTokens = 0
 		messageCount = 0
 		systemFingerprint = ""
 		toolsFingerprint = ""
+		messagesPrefixFingerprint = ""
 	}
 
 	state := persistedState{
-		Tokens:            totalInputTokens,
-		MsgCount:          messageCount,
-		SystemFingerprint: systemFingerprint,
-		ToolsFingerprint:  toolsFingerprint,
+		Tokens:                    totalInputTokens,
+		MsgCount:                  messageCount,
+		SystemFingerprint:         systemFingerprint,
+		ToolsFingerprint:          toolsFingerprint,
+		MessagesPrefixFingerprint: messagesPrefixFingerprint,
 	}
 
 	st.mu.Lock()
@@ -705,12 +715,14 @@ func (st *SawtoothTrigger) UpdatePressureBaseline(threadID string, totalInputTok
 		st.lastMessageCount[threadID] = messageCount
 		st.systemFingerprints[threadID] = systemFingerprint
 		st.toolsFingerprints[threadID] = toolsFingerprint
+		st.messagesPrefixFingerprints[threadID] = messagesPrefixFingerprint
 		st.lastRequestTime[threadID] = time.Now()
 	} else {
 		delete(st.lastTotalTokens, threadID)
 		delete(st.lastMessageCount, threadID)
 		delete(st.systemFingerprints, threadID)
 		delete(st.toolsFingerprints, threadID)
+		delete(st.messagesPrefixFingerprints, threadID)
 		delete(st.lastRequestTime, threadID)
 	}
 	st.loadedFromDB[threadID] = true
@@ -788,6 +800,7 @@ func (st *SawtoothTrigger) loadSawtoothFromDB(threadID string) {
 	}
 	state.SystemFingerprint = sanitizePressureFingerprint(state.SystemFingerprint)
 	state.ToolsFingerprint = sanitizePressureFingerprint(state.ToolsFingerprint)
+	state.MessagesPrefixFingerprint = sanitizePressureFingerprint(state.MessagesPrefixFingerprint)
 
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -799,6 +812,7 @@ func (st *SawtoothTrigger) loadSawtoothFromDB(threadID string) {
 	st.lastMessageCount[threadID] = state.MsgCount
 	st.systemFingerprints[threadID] = state.SystemFingerprint
 	st.toolsFingerprints[threadID] = state.ToolsFingerprint
+	st.messagesPrefixFingerprints[threadID] = state.MessagesPrefixFingerprint
 	// 不设置 lastRequestTime —— 保持零值，ShouldTrigger 中 hasTime=false 会跳过 Pause 检查。
 	// 下次 API 响应后 UpdateAfterResponse 才会设置真实时间。
 

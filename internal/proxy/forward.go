@@ -645,7 +645,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 							actual := totalInputTokens(usage)
 							if meta.BaselineUpdated {
 								decision := meta.PressureDecision
-								s.Sawtooth.UpdatePressureBaseline(sessionID, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint)
+								s.Sawtooth.UpdatePressureBaseline(sessionID, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint)
 							}
 							usageRecorded = true
 						}
@@ -773,7 +773,7 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *re
 				actual := totalInputTokens(usage)
 				if meta.BaselineUpdated {
 					decision := meta.PressureDecision
-					s.Sawtooth.UpdatePressureBaseline(sessionID, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint)
+					s.Sawtooth.UpdatePressureBaseline(sessionID, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint)
 				}
 			}
 

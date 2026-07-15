@@ -374,25 +374,26 @@ const (
 // pressureDecision 保存请求进入有状态管线前的一次性压力决定。
 // 该值只包含计数、固定长度指纹和受限枚举，不保存请求正文。
 type pressureDecision struct {
-	Available                bool
-	MessagesLocalTokens      int
-	SystemLocalTokens        int
-	ToolsLocalTokens         int
-	FullLocalEstimate        int
-	PreviousActual           int
-	PreviousMessageCount     int
-	NewMessageDelta          int
-	SelectedPressure         int
-	Source                   pressureSource
-	ResetReason              baselineResetReason
-	TriggerReason            TriggerReason
-	Threshold                int
-	MessageCount             int
-	SystemFingerprint        string
-	ToolsFingerprint         string
-	SystemFingerprintChanged bool
-	ToolsFingerprintChanged  bool
-	CompressDecision         bool
+	Available                 bool
+	MessagesLocalTokens       int
+	SystemLocalTokens         int
+	ToolsLocalTokens          int
+	FullLocalEstimate         int
+	PreviousActual            int
+	PreviousMessageCount      int
+	NewMessageDelta           int
+	SelectedPressure          int
+	Source                    pressureSource
+	ResetReason               baselineResetReason
+	TriggerReason             TriggerReason
+	Threshold                 int
+	MessageCount              int
+	SystemFingerprint         string
+	ToolsFingerprint          string
+	MessagesPrefixFingerprint string
+	SystemFingerprintChanged  bool
+	ToolsFingerprintChanged   bool
+	CompressDecision          bool
 }
 
 type topLevelMeasurement struct {
@@ -440,6 +441,18 @@ func fingerprintTopLevelJSON(raw json.RawMessage) string {
 	return inspectTopLevelJSON(raw, nil).fingerprint
 }
 
+// fingerprintMessagesPrefix 只保存消息坐标的 SHA-256 证明，不保存消息正文。
+func fingerprintMessagesPrefix(messages []Message, count int) string {
+	if count < 0 || count > len(messages) {
+		return ""
+	}
+	canonical, err := json.Marshal(messages[:count])
+	if err != nil {
+		return ""
+	}
+	return sha256hex(canonical)
+}
+
 // buildPressureDecision 在 local_full 与 actual_plus_delta 中只选择一次。
 // production 调用对 system/tools 各规范化一次，同时保存 full estimate 作为误差证据。
 func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessage, baseline pressureBaseline, tc *TokenCounter, threshold int) pressureDecision {
@@ -451,24 +464,26 @@ func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessa
 	}
 	fullEstimate := saturatingAdd(saturatingAdd(messagesTokens, system.tokens), tools.tokens)
 	decision := pressureDecision{
-		Available:            tc != nil,
-		MessagesLocalTokens:  messagesTokens,
-		SystemLocalTokens:    system.tokens,
-		ToolsLocalTokens:     tools.tokens,
-		FullLocalEstimate:    fullEstimate,
-		PreviousActual:       baseline.ActualTokens,
-		PreviousMessageCount: baseline.MessageCount,
-		SelectedPressure:     fullEstimate,
-		Source:               pressureSourceLocalFull,
-		ResetReason:          baselineResetNoActual,
-		Threshold:            threshold,
-		MessageCount:         len(messages),
-		SystemFingerprint:    system.fingerprint,
-		ToolsFingerprint:     tools.fingerprint,
+		Available:                 tc != nil,
+		MessagesLocalTokens:       messagesTokens,
+		SystemLocalTokens:         system.tokens,
+		ToolsLocalTokens:          tools.tokens,
+		FullLocalEstimate:         fullEstimate,
+		PreviousActual:            baseline.ActualTokens,
+		PreviousMessageCount:      baseline.MessageCount,
+		SelectedPressure:          fullEstimate,
+		Source:                    pressureSourceLocalFull,
+		ResetReason:               baselineResetNoActual,
+		Threshold:                 threshold,
+		MessageCount:              len(messages),
+		SystemFingerprint:         system.fingerprint,
+		ToolsFingerprint:          tools.fingerprint,
+		MessagesPrefixFingerprint: fingerprintMessagesPrefix(messages, len(messages)),
 	}
 
 	baselineValid := baseline.Available && baseline.ActualTokens > 0 && baseline.MessageCount >= 0 &&
-		validPressureFingerprint(baseline.SystemFingerprint) && validPressureFingerprint(baseline.ToolsFingerprint)
+		validPressureFingerprint(baseline.SystemFingerprint) && validPressureFingerprint(baseline.ToolsFingerprint) &&
+		validPressureFingerprint(baseline.MessagesPrefixFingerprint)
 	if !baselineValid {
 		return decision
 	}
@@ -484,6 +499,10 @@ func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessa
 	}
 	if decision.ToolsFingerprintChanged {
 		decision.ResetReason = baselineResetToolsChanged
+		return decision
+	}
+	if fingerprintMessagesPrefix(messages, baseline.MessageCount) != baseline.MessagesPrefixFingerprint {
+		decision.ResetReason = baselineResetMessagesChanged
 		return decision
 	}
 

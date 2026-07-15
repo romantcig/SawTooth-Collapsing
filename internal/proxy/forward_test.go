@@ -56,10 +56,11 @@ func TestHandleSSEPressureBaseline(t *testing.T) {
 	tools := json.RawMessage(`[{"name":"sse_tool","input_schema":{"type":"object"}}]`)
 	meta := newRequestMeta(1, "sse-cache")
 	meta.PressureDecision = pressureDecision{
-		Available:         true,
-		MessageCount:      37,
-		SystemFingerprint: fingerprintTopLevelJSON(system),
-		ToolsFingerprint:  fingerprintTopLevelJSON(tools),
+		Available:                 true,
+		MessageCount:              37,
+		SystemFingerprint:         fingerprintTopLevelJSON(system),
+		ToolsFingerprint:          fingerprintTopLevelJSON(tools),
+		MessagesPrefixFingerprint: strings.Repeat("a", 64),
 	}
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
@@ -74,7 +75,7 @@ func TestHandleSSEPressureBaseline(t *testing.T) {
 	if err := json.Unmarshal([]byte(persisted), &state); err != nil {
 		t.Fatalf("解析持久状态: %v; raw=%q", err, persisted)
 	}
-	if state.Tokens != 93252 || state.MsgCount != meta.PressureDecision.MessageCount || state.SystemFingerprint != meta.PressureDecision.SystemFingerprint || state.ToolsFingerprint != meta.PressureDecision.ToolsFingerprint {
+	if state.Tokens != 93252 || state.MsgCount != meta.PressureDecision.MessageCount || state.SystemFingerprint != meta.PressureDecision.SystemFingerprint || state.ToolsFingerprint != meta.PressureDecision.ToolsFingerprint || state.MessagesPrefixFingerprint != meta.PressureDecision.MessagesPrefixFingerprint {
 		t.Fatalf("SSE 持久状态=%+v, want actual=93252 original_count=%d fingerprints=%q/%q", state, meta.PressureDecision.MessageCount, meta.PressureDecision.SystemFingerprint, meta.PressureDecision.ToolsFingerprint)
 	}
 	if strings.Contains(recorder.Body.String(), `"input_tokens":196`) || !strings.Contains(recorder.Body.String(), `"input_tokens":98`) {
@@ -92,10 +93,11 @@ func TestHandleJSONPressureBaseline(t *testing.T) {
 	tools := json.RawMessage(`[{"name":"json_tool","input_schema":{"type":"object"}}]`)
 	meta := newRequestMeta(2, "json-cache")
 	meta.PressureDecision = pressureDecision{
-		Available:         true,
-		MessageCount:      41,
-		SystemFingerprint: fingerprintTopLevelJSON(system),
-		ToolsFingerprint:  fingerprintTopLevelJSON(tools),
+		Available:                 true,
+		MessageCount:              41,
+		SystemFingerprint:         fingerprintTopLevelJSON(system),
+		ToolsFingerprint:          fingerprintTopLevelJSON(tools),
+		MessagesPrefixFingerprint: strings.Repeat("b", 64),
 	}
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
@@ -109,7 +111,7 @@ func TestHandleJSONPressureBaseline(t *testing.T) {
 	if err := json.Unmarshal([]byte(persisted), &state); err != nil {
 		t.Fatalf("解析持久状态: %v; raw=%q", err, persisted)
 	}
-	if state.Tokens != 93252 || state.MsgCount != meta.PressureDecision.MessageCount || state.SystemFingerprint != meta.PressureDecision.SystemFingerprint || state.ToolsFingerprint != meta.PressureDecision.ToolsFingerprint {
+	if state.Tokens != 93252 || state.MsgCount != meta.PressureDecision.MessageCount || state.SystemFingerprint != meta.PressureDecision.SystemFingerprint || state.ToolsFingerprint != meta.PressureDecision.ToolsFingerprint || state.MessagesPrefixFingerprint != meta.PressureDecision.MessagesPrefixFingerprint {
 		t.Fatalf("JSON 持久状态=%+v, want actual=93252 original_count=%d fingerprints=%q/%q", state, meta.PressureDecision.MessageCount, meta.PressureDecision.SystemFingerprint, meta.PressureDecision.ToolsFingerprint)
 	}
 	if strings.Contains(recorder.Body.String(), `"input_tokens":196`) || !strings.Contains(recorder.Body.String(), `"input_tokens":98`) {
@@ -148,7 +150,7 @@ func testHandleAuxiliaryDoesNotUpdate(t *testing.T, sse bool) {
 			trigger := NewSawtoothTrigger(time.Hour, 50000, 1000)
 			oldSystem := fingerprintTopLevelJSON(json.RawMessage(`"old system"`))
 			oldTools := fingerprintTopLevelJSON(json.RawMessage(`[]`))
-			trigger.UpdatePressureBaseline(sessionID, 777, 9, oldSystem, oldTools)
+			trigger.UpdatePressureBaseline(sessionID, 777, 9, oldSystem, oldTools, strings.Repeat("c", 64))
 			before := trigger.PressureBaseline(sessionID)
 			persistCalls := 0
 			trigger.SetPersistFunc(func(_ string, _ string) { persistCalls++ })
@@ -199,7 +201,7 @@ func TestHandleJSONFailureDoesNotUpdate(t *testing.T) {
 		const sessionID = "upstream-failure-baseline"
 		trigger := NewSawtoothTrigger(time.Hour, 50000, 1000)
 		fingerprint := fingerprintTopLevelJSON(nil)
-		trigger.UpdatePressureBaseline(sessionID, 777, 9, fingerprint, fingerprint)
+		trigger.UpdatePressureBaseline(sessionID, 777, 9, fingerprint, fingerprint, strings.Repeat("d", 64))
 		before := trigger.PressureBaseline(sessionID)
 		persistCalls := 0
 		trigger.SetPersistFunc(func(_ string, _ string) { persistCalls++ })
@@ -256,7 +258,7 @@ func testHandleFailureDoesNotUpdate(t *testing.T, sse bool) {
 			const sessionID = "failure-baseline"
 			trigger := NewSawtoothTrigger(time.Hour, 50000, 1000)
 			fingerprint := fingerprintTopLevelJSON(nil)
-			trigger.UpdatePressureBaseline(sessionID, 777, 9, fingerprint, fingerprint)
+			trigger.UpdatePressureBaseline(sessionID, 777, 9, fingerprint, fingerprint, strings.Repeat("e", 64))
 			before := trigger.PressureBaseline(sessionID)
 			persistCalls := 0
 			trigger.SetPersistFunc(func(_ string, _ string) { persistCalls++ })

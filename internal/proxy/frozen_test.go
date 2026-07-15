@@ -14,12 +14,14 @@ func TestSawtoothPressureBaselineSnapshot(t *testing.T) {
 	const threadID = "pressure-snapshot"
 	systemFingerprint := strings.Repeat("a", 64)
 	toolsFingerprint := strings.Repeat("b", 64)
+	messagesPrefixFingerprint := strings.Repeat("c", 64)
 
 	trigger.mu.Lock()
 	trigger.lastTotalTokens[threadID] = 91_234
 	trigger.lastMessageCount[threadID] = 27
 	trigger.systemFingerprints[threadID] = systemFingerprint
 	trigger.toolsFingerprints[threadID] = toolsFingerprint
+	trigger.messagesPrefixFingerprints[threadID] = messagesPrefixFingerprint
 	trigger.loadedFromDB[threadID] = true
 	trigger.mu.Unlock()
 
@@ -30,8 +32,8 @@ func TestSawtoothPressureBaselineSnapshot(t *testing.T) {
 	if got.ActualTokens != 91_234 || got.MessageCount != 27 {
 		t.Fatalf("baseline coordinates = actual %d, messages %d", got.ActualTokens, got.MessageCount)
 	}
-	if got.SystemFingerprint != systemFingerprint || got.ToolsFingerprint != toolsFingerprint {
-		t.Fatalf("baseline fingerprints = (%q, %q)", got.SystemFingerprint, got.ToolsFingerprint)
+	if got.SystemFingerprint != systemFingerprint || got.ToolsFingerprint != toolsFingerprint || got.MessagesPrefixFingerprint != messagesPrefixFingerprint {
+		t.Fatalf("baseline fingerprints = (%q, %q, %q)", got.SystemFingerprint, got.ToolsFingerprint, got.MessagesPrefixFingerprint)
 	}
 }
 
@@ -114,11 +116,12 @@ func TestSawtoothPressureBaselinePersistenceRoundTrip(t *testing.T) {
 	const threadID = "pressure-round-trip"
 	systemFingerprint := strings.Repeat("a", 64)
 	toolsFingerprint := strings.Repeat("b", 64)
+	messagesPrefixFingerprint := strings.Repeat("c", 64)
 	persisted := make(map[string]string)
 
 	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
 	trigger.SetPersistFunc(func(key, value string) { persisted[key] = value })
-	trigger.UpdatePressureBaseline(threadID, 93_252, 25, systemFingerprint, toolsFingerprint)
+	trigger.UpdatePressureBaseline(threadID, 93_252, 25, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint)
 
 	raw, ok := persisted["sawtooth:"+threadID]
 	if !ok {
@@ -129,7 +132,7 @@ func TestSawtoothPressureBaselinePersistenceRoundTrip(t *testing.T) {
 		t.Fatalf("unmarshal persisted pressure baseline: %v", err)
 	}
 	if state.Tokens != 93_252 || state.MsgCount != 25 ||
-		state.SystemFingerprint != systemFingerprint || state.ToolsFingerprint != toolsFingerprint {
+		state.SystemFingerprint != systemFingerprint || state.ToolsFingerprint != toolsFingerprint || state.MessagesPrefixFingerprint != messagesPrefixFingerprint {
 		t.Fatalf("persisted pressure baseline = %+v", state)
 	}
 
@@ -140,7 +143,7 @@ func TestSawtoothPressureBaselinePersistenceRoundTrip(t *testing.T) {
 	})
 	got := restored.PressureBaseline(threadID)
 	if !got.Available || got.ActualTokens != 93_252 || got.MessageCount != 25 ||
-		got.SystemFingerprint != systemFingerprint || got.ToolsFingerprint != toolsFingerprint {
+		got.SystemFingerprint != systemFingerprint || got.ToolsFingerprint != toolsFingerprint || got.MessagesPrefixFingerprint != messagesPrefixFingerprint {
 		t.Fatalf("restored pressure baseline = %+v", got)
 	}
 }
@@ -171,6 +174,7 @@ func TestSawtoothPressureBaselineLegacyUpdateForcesRebaseline(t *testing.T) {
 		20,
 		strings.Repeat("c", 64),
 		strings.Repeat("d", 64),
+		strings.Repeat("e", 64),
 	)
 	trigger.UpdateAfterResponse("pressure-wrapper", 71_000, 22)
 
@@ -193,7 +197,7 @@ func TestSawtoothPressureBaselineRejectsInvalidFingerprint(t *testing.T) {
 	for index, invalid := range invalidFingerprints {
 		threadID := fmt.Sprintf("pressure-invalid-%d", index)
 		trigger := NewSawtoothTrigger(0, 100_000, 10_000)
-		trigger.UpdatePressureBaseline(threadID, 50_000, 12, invalid, valid)
+		trigger.UpdatePressureBaseline(threadID, 50_000, 12, invalid, valid, valid)
 		got := trigger.PressureBaseline(threadID)
 		if got.Available || got.SystemFingerprint != "" || got.ToolsFingerprint != valid {
 			t.Fatalf("invalid fingerprint entered calibrated baseline: %+v", got)
@@ -201,7 +205,7 @@ func TestSawtoothPressureBaselineRejectsInvalidFingerprint(t *testing.T) {
 	}
 
 	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
-	trigger.UpdatePressureBaseline("pressure-no-actual", 0, 12, valid, valid)
+	trigger.UpdatePressureBaseline("pressure-no-actual", 0, 12, valid, valid, valid)
 	got := trigger.PressureBaseline("pressure-no-actual")
 	if got.Available || got.ActualTokens != 0 || got.SystemFingerprint != "" || got.ToolsFingerprint != "" {
 		t.Fatalf("non-positive actual established baseline: %+v", got)
@@ -216,12 +220,13 @@ func TestSawtoothPressureBaselineUpdateIsAtomic(t *testing.T) {
 		count  int
 		system string
 		tools  string
+		prefix string
 	}
 	versions := []version{
-		{actual: 30_003, count: 303, system: strings.Repeat("5", 64), tools: strings.Repeat("6", 64)},
-		{actual: 40_004, count: 404, system: strings.Repeat("7", 64), tools: strings.Repeat("8", 64)},
+		{actual: 30_003, count: 303, system: strings.Repeat("5", 64), tools: strings.Repeat("6", 64), prefix: strings.Repeat("9", 64)},
+		{actual: 40_004, count: 404, system: strings.Repeat("7", 64), tools: strings.Repeat("8", 64), prefix: strings.Repeat("a", 64)},
 	}
-	trigger.UpdatePressureBaseline(threadID, versions[0].actual, versions[0].count, versions[0].system, versions[0].tools)
+	trigger.UpdatePressureBaseline(threadID, versions[0].actual, versions[0].count, versions[0].system, versions[0].tools, versions[0].prefix)
 
 	const iterations = 20_000
 	start := make(chan struct{})
@@ -234,7 +239,7 @@ func TestSawtoothPressureBaselineUpdateIsAtomic(t *testing.T) {
 			<-start
 			for i := 0; i < iterations; i++ {
 				value := versions[(i+writer)%len(versions)]
-				trigger.UpdatePressureBaseline(threadID, value.actual, value.count, value.system, value.tools)
+				trigger.UpdatePressureBaseline(threadID, value.actual, value.count, value.system, value.tools, value.prefix)
 			}
 		}()
 	}
@@ -244,7 +249,7 @@ func TestSawtoothPressureBaselineUpdateIsAtomic(t *testing.T) {
 		matches := false
 		for _, want := range versions {
 			if got.Available && got.ActualTokens == want.actual && got.MessageCount == want.count &&
-				got.SystemFingerprint == want.system && got.ToolsFingerprint == want.tools {
+				got.SystemFingerprint == want.system && got.ToolsFingerprint == want.tools && got.MessagesPrefixFingerprint == want.prefix {
 				matches = true
 				break
 			}

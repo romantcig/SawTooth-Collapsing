@@ -70,12 +70,13 @@ func TestPressureDecisionUsesActualPlusDelta(t *testing.T) {
 	system := json.RawMessage(`[{"type":"text","text":"stable system"}]`)
 	tools := json.RawMessage(`[{"name":"stable_tool","input_schema":{"type":"object"}}]`)
 	baseline := pressureBaseline{
-		ActualTokens:      9000,
-		MessageCount:      2,
-		SystemFingerprint: fingerprintTopLevelJSON(system),
-		ToolsFingerprint:  fingerprintTopLevelJSON(tools),
-		Available:         true,
-		ResetReason:       baselineResetNone,
+		ActualTokens:              9000,
+		MessageCount:              2,
+		SystemFingerprint:         fingerprintTopLevelJSON(system),
+		ToolsFingerprint:          fingerprintTopLevelJSON(tools),
+		MessagesPrefixFingerprint: fingerprintMessagesPrefix(messages, 2),
+		Available:                 true,
+		ResetReason:               baselineResetNone,
 	}
 
 	decision := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 16000)
@@ -104,11 +105,12 @@ func TestPressureDecisionResetsOnMessageShrink(t *testing.T) {
 	system := json.RawMessage(`"stable"`)
 	tools := json.RawMessage(`[]`)
 	baseline := pressureBaseline{
-		ActualTokens:      20000,
-		MessageCount:      3,
-		SystemFingerprint: fingerprintTopLevelJSON(system),
-		ToolsFingerprint:  fingerprintTopLevelJSON(tools),
-		Available:         true,
+		ActualTokens:              20000,
+		MessageCount:              3,
+		SystemFingerprint:         fingerprintTopLevelJSON(system),
+		ToolsFingerprint:          fingerprintTopLevelJSON(tools),
+		MessagesPrefixFingerprint: strings.Repeat("a", 64),
+		Available:                 true,
 	}
 	decision := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 16000)
 	if decision.Source != pressureSourceLocalFull || decision.ResetReason != baselineResetMessageShrink || decision.SelectedPressure != decision.FullLocalEstimate {
@@ -125,11 +127,12 @@ func TestPressureDecisionResetsOnSystemChange(t *testing.T) {
 	system := json.RawMessage(`"new system"`)
 	tools := json.RawMessage(`[]`)
 	baseline := pressureBaseline{
-		ActualTokens:      20000,
-		MessageCount:      2,
-		SystemFingerprint: fingerprintTopLevelJSON(json.RawMessage(`"old system"`)),
-		ToolsFingerprint:  fingerprintTopLevelJSON(tools),
-		Available:         true,
+		ActualTokens:              20000,
+		MessageCount:              2,
+		SystemFingerprint:         fingerprintTopLevelJSON(json.RawMessage(`"old system"`)),
+		ToolsFingerprint:          fingerprintTopLevelJSON(tools),
+		MessagesPrefixFingerprint: fingerprintMessagesPrefix(messages, 2),
+		Available:                 true,
 	}
 	decision := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 16000)
 	if decision.Source != pressureSourceLocalFull || decision.ResetReason != baselineResetSystemChanged || decision.SelectedPressure != decision.FullLocalEstimate {
@@ -149,11 +152,12 @@ func TestPressureDecisionResetsOnToolsChange(t *testing.T) {
 	system := json.RawMessage(`"stable system"`)
 	tools := json.RawMessage(`[{"name":"new_tool"}]`)
 	baseline := pressureBaseline{
-		ActualTokens:      20000,
-		MessageCount:      2,
-		SystemFingerprint: fingerprintTopLevelJSON(system),
-		ToolsFingerprint:  fingerprintTopLevelJSON(json.RawMessage(`[{"name":"old_tool"}]`)),
-		Available:         true,
+		ActualTokens:              20000,
+		MessageCount:              2,
+		SystemFingerprint:         fingerprintTopLevelJSON(system),
+		ToolsFingerprint:          fingerprintTopLevelJSON(json.RawMessage(`[{"name":"old_tool"}]`)),
+		MessagesPrefixFingerprint: fingerprintMessagesPrefix(messages, 2),
+		Available:                 true,
 	}
 	decision := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 16000)
 	if decision.Source != pressureSourceLocalFull || decision.ResetReason != baselineResetToolsChanged || decision.SelectedPressure != decision.FullLocalEstimate {
@@ -189,7 +193,7 @@ func TestPressureDecisionThresholdBehavior(t *testing.T) {
 	}
 	pause := NewSawtoothTrigger(0, 1000, 100)
 	fingerprint := fingerprintTopLevelJSON(nil)
-	pause.UpdatePressureBaseline("pause", 200, 1, fingerprint, fingerprint)
+	pause.UpdatePressureBaseline("pause", 200, 1, fingerprint, fingerprint, strings.Repeat("a", 64))
 	pause.mu.Lock()
 	pause.lastRequestTime["pause"] = time.Now().Add(-time.Second)
 	pause.mu.Unlock()
@@ -231,7 +235,7 @@ func TestRequestMetaConcurrentIDsUnique(t *testing.T) {
 func TestHandleMessagesDebugStages(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":196,"cache_creation_input_tokens":0,"cache_read_input_tokens":93056,"output_tokens":1}}`))
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":196,"cache_creation_input_tokens":0,"cache_read_input_tokens":93056,"output_tokens":1}}`))
 	}))
 	defer upstream.Close()
 
@@ -282,7 +286,7 @@ func TestHandleMessagesDebugStages(t *testing.T) {
 func TestHandleMessagesDebugFullBodyOptIn(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":1,"output_tokens":1}}`))
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":1,"output_tokens":1}}`))
 	}))
 	defer upstream.Close()
 
@@ -324,7 +328,7 @@ func TestHandleMessagesDebugFullBodyOptIn(t *testing.T) {
 func TestConcurrentRequestLogsReconstructable(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":100,"output_tokens":1}}`))
 	}))
 	defer upstream.Close()
 
@@ -555,7 +559,8 @@ func testSessionTitleResponseState(t *testing.T, sse bool) {
 		if sse {
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = io.WriteString(w, "event: message_start\n"+
-				`data: {"type":"message_start","message":{"usage":{"input_tokens":196,"cache_creation_input_tokens":0,"cache_read_input_tokens":93056,"output_tokens":20}}}`+"\n\n")
+				`data: {"type":"message_start","message":{"type":"message","usage":{"input_tokens":196,"cache_creation_input_tokens":0,"cache_read_input_tokens":93056,"output_tokens":20}}}`+"\n\n"+
+				"event: message_stop\n"+`data: {"type":"message_stop"}`+"\n\n")
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -567,7 +572,7 @@ func testSessionTitleResponseState(t *testing.T, sse bool) {
 	server.Config.Proxy.Deflation = 0.5
 	server.Config.Debug = DebugConfig{Enabled: true, DataDir: t.TempDir()}
 	missingFingerprint := fingerprintTopLevelJSON(nil)
-	server.Sawtooth.UpdatePressureBaseline(sessionID, 777, 9, missingFingerprint, missingFingerprint)
+	server.Sawtooth.UpdatePressureBaseline(sessionID, 777, 9, missingFingerprint, missingFingerprint, strings.Repeat("a", 64))
 	baselineBefore := server.Sawtooth.PressureBaseline(sessionID)
 	requestSeqBefore := server.Sawtooth.GetRequestSeq(sessionID)
 	frozenMessages := []Message{{Role: "user", Content: mustMarshal("title-response-frozen")}}
@@ -658,7 +663,8 @@ func testSubagentResponseState(t *testing.T, sse bool) {
 		if sse {
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = io.WriteString(w, "event: message_start\n"+
-				`data: {"type":"message_start","message":{"usage":{"input_tokens":196,"cache_creation_input_tokens":0,"cache_read_input_tokens":93056,"output_tokens":20}}}`+"\n\n")
+				`data: {"type":"message_start","message":{"type":"message","usage":{"input_tokens":196,"cache_creation_input_tokens":0,"cache_read_input_tokens":93056,"output_tokens":20}}}`+"\n\n"+
+				"event: message_stop\n"+`data: {"type":"message_stop"}`+"\n\n")
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -670,7 +676,7 @@ func testSubagentResponseState(t *testing.T, sse bool) {
 	server.Config.Proxy.Deflation = 0.5
 	server.Config.Debug = DebugConfig{Enabled: true, DataDir: t.TempDir()}
 	missingFingerprint := fingerprintTopLevelJSON(nil)
-	server.Sawtooth.UpdatePressureBaseline(sessionID, 888, 11, missingFingerprint, missingFingerprint)
+	server.Sawtooth.UpdatePressureBaseline(sessionID, 888, 11, missingFingerprint, missingFingerprint, strings.Repeat("a", 64))
 	baselineBefore := server.Sawtooth.PressureBaseline(sessionID)
 	requestSeqBefore := server.Sawtooth.GetRequestSeq(sessionID)
 	frozenMessages := []Message{{Role: "user", Content: mustMarshal("subagent-response-frozen")}}
@@ -742,13 +748,13 @@ func testHandleMessagesDirectAgentBypass(t *testing.T, _ ...string) {
 		}
 		forwardedBodies = append(forwardedBodies, body)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":100,"output_tokens":1}}`))
 	}))
 	defer upstream.Close()
 
 	server := newPipelineTestServer(t, upstream.URL)
 	missingFingerprint := fingerprintTopLevelJSON(nil)
-	server.Sawtooth.UpdatePressureBaseline(sessionID, 777, 9, missingFingerprint, missingFingerprint)
+	server.Sawtooth.UpdatePressureBaseline(sessionID, 777, 9, missingFingerprint, missingFingerprint, strings.Repeat("a", 64))
 	baselineBefore := server.Sawtooth.PressureBaseline(sessionID)
 	requestSeqBefore := server.Sawtooth.GetRequestSeq(sessionID)
 	frozenMessages := []Message{{Role: "user", Content: mustMarshal("subagent-frozen-sentinel")}}
@@ -822,7 +828,7 @@ func TestHandleMessagesMainFallbackRunsPipeline(t *testing.T) {
 		}
 		forwarded = deepCopyMessages(body.Messages)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":100,"output_tokens":1}}`))
 	}))
 	defer upstream.Close()
 
@@ -861,7 +867,7 @@ func TestHandleMessagesSubagentIgnoresParentFrozen(t *testing.T) {
 		}
 		forwarded = deepCopyMessages(body.Messages)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100}}`))
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":100}}`))
 	}))
 	defer upstream.Close()
 	server := newPipelineTestServer(t, upstream.URL)
@@ -892,7 +898,7 @@ func TestHandleMessagesCollapseFreezeLifecycle(t *testing.T) {
 		}
 		forwarded = deepCopyMessages(body.Messages)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":100,"output_tokens":1}}`))
 	}))
 	defer upstream.Close()
 
@@ -941,7 +947,7 @@ func TestHandleMessagesPreviousUsageAboveThresholdTriggersCollapse(t *testing.T)
 		}
 		forwarded = deepCopyMessages(body.Messages)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":100,"output_tokens":1}}`))
 	}))
 	defer upstream.Close()
 
@@ -965,7 +971,7 @@ func TestHandleMessagesPreviousUsageAboveThresholdTriggersCollapse(t *testing.T)
 		t.Fatal("未构造出低于阈值且具有可折叠历史的消息")
 	}
 	missingFingerprint := fingerprintTopLevelJSON(nil)
-	server.Sawtooth.UpdatePressureBaseline(sessionID, server.Config.Stubify.TokenThreshold+1, len(raw), missingFingerprint, missingFingerprint)
+	server.Sawtooth.UpdatePressureBaseline(sessionID, server.Config.Stubify.TokenThreshold+1, len(raw), missingFingerprint, missingFingerprint, fingerprintMessagesPrefix(raw, len(raw)))
 
 	servePipelineRequest(t, server, sessionID, raw)
 
@@ -991,7 +997,7 @@ func TestHandleMessagesPreviousUsageAboveThresholdDoesNotForceCollapse(t *testin
 		}
 		forwarded = deepCopyMessages(body.Messages)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":100,"output_tokens":1}}`))
 	}))
 	defer upstream.Close()
 
@@ -999,7 +1005,7 @@ func TestHandleMessagesPreviousUsageAboveThresholdDoesNotForceCollapse(t *testin
 	sessionID := "previous-usage-short-history"
 	raw := pipelineMessages(2, 3)
 	missingFingerprint := fingerprintTopLevelJSON(nil)
-	server.Sawtooth.UpdatePressureBaseline(sessionID, server.Config.Stubify.TokenThreshold+1, len(raw), missingFingerprint, missingFingerprint)
+	server.Sawtooth.UpdatePressureBaseline(sessionID, server.Config.Stubify.TokenThreshold+1, len(raw), missingFingerprint, missingFingerprint, fingerprintMessagesPrefix(raw, len(raw)))
 	var captured pressureDecision
 	server.searchAndExpandFn = func(messages []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, meta *requestMeta) RecallOutcome {
 		captured = meta.PressureDecision
@@ -1022,7 +1028,7 @@ func TestHandleMessagesPreviousUsageAboveThresholdDoesNotForceCollapse(t *testin
 func TestHandleMessagesLocalFullSystemToolsTrigger(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":100,"output_tokens":1}}`))
 	}))
 	defer upstream.Close()
 
@@ -1058,7 +1064,7 @@ func TestHandleMessagesLocalFullSystemToolsTrigger(t *testing.T) {
 func TestHandleMessagesActualPlusDelta(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":100,"output_tokens":1}}`))
 	}))
 	defer upstream.Close()
 
@@ -1068,7 +1074,7 @@ func TestHandleMessagesActualPlusDelta(t *testing.T) {
 	messages := append(deepCopyMessages(base), pipelineMessages(1, 7)...)
 	systemRaw := json.RawMessage(`[{"type":"text","text":"stable system"}]`)
 	toolsRaw := json.RawMessage(`[{"name":"stable_tool","input_schema":{"type":"object"}}]`)
-	server.Sawtooth.UpdatePressureBaseline(sessionID, 7000, len(base), fingerprintTopLevelJSON(systemRaw), fingerprintTopLevelJSON(toolsRaw))
+	server.Sawtooth.UpdatePressureBaseline(sessionID, 7000, len(base), fingerprintTopLevelJSON(systemRaw), fingerprintTopLevelJSON(toolsRaw), fingerprintMessagesPrefix(base, len(base)))
 	var captured pressureDecision
 	server.searchAndExpandFn = func(current []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, meta *requestMeta) RecallOutcome {
 		captured = meta.PressureDecision
@@ -1094,10 +1100,97 @@ func TestHandleMessagesActualPlusDelta(t *testing.T) {
 	}
 }
 
+func TestPressureDecisionRejectsEditedBaselinePrefix(t *testing.T) {
+	tokenCounter, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	base := pipelineMessages(2, 5)
+	fingerprint := fingerprintTopLevelJSON(nil)
+	baseline := pressureBaseline{
+		ActualTokens:              7000,
+		MessageCount:              len(base),
+		SystemFingerprint:         fingerprint,
+		ToolsFingerprint:          fingerprint,
+		MessagesPrefixFingerprint: fingerprintMessagesPrefix(base, len(base)),
+		Available:                 true,
+	}
+
+	tests := []struct {
+		name     string
+		messages []Message
+	}{
+		{name: "same length edit", messages: deepCopyMessages(base)},
+		{name: "growth with old prefix edit", messages: append(deepCopyMessages(base), pipelineMessages(1, 3)...)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.messages[0].Content = mustMarshal(strings.Repeat("edited historical pressure ", 2000))
+			decision := buildPressureDecision(tc.messages, nil, nil, baseline, tokenCounter, 100_000)
+			if decision.Source != pressureSourceLocalFull || decision.ResetReason != baselineResetMessagesChanged {
+				t.Fatalf("edited prefix decision=%+v", decision)
+			}
+			if decision.SelectedPressure != decision.FullLocalEstimate || decision.NewMessageDelta != 0 {
+				t.Fatalf("edited prefix reused actual: %+v", decision)
+			}
+		})
+	}
+}
+
+func TestHandleMessagesEditedPrefixFailureRetryStaysLocalFull(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"upstream_error"}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	sessionID := "edited-prefix-failure-retry"
+	base := pipelineMessages(2, 5)
+	edited := deepCopyMessages(base)
+	edited[0].Content = mustMarshal(strings.Repeat("edited historical pressure ", 2000))
+	fingerprint := fingerprintTopLevelJSON(nil)
+	server.Sawtooth.UpdatePressureBaseline(sessionID, 7000, len(base), fingerprint, fingerprint, fingerprintMessagesPrefix(base, len(base)))
+	var decisions []pressureDecision
+	server.searchAndExpandFn = func(current []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, meta *requestMeta) RecallOutcome {
+		decisions = append(decisions, meta.PressureDecision)
+		return RecallOutcome{Messages: current}
+	}
+
+	serveFailure := func() {
+		requestBody, err := json.Marshal(map[string]any{
+			"model": "deepseek-v4-pro", "thinking": map[string]any{"type": "enabled"}, "messages": edited,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(requestBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Claude-Code-Session-Id", sessionID)
+		recorder := httptest.NewRecorder()
+		server.HandleMessages(recorder, req)
+		if recorder.Code != http.StatusBadGateway {
+			t.Fatalf("failure status=%d, want %d", recorder.Code, http.StatusBadGateway)
+		}
+	}
+	serveFailure()
+	serveFailure()
+
+	if len(decisions) != 2 {
+		t.Fatalf("captured decisions=%d, want 2", len(decisions))
+	}
+	for index, decision := range decisions {
+		if decision.Source != pressureSourceLocalFull || decision.ResetReason != baselineResetMessagesChanged {
+			t.Fatalf("retry %d reused stale actual: %+v", index+1, decision)
+		}
+	}
+}
+
 func TestHandleMessagesPressureBaselineReset(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":100,"output_tokens":1}}`))
 	}))
 	defer upstream.Close()
 
@@ -1134,7 +1227,11 @@ func TestHandleMessagesPressureBaselineReset(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			server := newPipelineTestServer(t, upstream.URL)
 			sessionID := "baseline-reset-" + strings.ReplaceAll(tc.name, " ", "-")
-			server.Sawtooth.UpdatePressureBaseline(sessionID, 20000, tc.baselineCount, fingerprintTopLevelJSON(tc.baselineSys), fingerprintTopLevelJSON(tc.baselineTools))
+			prefixFingerprint := strings.Repeat("a", 64)
+			if tc.baselineCount <= len(tc.messages) {
+				prefixFingerprint = fingerprintMessagesPrefix(tc.messages, tc.baselineCount)
+			}
+			server.Sawtooth.UpdatePressureBaseline(sessionID, 20000, tc.baselineCount, fingerprintTopLevelJSON(tc.baselineSys), fingerprintTopLevelJSON(tc.baselineTools), prefixFingerprint)
 			var captured pressureDecision
 			server.searchAndExpandFn = func(current []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, meta *requestMeta) RecallOutcome {
 				captured = meta.PressureDecision
@@ -1172,7 +1269,7 @@ func TestHandleMessagesCollapseThenRestore(t *testing.T) {
 		}
 		forwarded = append(forwarded, deepCopyMessages(body.Messages))
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":100,"output_tokens":1}}`))
 	}))
 	defer upstream.Close()
 
@@ -1192,8 +1289,8 @@ func TestHandleMessagesCollapseThenRestore(t *testing.T) {
 	if len(forwarded) != 2 {
 		t.Fatalf("upstream request count = %d, want 2", len(forwarded))
 	}
-	if got, want := len(forwarded[1]), len(forwarded[0])+len(tail); got != want {
-		t.Fatalf("restored message count = %d, want frozen prefix %d + tail %d = %d", got, len(forwarded[0]), len(tail), want)
+	if got := len(forwarded[1]); got <= len(tail) || got >= len(secondRaw) {
+		t.Fatalf("context 坐标变化后的重压缩消息数=%d, want 保留历史且小于原始 %d", got, len(secondRaw))
 	}
 	assertPersistentContext(t, forwarded[0], "context-A")
 	assertPersistentContext(t, forwarded[1], "context-B")
@@ -1204,20 +1301,12 @@ func TestHandleMessagesCollapseThenRestore(t *testing.T) {
 		t.Fatalf("第二轮 context B count=%d, want 1", got)
 	}
 	for i := range tail {
-		got, err := json.Marshal(forwarded[1][len(forwarded[0])+i])
-		if err != nil {
-			t.Fatalf("marshal forwarded tail %d: %v", i, err)
-		}
-		want, err := json.Marshal(tail[i])
-		if err != nil {
-			t.Fatalf("marshal expected tail %d: %v", i, err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Fatalf("fresh tail %d changed\ngot:  %s\nwant: %s", i, got, want)
+		if got := countMessagesContaining(forwarded[1], fmt.Sprintf("fresh-tail-%d", i)); got != 1 {
+			t.Fatalf("fresh tail %d count=%d, want 1", i, got)
 		}
 	}
-	if got := archiveCount(t, server.Store); got != archivesAfterFreeze {
-		t.Fatalf("archive rows after restore = %d, want unchanged %d", got, archivesAfterFreeze)
+	if got := archiveCount(t, server.Store); got != archivesAfterFreeze+1 {
+		t.Fatalf("context 坐标变化重压缩后的 archive rows=%d, want %d", got, archivesAfterFreeze+1)
 	}
 	detachedSecond, _ := DetachPersistentUserContext(secondRaw)
 	if result := server.Frozen.Get("thread-restore", StripReminders(detachedSecond)); result == nil {
@@ -1234,7 +1323,7 @@ func TestHandleMessagesCollapseThenRestore(t *testing.T) {
 func TestHandleMessagesFrozenBoundaryEdit(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":20000,"output_tokens":1}}`))
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":20000,"output_tokens":1}}`))
 	}))
 	defer upstream.Close()
 
@@ -1303,7 +1392,7 @@ func TestHandleMessagesPersistentContextPaths(t *testing.T) {
 				}
 				forwarded = deepCopyMessages(body.Messages)
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"usage":{"input_tokens":100}}`))
+				_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":100}}`))
 			}))
 			defer upstream.Close()
 
@@ -1382,7 +1471,7 @@ func TestHandleMessagesSearchOnceAcrossFrozenPaths(t *testing.T) {
 				}
 				forwarded = deepCopyMessages(body.Messages)
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":1}}`))
+				_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":100,"output_tokens":1}}`))
 			}))
 			defer upstream.Close()
 
