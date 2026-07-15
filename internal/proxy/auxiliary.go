@@ -158,8 +158,37 @@ func isSessionTitleLanguageInstruction(text string) bool {
 	if language == "" || utf8.RuneCountInString(language) > 64 {
 		return false
 	}
+	parenthesisDepth := 0
 	for _, r := range language {
-		if r == '<' || r == '>' || unicode.IsControl(r) {
+		switch {
+		case unicode.IsLetter(r), unicode.IsMark(r), r == ' ', r == '-':
+		case r == '(':
+			if parenthesisDepth != 0 {
+				return false
+			}
+			parenthesisDepth = 1
+		case r == ')':
+			if parenthesisDepth != 1 {
+				return false
+			}
+			parenthesisDepth = 0
+		default:
+			return false
+		}
+	}
+	if parenthesisDepth != 0 {
+		return false
+	}
+	blockedWords := map[string]struct{}{
+		"add": {}, "disregard": {}, "forget": {}, "follow": {}, "generate": {},
+		"ignore": {}, "include": {}, "instruction": {}, "instructions": {}, "instead": {},
+		"obey": {}, "output": {}, "override": {}, "previous": {}, "prompt": {},
+		"remove": {}, "reveal": {}, "system": {}, "write": {},
+	}
+	for _, word := range strings.FieldsFunc(strings.ToLower(language), func(r rune) bool {
+		return r == ' ' || r == '-' || r == '(' || r == ')'
+	}) {
+		if _, blocked := blockedWords[word]; blocked {
 			return false
 		}
 	}
