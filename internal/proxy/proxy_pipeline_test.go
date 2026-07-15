@@ -52,6 +52,14 @@ func TestPressureDecisionLocalFullIncludesTopLevelComponents(t *testing.T) {
 	if gotA, gotB := fingerprintTopLevelJSON(orderedA), fingerprintTopLevelJSON(orderedB); gotA != gotB {
 		t.Fatalf("同语义不同 key 顺序 fingerprint 不一致: %q != %q", gotA, gotB)
 	}
+	largeIntegerA := json.RawMessage(`{"tools":[{"input_schema":{"const":9007199254740992}}]}`)
+	largeIntegerB := json.RawMessage(`{"tools":[{"input_schema":{"const":9007199254740993}}]}`)
+	if gotA, gotB := fingerprintTopLevelJSON(largeIntegerA), fingerprintTopLevelJSON(largeIntegerB); gotA == gotB {
+		t.Fatalf("超过 2^53 的不同整数 fingerprint 被折叠: %q", gotA)
+	}
+	if _, present, _ := canonicalizeTopLevelJSON(json.RawMessage(`{"a":1} {"b":2}`)); present {
+		t.Fatal("canonicalization accepted multiple top-level JSON values")
+	}
 	missingA := fingerprintTopLevelJSON(nil)
 	missingB := fingerprintTopLevelJSON(json.RawMessage{})
 	nullA := fingerprintTopLevelJSON(json.RawMessage(`null`))

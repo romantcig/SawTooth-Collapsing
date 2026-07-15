@@ -408,7 +408,12 @@ func canonicalizeTopLevelJSON(raw json.RawMessage) (canonical []byte, present bo
 		return nil, false, false
 	}
 	var value any
-	if err := json.Unmarshal(raw, &value); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		return nil, false, false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return nil, false, false
 	}
 	canonical, err := json.Marshal(value)
