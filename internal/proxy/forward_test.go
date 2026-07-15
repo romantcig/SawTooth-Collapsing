@@ -66,7 +66,8 @@ func TestHandleSSEPressureBaseline(t *testing.T) {
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": {"text/event-stream"}},
 		Body: io.NopCloser(strings.NewReader("event: message_start\n" +
-			"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":196,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":93056,\"output_tokens\":20}}}\n\n")),
+			"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":196,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":93056,\"output_tokens\":20}}}\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")),
 	}
 	recorder := httptest.NewRecorder()
 	s.handleSSE(recorder, resp, meta, time.Now(), "model", 4)
@@ -226,6 +227,77 @@ func TestHandleJSONFailureDoesNotUpdate(t *testing.T) {
 
 func TestHandleSSEFailureDoesNotUpdate(t *testing.T) {
 	testHandleFailureDoesNotUpdate(t, true)
+}
+
+type readThenErrorCloser struct {
+	reader *strings.Reader
+	err    error
+}
+
+func (r *readThenErrorCloser) Read(p []byte) (int, error) {
+	if r.reader.Len() > 0 {
+		return r.reader.Read(p)
+	}
+	if r.err != nil {
+		err := r.err
+		r.err = nil
+		return 0, err
+	}
+	return 0, io.EOF
+}
+
+func (r *readThenErrorCloser) Close() error { return nil }
+
+func TestHandleSSEInterruptedAfterMessageStartDiscardsPendingUsage(t *testing.T) {
+	const sessionID = "sse-interrupted-after-start"
+	trigger := NewSawtoothTrigger(time.Hour, 50_000, 1000)
+	fingerprint := fingerprintTopLevelJSON(nil)
+	trigger.UpdatePressureBaseline(sessionID, 777, 9, fingerprint, fingerprint, strings.Repeat("a", 64))
+	before := trigger.PressureBaseline(sessionID)
+	persistCalls := 0
+	trigger.SetPersistFunc(func(_ string, _ string) { persistCalls++ })
+	dataDir := t.TempDir()
+	s := NewServer(Config{Proxy: ProxyConfig{Deflation: 0.5}, Debug: DebugConfig{Enabled: true, DataDir: dataDir}})
+	s.Sawtooth = trigger
+	meta := newRequestMeta(22, sessionID)
+	meta.PressureDecision = pressureDecision{
+		Available:                 true,
+		SelectedPressure:          700,
+		MessageCount:              10,
+		SystemFingerprint:         fingerprint,
+		ToolsFingerprint:          fingerprint,
+		MessagesPrefixFingerprint: strings.Repeat("b", 64),
+	}
+	stamp := time.Now()
+	s.writePressureDecisionDebugFacts(meta, stamp)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"text/event-stream"}},
+		Body: &readThenErrorCloser{
+			reader: strings.NewReader("event: message_start\n" +
+				"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":196,\"cache_read_input_tokens\":93056}}}\n\n" +
+				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n"),
+			err: io.ErrUnexpectedEOF,
+		},
+	}
+
+	result := s.handleSSE(httptest.NewRecorder(), resp, meta, stamp, "model", 2)
+	if !errors.Is(result.err, io.ErrUnexpectedEOF) {
+		t.Fatalf("stream error=%v, want %v", result.err, io.ErrUnexpectedEOF)
+	}
+	if persistCalls != 0 {
+		t.Fatalf("interrupted stream persisted baseline %d times", persistCalls)
+	}
+	if after := trigger.PressureBaseline(sessionID); after != before {
+		t.Fatalf("interrupted stream changed baseline\nbefore=%+v\nafter=%+v", before, after)
+	}
+	facts := debugFactsByStage(t, dataDir, sessionID)
+	if len(facts) != 1 || facts[debugStagePressureDecision] == nil {
+		t.Fatalf("interrupted stream facts=%v, want only pressure decision", facts)
+	}
+	if _, ok := facts[debugStageResponseUsage]; ok {
+		t.Fatalf("interrupted stream wrote response_usage: %v", facts)
+	}
 }
 
 func testHandleFailureDoesNotUpdate(t *testing.T, sse bool) {

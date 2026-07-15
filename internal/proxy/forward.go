@@ -599,7 +599,9 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 
 	var eventBuf []string
 	var fullResponse strings.Builder
-	usageRecorded := false
+	var pendingUsage map[string]any
+	sawMessageStop := false
+	var downstreamErr error
 	committed := false
 	commit := func() {
 		if committed {
@@ -617,14 +619,23 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 		committed = true
 	}
 	flushEvent := func(event []string) {
+		if downstreamErr != nil {
+			return
+		}
 		commit()
 		processed := s.processSSEEvent(event)
 		for _, line := range processed {
-			_, _ = fmt.Fprintf(w, "%s\n", line)
+			if _, err := fmt.Fprintf(w, "%s\n", line); err != nil {
+				downstreamErr = err
+				return
+			}
 			fullResponse.WriteString(line)
 			fullResponse.WriteString("\n")
 		}
-		_, _ = fmt.Fprint(w, "\n")
+		if _, err := fmt.Fprint(w, "\n"); err != nil {
+			downstreamErr = err
+			return
+		}
 		fullResponse.WriteString("\n")
 		flusher.Flush()
 	}
@@ -632,8 +643,8 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// message_start 的 usage 在 processSSEEvent deflation 前更新 Sawtooth。
-		if !usageRecorded &&
+		// message_start 的 usage 在 processSSEEvent deflation 前缓存；只有完整流成功结束后才提交。
+		if pendingUsage == nil &&
 			strings.HasPrefix(line, "data:") && strings.Contains(line, "message_start") {
 			dataStr := strings.TrimSpace(line[5:])
 			var data map[string]any
@@ -641,16 +652,21 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 				if eventType, _ := data["type"].(string); eventType == "message_start" {
 					if msg, ok := data["message"].(map[string]any); ok {
 						if usage, ok := msg["usage"].(map[string]any); ok {
-							s.writeUsageDebugFacts(meta, timestamp, usage)
-							actual := totalInputTokens(usage)
-							if meta.BaselineUpdated {
-								decision := meta.PressureDecision
-								s.Sawtooth.UpdatePressureBaseline(sessionID, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint)
+							pendingUsage = make(map[string]any, len(usage))
+							for key, value := range usage {
+								pendingUsage[key] = value
 							}
-							usageRecorded = true
 						}
 					}
 				}
+			}
+		}
+		if strings.HasPrefix(line, "data:") && strings.Contains(line, "message_stop") {
+			dataStr := strings.TrimSpace(line[5:])
+			var data map[string]any
+			if json.Unmarshal([]byte(dataStr), &data) == nil {
+				eventType, _ := data["type"].(string)
+				sawMessageStop = eventType == "message_stop"
 			}
 		}
 
@@ -673,6 +689,17 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 	s.writeFullBodyDebug(meta, timestamp, debugBodyStageResponse, []byte(fullResponse.String()), resp.Header, model, messageCount)
 	if err := scanner.Err(); err != nil {
 		return upstreamResponseResult{err: err, committed: committed}
+	}
+	if downstreamErr != nil {
+		return upstreamResponseResult{err: downstreamErr, committed: committed}
+	}
+	if pendingUsage != nil && sawMessageStop {
+		s.writeUsageDebugFacts(meta, timestamp, pendingUsage)
+		actual := totalInputTokens(pendingUsage)
+		if meta.BaselineUpdated {
+			decision := meta.PressureDecision
+			s.Sawtooth.UpdatePressureBaseline(sessionID, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint)
+		}
 	}
 	if !committed {
 		commit()
