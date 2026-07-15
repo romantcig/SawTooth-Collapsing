@@ -81,8 +81,11 @@ func TestPhase08CombinedLifecycle(t *testing.T) {
 	if err := json.Unmarshal([]byte(persisted), &state); err != nil {
 		t.Fatalf("parse persisted Sawtooth state: %v raw=%q", err, persisted)
 	}
-	if state.Tokens != 93252 {
-		t.Fatalf("Sawtooth persisted tokens=%d, want 93252", state.Tokens)
+	if state.Tokens != 0 || state.MsgCount != 0 || state.SystemFingerprint != "" || state.ToolsFingerprint != "" || state.MessagesPrefixFingerprint != "" {
+		t.Fatalf("forwarded 坐标改变后 Sawtooth baseline 未安全清空: %+v", state)
+	}
+	if baseline := server.Sawtooth.PressureBaseline("phase08-combined"); baseline.Available {
+		t.Fatalf("forwarded 坐标改变后 raw baseline 仍可用: %+v", baseline)
 	}
 
 	facts := readDebugFactFiles(t, debugDir, "phase08-combined")
@@ -114,6 +117,8 @@ func TestPhase08CombinedLifecycle(t *testing.T) {
 		}
 		if usage := stages[debugStageResponseUsage]; usage.TotalInputTokens != 93252 {
 			t.Fatalf("request %d usage total=%d, want 93252", requestID, usage.TotalInputTokens)
+		} else if usage.BaselineUpdated == nil || *usage.BaselineUpdated {
+			t.Fatalf("request %d baseline_updated=%v, want false", requestID, usage.BaselineUpdated)
 		}
 		if raw := stages[debugStageRawInbound]; raw.ImageCount != 1 || !raw.HasClaudeMDContext {
 			t.Fatalf("request %d raw facts=%+v", requestID, raw)
