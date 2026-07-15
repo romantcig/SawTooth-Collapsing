@@ -113,6 +113,84 @@ func TestSawtoothPressureBaselineMissingState(t *testing.T) {
 	}
 }
 
+func TestSawtoothPressureBaselineConcurrentColdStartWaitsForLoad(t *testing.T) {
+	const threadID = "pressure-concurrent-cold-start"
+	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+	loadStarted := make(chan struct{})
+	releaseLoad := make(chan struct{})
+	loadCalls := 0
+	state := persistedState{
+		Tokens: 88_888, MsgCount: 18,
+		SystemFingerprint: strings.Repeat("1", 64), ToolsFingerprint: strings.Repeat("2", 64),
+		MessagesPrefixFingerprint: strings.Repeat("3", 64),
+	}
+	raw, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trigger.SetLoadFunc(func(string) (string, bool) {
+		loadCalls++
+		close(loadStarted)
+		<-releaseLoad
+		return string(raw), true
+	})
+
+	results := make(chan pressureBaseline, 2)
+	go func() { results <- trigger.PressureBaseline(threadID) }()
+	<-loadStarted
+	go func() { results <- trigger.PressureBaseline(threadID) }()
+	select {
+	case got := <-results:
+		t.Fatalf("concurrent cold-start returned before load completion: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseLoad)
+	for i := 0; i < 2; i++ {
+		got := <-results
+		if !got.Available || got.ActualTokens != state.Tokens || got.MessageCount != state.MsgCount ||
+			got.SystemFingerprint != state.SystemFingerprint || got.ToolsFingerprint != state.ToolsFingerprint ||
+			got.MessagesPrefixFingerprint != state.MessagesPrefixFingerprint {
+			t.Fatalf("cold-start result=%+v, want %+v", got, state)
+		}
+	}
+	if loadCalls != 1 {
+		t.Fatalf("load calls=%d, want 1", loadCalls)
+	}
+}
+
+func TestSawtoothPressureBaselineSlowLoadDoesNotOverwriteResponse(t *testing.T) {
+	const threadID = "pressure-slow-load-response-wins"
+	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+	loadStarted := make(chan struct{})
+	releaseLoad := make(chan struct{})
+	oldState := persistedState{
+		Tokens: 11_111, MsgCount: 11,
+		SystemFingerprint: strings.Repeat("1", 64), ToolsFingerprint: strings.Repeat("2", 64),
+		MessagesPrefixFingerprint: strings.Repeat("3", 64),
+	}
+	raw, err := json.Marshal(oldState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trigger.SetLoadFunc(func(string) (string, bool) {
+		close(loadStarted)
+		<-releaseLoad
+		return string(raw), true
+	})
+	loadedResult := make(chan pressureBaseline, 1)
+	go func() { loadedResult <- trigger.PressureBaseline(threadID) }()
+	<-loadStarted
+
+	trigger.UpdatePressureBaseline(threadID, 22_222, 22, strings.Repeat("4", 64), strings.Repeat("5", 64), strings.Repeat("6", 64))
+	close(releaseLoad)
+	got := <-loadedResult
+	if !got.Available || got.ActualTokens != 22_222 || got.MessageCount != 22 ||
+		got.SystemFingerprint != strings.Repeat("4", 64) || got.ToolsFingerprint != strings.Repeat("5", 64) ||
+		got.MessagesPrefixFingerprint != strings.Repeat("6", 64) {
+		t.Fatalf("slow load overwrote newer response: %+v", got)
+	}
+}
+
 func TestSawtoothPressureBaselinePersistenceRoundTrip(t *testing.T) {
 	const threadID = "pressure-round-trip"
 	systemFingerprint := strings.Repeat("a", 64)

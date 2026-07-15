@@ -559,19 +559,21 @@ type pressureBaseline struct {
 // SawtoothTrigger 根据 token 使用量和时间判断是否执行桩化周期。
 type SawtoothTrigger struct {
 	mu                         sync.RWMutex
-	lastTotalTokens            map[string]int       // threadID → 上次 API 响应 input tokens
-	lastMessageCount           map[string]int       // threadID → 上次响应时的消息数
-	systemFingerprints         map[string]string    // threadID → 上次主请求 system 的 SHA-256 指纹
-	toolsFingerprints          map[string]string    // threadID → 上次主请求 tools 的 SHA-256 指纹
-	messagesPrefixFingerprints map[string]string    // threadID → 上次主请求消息前缀的 SHA-256 指纹
-	lastRequestTime            map[string]time.Time // threadID → 上次 API 响应时间
-	loadedFromDB               map[string]bool      // threadID → 已尝试从 DB 加载
-	requestSeq                 map[string]int       // threadID → 当前请求序号（Phase B: DecayTracker 用）
-	pauseThreshold             time.Duration        // 暂停检测阈值（cache TTL - 安全边距）
-	tokenThreshold             int                  // 超过此值触发桩化周期（来自配置）
-	tokenMinimum               int                  // 桩化下限（来自配置）
-	persistFn                  PersistFunc          // 可选：更新时持久化 token 状态到 DB
-	loadFn                     LoadFunc             // 可选：冷启动时从 DB 加载 token 状态
+	lastTotalTokens            map[string]int           // threadID → 上次 API 响应 input tokens
+	lastMessageCount           map[string]int           // threadID → 上次响应时的消息数
+	systemFingerprints         map[string]string        // threadID → 上次主请求 system 的 SHA-256 指纹
+	toolsFingerprints          map[string]string        // threadID → 上次主请求 tools 的 SHA-256 指纹
+	messagesPrefixFingerprints map[string]string        // threadID → 上次主请求消息前缀的 SHA-256 指纹
+	lastRequestTime            map[string]time.Time     // threadID → 上次 API 响应时间
+	loadedFromDB               map[string]bool          // threadID → DB 加载已完成
+	loadingFromDB              map[string]chan struct{} // threadID → 正在进行的 DB 加载完成信号
+	baselineGeneration         map[string]uint64        // threadID → 响应写回版本，防止慢加载覆盖新状态
+	requestSeq                 map[string]int           // threadID → 当前请求序号（Phase B: DecayTracker 用）
+	pauseThreshold             time.Duration            // 暂停检测阈值（cache TTL - 安全边距）
+	tokenThreshold             int                      // 超过此值触发桩化周期（来自配置）
+	tokenMinimum               int                      // 桩化下限（来自配置）
+	persistFn                  PersistFunc              // 可选：更新时持久化 token 状态到 DB
+	loadFn                     LoadFunc                 // 可选：冷启动时从 DB 加载 token 状态
 }
 
 // NewSawtoothTrigger 创建新的触发状态跟踪器。
@@ -584,6 +586,8 @@ func NewSawtoothTrigger(pauseThreshold time.Duration, tokenThreshold, tokenMinim
 		messagesPrefixFingerprints: make(map[string]string),
 		lastRequestTime:            make(map[string]time.Time),
 		loadedFromDB:               make(map[string]bool),
+		loadingFromDB:              make(map[string]chan struct{}),
+		baselineGeneration:         make(map[string]uint64),
 		requestSeq:                 make(map[string]int),
 		pauseThreshold:             pauseThreshold,
 		tokenThreshold:             tokenThreshold,
@@ -594,12 +598,19 @@ func NewSawtoothTrigger(pauseThreshold time.Duration, tokenThreshold, tokenMinim
 // PressureBaseline 返回指定 thread 的完整 pressure baseline 单次快照。
 // 首次访问会在不持锁的情况下尝试从 SQLite lazy-load，然后整体重读。
 func (st *SawtoothTrigger) PressureBaseline(threadID string) pressureBaseline {
-	st.mu.RLock()
-	_, hasActual := st.lastTotalTokens[threadID]
-	loaded := st.loadedFromDB[threadID]
-	st.mu.RUnlock()
-
-	if !hasActual && !loaded {
+	for {
+		st.mu.RLock()
+		_, hasActual := st.lastTotalTokens[threadID]
+		loaded := st.loadedFromDB[threadID]
+		loading := st.loadingFromDB[threadID]
+		st.mu.RUnlock()
+		if hasActual || loaded {
+			break
+		}
+		if loading != nil {
+			<-loading
+			continue
+		}
 		st.loadSawtoothFromDB(threadID)
 	}
 
@@ -726,6 +737,10 @@ func (st *SawtoothTrigger) UpdatePressureBaseline(threadID string, totalInputTok
 		delete(st.lastRequestTime, threadID)
 	}
 	st.loadedFromDB[threadID] = true
+	st.baselineGeneration[threadID]++
+	if st.loadingFromDB[threadID] != nil {
+		st.loadedFromDB[threadID] = false
+	}
 	persistFn := st.persistFn
 	if persistFn != nil {
 		if data, err := json.Marshal(state); err == nil {
@@ -774,52 +789,55 @@ func (st *SawtoothTrigger) loadSawtoothFromDB(threadID string) {
 		st.mu.Unlock()
 		return
 	}
-	st.loadedFromDB[threadID] = true
+	if loading := st.loadingFromDB[threadID]; loading != nil {
+		st.mu.Unlock()
+		<-loading
+		return
+	}
+	loading := make(chan struct{})
+	st.loadingFromDB[threadID] = loading
+	startGeneration := st.baselineGeneration[threadID]
 	loadFn := st.loadFn
 	st.mu.Unlock()
 
-	if loadFn == nil {
-		return
-	}
-
-	raw, ok := loadFn("sawtooth:" + threadID)
-	if !ok || raw == "" {
-		return
-	}
-
 	var state persistedState
-	if err := json.Unmarshal([]byte(raw), &state); err != nil {
-		return
+	valid := false
+	if loadFn != nil {
+		raw, ok := loadFn("sawtooth:" + threadID)
+		if ok && raw != "" && json.Unmarshal([]byte(raw), &state) == nil && state.Tokens > 0 && state.MsgCount >= 0 {
+			state.SystemFingerprint = sanitizePressureFingerprint(state.SystemFingerprint)
+			state.ToolsFingerprint = sanitizePressureFingerprint(state.ToolsFingerprint)
+			state.MessagesPrefixFingerprint = sanitizePressureFingerprint(state.MessagesPrefixFingerprint)
+			valid = true
+		}
 	}
-	if state.Tokens <= 0 {
-		return // 无效状态
-	}
-	if state.MsgCount < 0 {
-		return
-	}
-	state.SystemFingerprint = sanitizePressureFingerprint(state.SystemFingerprint)
-	state.ToolsFingerprint = sanitizePressureFingerprint(state.ToolsFingerprint)
-	state.MessagesPrefixFingerprint = sanitizePressureFingerprint(state.MessagesPrefixFingerprint)
 
 	st.mu.Lock()
-	defer st.mu.Unlock()
-	// 仅在仍为空时写入（UpdateAfterResponse 可能在并发中被调用）
-	if _, exists := st.lastTotalTokens[threadID]; exists {
-		return
+	applied := false
+	if valid && st.baselineGeneration[threadID] == startGeneration {
+		if _, exists := st.lastTotalTokens[threadID]; !exists {
+			st.lastTotalTokens[threadID] = state.Tokens
+			st.lastMessageCount[threadID] = state.MsgCount
+			st.systemFingerprints[threadID] = state.SystemFingerprint
+			st.toolsFingerprints[threadID] = state.ToolsFingerprint
+			st.messagesPrefixFingerprints[threadID] = state.MessagesPrefixFingerprint
+			applied = true
+		}
 	}
-	st.lastTotalTokens[threadID] = state.Tokens
-	st.lastMessageCount[threadID] = state.MsgCount
-	st.systemFingerprints[threadID] = state.SystemFingerprint
-	st.toolsFingerprints[threadID] = state.ToolsFingerprint
-	st.messagesPrefixFingerprints[threadID] = state.MessagesPrefixFingerprint
+	st.loadedFromDB[threadID] = true
+	delete(st.loadingFromDB, threadID)
+	close(loading)
+	st.mu.Unlock()
 	// 不设置 lastRequestTime —— 保持零值，ShouldTrigger 中 hasTime=false 会跳过 Pause 检查。
 	// 下次 API 响应后 UpdateAfterResponse 才会设置真实时间。
 
-	slog.Info("从 SQLite 恢复 Sawtooth 状态",
-		"thread_id", threadID,
-		"tokens", state.Tokens,
-		"msg_count", state.MsgCount,
-	)
+	if applied {
+		slog.Info("从 SQLite 恢复 Sawtooth 状态",
+			"thread_id", threadID,
+			"tokens", state.Tokens,
+			"msg_count", state.MsgCount,
+		)
+	}
 }
 
 // ── Cache TTL 自适应辅助函数 ──
