@@ -22,6 +22,159 @@ var allowedDebugFactKeys = map[string]bool{
 	"estimated_tokens": true, "agent_role": true, "agent_reason": true,
 	"input_tokens": true, "cache_creation_input_tokens": true,
 	"cache_read_input_tokens": true, "total_input_tokens": true, "error": true,
+	"messages_local_tokens": true, "system_local_tokens": true, "tools_local_tokens": true,
+	"full_local_tokens": true, "previous_actual_tokens": true, "previous_message_count": true,
+	"new_message_delta_tokens": true, "selected_pressure_tokens": true,
+	"pressure_threshold_tokens": true, "pressure_source": true, "trigger_reason": true,
+	"baseline_reset_reason": true, "compress_decision": true,
+	"system_fingerprint_changed": true, "tools_fingerprint_changed": true,
+	"baseline_updated": true, "actual_minus_selected_tokens": true,
+}
+
+func TestDebugFactsPressureDecisionAndUsageJoin(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.Debug = DebugConfig{Enabled: true, DataDir: dataDir}
+	s := NewServer(cfg)
+	s.Sawtooth = NewSawtoothTrigger(time.Minute, 16000, 8000)
+	meta := newRequestMeta(101, "pressure-join-session")
+	meta.PressureDecision = pressureDecision{
+		Available:                true,
+		MessagesLocalTokens:      7000,
+		SystemLocalTokens:        1200,
+		ToolsLocalTokens:         800,
+		FullLocalEstimate:        9000,
+		PreviousActual:           15000,
+		PreviousMessageCount:     12,
+		NewMessageDelta:          2500,
+		SelectedPressure:         17500,
+		Source:                   pressureSourceActualPlusDelta,
+		ResetReason:              baselineResetNone,
+		TriggerReason:            TriggerTokens,
+		Threshold:                16000,
+		MessageCount:             14,
+		CompressDecision:         true,
+		SystemFingerprintChanged: false,
+		ToolsFingerprintChanged:  true,
+	}
+	stamp := time.Date(2026, 7, 15, 1, 2, 3, 4, time.UTC)
+	s.writePressureDecisionDebugFacts(meta, stamp)
+	s.writePressureDecisionDebugFacts(meta, stamp.Add(time.Nanosecond))
+	s.writeUsageDebugFacts(meta, stamp, map[string]any{
+		"input_tokens": 19000, "cache_creation_input_tokens": 1000, "cache_read_input_tokens": 500,
+	})
+
+	facts := debugFactsByStage(t, dataDir, meta.RequestSessionID)
+	if len(facts) != 2 {
+		t.Fatalf("facts stage 数=%d, want pressure+usage 共 2: %v", len(facts), facts)
+	}
+	pressure := facts[debugStagePressureDecision]
+	usage := facts[debugStageResponseUsage]
+	for key, want := range map[string]any{
+		"messages_local_tokens":      7000.0,
+		"system_local_tokens":        1200.0,
+		"tools_local_tokens":         800.0,
+		"full_local_tokens":          9000.0,
+		"previous_actual_tokens":     15000.0,
+		"previous_message_count":     12.0,
+		"new_message_delta_tokens":   2500.0,
+		"selected_pressure_tokens":   17500.0,
+		"pressure_threshold_tokens":  16000.0,
+		"pressure_source":            string(pressureSourceActualPlusDelta),
+		"trigger_reason":             string(TriggerTokens),
+		"baseline_reset_reason":      string(baselineResetNone),
+		"compress_decision":          true,
+		"system_fingerprint_changed": false,
+		"tools_fingerprint_changed":  true,
+	} {
+		if got := pressure[key]; got != want {
+			t.Fatalf("pressure[%s]=%v (%T), want %v (%T)", key, got, got, want, want)
+		}
+	}
+	if got := usage["total_input_tokens"]; got != 20500.0 {
+		t.Fatalf("usage total=%v, want deflation 前 20500", got)
+	}
+	if got := usage["baseline_updated"]; got != true {
+		t.Fatalf("usage baseline_updated=%v, want true", got)
+	}
+	if got := usage["actual_minus_selected_tokens"]; got != 3000.0 {
+		t.Fatalf("usage actual_minus_selected=%v, want 3000", got)
+	}
+	if pressure["request_id"] != usage["request_id"] || pressure["request_id"] != 101.0 {
+		t.Fatalf("request_id join 失败: pressure=%v usage=%v", pressure["request_id"], usage["request_id"])
+	}
+}
+
+func TestDebugFactsAuxiliaryUsageDoesNotClaimBaseline(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		meta *requestMeta
+	}{
+		{name: "session title", meta: &requestMeta{ID: 201, RequestSessionID: "title-usage", RequestKind: requestKindSessionTitle}},
+		{name: "subagent", meta: &requestMeta{ID: 202, RequestSessionID: "subagent-usage", AgentRole: agentRoleSubagent}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			cfg := DefaultConfig()
+			cfg.Debug = DebugConfig{Enabled: true, DataDir: dataDir}
+			s := NewServer(cfg)
+			s.Sawtooth = NewSawtoothTrigger(time.Minute, 16000, 8000)
+			tc.meta.PressureDecision = pressureDecision{Available: true, SelectedPressure: 9000}
+			stamp := time.Date(2026, 7, 15, 2, 3, 4, 5, time.UTC)
+			s.writePressureDecisionDebugFacts(tc.meta, stamp)
+			s.writeUsageDebugFacts(tc.meta, stamp, map[string]any{"input_tokens": 10000})
+
+			facts := debugFactsByStage(t, dataDir, tc.meta.RequestSessionID)
+			if _, ok := facts[debugStagePressureDecision]; ok {
+				t.Fatalf("辅助请求写入 pressure_decision: %v", facts)
+			}
+			usage, ok := facts[debugStageResponseUsage]
+			if !ok || len(facts) != 1 {
+				t.Fatalf("辅助请求 facts=%v, want only response_usage", facts)
+			}
+			if got := usage["baseline_updated"]; got != false {
+				t.Fatalf("辅助 usage baseline_updated=%v, want false", got)
+			}
+			if _, ok := usage["actual_minus_selected_tokens"]; ok {
+				t.Fatalf("辅助 usage 不应比较主 pressure: %v", usage)
+			}
+		})
+	}
+}
+
+func TestDebugFactsForwardedDoesNotReplacePressure(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.Debug = DebugConfig{Enabled: true, DataDir: dataDir}
+	s := NewServer(cfg)
+	tc, err := NewTokenCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.TokenCounter = tc
+	meta := newRequestMeta(301, "forwarded-pressure-session")
+	meta.PressureDecision = pressureDecision{
+		Available: true, MessagesLocalTokens: 12000, FullLocalEstimate: 12000,
+		SelectedPressure: 17000, Threshold: 16000, Source: pressureSourceActualPlusDelta,
+		TriggerReason: TriggerTokens, CompressDecision: true,
+	}
+	stamp := time.Date(2026, 7, 15, 3, 4, 5, 6, time.UTC)
+	s.writePressureDecisionDebugFacts(meta, stamp)
+	forwardedBody := []byte(`{"model":"claude-test","messages":[{"role":"user","content":"tiny forwarded"}]}`)
+	s.writeRequestDebugFacts(meta, stamp, debugStageForwarded, forwardedBody, nil)
+
+	facts := debugFactsByStage(t, dataDir, meta.RequestSessionID)
+	pressure := facts[debugStagePressureDecision]
+	forwarded := facts[debugStageForwarded]
+	if pressure["selected_pressure_tokens"] != 17000.0 {
+		t.Fatalf("selected pressure=%v, want 17000", pressure["selected_pressure_tokens"])
+	}
+	if forwarded["estimated_tokens"] == pressure["selected_pressure_tokens"] {
+		t.Fatalf("forwarded estimate 冒充 trigger basis: forwarded=%v pressure=%v", forwarded, pressure)
+	}
+	if _, ok := forwarded["selected_pressure_tokens"]; ok {
+		t.Fatalf("forwarded stage 含 pressure 专属字段: %v", forwarded)
+	}
 }
 
 func TestDebugFactsSchemaAndSecretSafety(t *testing.T) {
@@ -102,18 +255,28 @@ func TestDebugFactsConcurrentStagesDoNotOverwrite(t *testing.T) {
 	stamp := time.Date(2026, 7, 12, 1, 2, 3, 4, time.UTC)
 	var wg sync.WaitGroup
 	for _, id := range []uint64{1, 2} {
-		for _, stage := range []debugStage{debugStageRawInbound, debugStageForwarded} {
+		meta := newRequestMeta(id, "same-session")
+		meta.PressureDecision = pressureDecision{
+			Available: true, SelectedPressure: int(id) * 1000,
+			Threshold: 16000, Source: pressureSourceLocalFull,
+		}
+		for _, stage := range []debugStage{debugStageRawInbound, debugStageForwarded, debugStagePressureDecision} {
+			stage := stage
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				s.writeRequestDebugFacts(newRequestMeta(id, "same-session"), stamp, stage, body, nil)
+				if stage == debugStagePressureDecision {
+					s.writePressureDecisionDebugFacts(meta, stamp)
+					return
+				}
+				s.writeRequestDebugFacts(meta, stamp, stage, body, nil)
 			}()
 		}
 	}
 	wg.Wait()
 	files := readDebugFactFiles(t, dataDir, "same-session")
-	if len(files) != 4 {
-		t.Fatalf("并发 facts 文件数=%d, want 4", len(files))
+	if len(files) != 6 {
+		t.Fatalf("并发 facts 文件数=%d, want 6", len(files))
 	}
 }
 
@@ -230,4 +393,21 @@ func readDebugFactFiles(t *testing.T, dataDir, sessionID string) [][]byte {
 		files = append(files, data)
 	}
 	return files
+}
+
+func debugFactsByStage(t *testing.T, dataDir, sessionID string) map[debugStage]map[string]any {
+	t.Helper()
+	result := make(map[debugStage]map[string]any)
+	for _, data := range readDebugFactFiles(t, dataDir, sessionID) {
+		var fact map[string]any
+		if err := json.Unmarshal(data, &fact); err != nil {
+			t.Fatalf("解析 facts: %v: %s", err, data)
+		}
+		stage, _ := fact["stage"].(string)
+		if _, exists := result[debugStage(stage)]; exists {
+			t.Fatalf("stage %q 重复: %v", stage, result)
+		}
+		result[debugStage(stage)] = fact
+	}
+	return result
 }
