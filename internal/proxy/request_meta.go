@@ -13,6 +13,7 @@ type requestMeta struct {
 	AgentRole            agentRole
 	AgentReason          agentClassificationReason
 	PressureDecision     pressureDecision
+	BaselineGeneration   uint64
 	BaselineUpdated      bool
 	OriginalMessageCount int
 	Logger               *slog.Logger

@@ -641,6 +641,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		// Phase B: 只有进入有状态主请求管线时才递增请求序号（DecayTracker 用）。
 		if s.Sawtooth != nil {
 			requestSeq = s.Sawtooth.IncrementRequestSeq(sessionID)
+			meta.BaselineGeneration = s.Sawtooth.BeginPressureRequest(sessionID)
 		}
 		threshold := s.Config.Stubify.TokenThreshold
 		baseline := pressureBaseline{}

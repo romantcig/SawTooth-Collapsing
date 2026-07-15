@@ -558,40 +558,44 @@ type pressureBaseline struct {
 
 // SawtoothTrigger 根据 token 使用量和时间判断是否执行桩化周期。
 type SawtoothTrigger struct {
-	mu                         sync.RWMutex
-	lastTotalTokens            map[string]int           // threadID → 上次 API 响应 input tokens
-	lastMessageCount           map[string]int           // threadID → 上次响应时的消息数
-	systemFingerprints         map[string]string        // threadID → 上次主请求 system 的 SHA-256 指纹
-	toolsFingerprints          map[string]string        // threadID → 上次主请求 tools 的 SHA-256 指纹
-	messagesPrefixFingerprints map[string]string        // threadID → 上次主请求消息前缀的 SHA-256 指纹
-	lastRequestTime            map[string]time.Time     // threadID → 上次 API 响应时间
-	loadedFromDB               map[string]bool          // threadID → DB 加载已完成
-	loadingFromDB              map[string]chan struct{} // threadID → 正在进行的 DB 加载完成信号
-	baselineGeneration         map[string]uint64        // threadID → 响应写回版本，防止慢加载覆盖新状态
-	requestSeq                 map[string]int           // threadID → 当前请求序号（Phase B: DecayTracker 用）
-	pauseThreshold             time.Duration            // 暂停检测阈值（cache TTL - 安全边距）
-	tokenThreshold             int                      // 超过此值触发桩化周期（来自配置）
-	tokenMinimum               int                      // 桩化下限（来自配置）
-	persistFn                  PersistFunc              // 可选：更新时持久化 token 状态到 DB
-	loadFn                     LoadFunc                 // 可选：冷启动时从 DB 加载 token 状态
+	mu                          sync.RWMutex
+	lastTotalTokens             map[string]int           // threadID → 上次 API 响应 input tokens
+	lastMessageCount            map[string]int           // threadID → 上次响应时的消息数
+	systemFingerprints          map[string]string        // threadID → 上次主请求 system 的 SHA-256 指纹
+	toolsFingerprints           map[string]string        // threadID → 上次主请求 tools 的 SHA-256 指纹
+	messagesPrefixFingerprints  map[string]string        // threadID → 上次主请求消息前缀的 SHA-256 指纹
+	lastRequestTime             map[string]time.Time     // threadID → 上次 API 响应时间
+	loadedFromDB                map[string]bool          // threadID → DB 加载已完成
+	loadingFromDB               map[string]chan struct{} // threadID → 正在进行的 DB 加载完成信号
+	baselineGeneration          map[string]uint64        // threadID → 响应写回版本，防止慢加载覆盖新状态
+	baselineRequestGeneration   map[string]uint64        // threadID → 请求进入有状态主管线时分配的代际
+	baselineCommittedGeneration map[string]uint64        // threadID → 最近接受的响应请求代际
+	requestSeq                  map[string]int           // threadID → 当前请求序号（Phase B: DecayTracker 用）
+	pauseThreshold              time.Duration            // 暂停检测阈值（cache TTL - 安全边距）
+	tokenThreshold              int                      // 超过此值触发桩化周期（来自配置）
+	tokenMinimum                int                      // 桩化下限（来自配置）
+	persistFn                   PersistFunc              // 可选：更新时持久化 token 状态到 DB
+	loadFn                      LoadFunc                 // 可选：冷启动时从 DB 加载 token 状态
 }
 
 // NewSawtoothTrigger 创建新的触发状态跟踪器。
 func NewSawtoothTrigger(pauseThreshold time.Duration, tokenThreshold, tokenMinimum int) *SawtoothTrigger {
 	return &SawtoothTrigger{
-		lastTotalTokens:            make(map[string]int),
-		lastMessageCount:           make(map[string]int),
-		systemFingerprints:         make(map[string]string),
-		toolsFingerprints:          make(map[string]string),
-		messagesPrefixFingerprints: make(map[string]string),
-		lastRequestTime:            make(map[string]time.Time),
-		loadedFromDB:               make(map[string]bool),
-		loadingFromDB:              make(map[string]chan struct{}),
-		baselineGeneration:         make(map[string]uint64),
-		requestSeq:                 make(map[string]int),
-		pauseThreshold:             pauseThreshold,
-		tokenThreshold:             tokenThreshold,
-		tokenMinimum:               tokenMinimum,
+		lastTotalTokens:             make(map[string]int),
+		lastMessageCount:            make(map[string]int),
+		systemFingerprints:          make(map[string]string),
+		toolsFingerprints:           make(map[string]string),
+		messagesPrefixFingerprints:  make(map[string]string),
+		lastRequestTime:             make(map[string]time.Time),
+		loadedFromDB:                make(map[string]bool),
+		loadingFromDB:               make(map[string]chan struct{}),
+		baselineGeneration:          make(map[string]uint64),
+		baselineRequestGeneration:   make(map[string]uint64),
+		baselineCommittedGeneration: make(map[string]uint64),
+		requestSeq:                  make(map[string]int),
+		pauseThreshold:              pauseThreshold,
+		tokenThreshold:              tokenThreshold,
+		tokenMinimum:                tokenMinimum,
 	}
 }
 
@@ -698,9 +702,26 @@ func (st *SawtoothTrigger) UpdateAfterResponse(threadID string, totalInputTokens
 	st.UpdatePressureBaseline(threadID, totalInputTokens, messageCount, "", "", "")
 }
 
-// UpdatePressureBaseline 在成功主响应后原子写回完整 pressure baseline。
+// BeginPressureRequest 在请求进入有状态主管线时分配单调代际。
+// 响应写回携带该代际，迟到的旧响应因此不能覆盖更新请求的 baseline。
+func (st *SawtoothTrigger) BeginPressureRequest(threadID string) uint64 {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.baselineRequestGeneration[threadID]++
+	return st.baselineRequestGeneration[threadID]
+}
+
+// UpdatePressureBaseline 是测试与 legacy 调用使用的同步入口。
+// 它先分配一个新请求代际，再复用生产响应写回协议。
 // 指纹只接受固定 64 位小写 SHA-256 十六进制；非法值按空值持久化。
 func (st *SawtoothTrigger) UpdatePressureBaseline(threadID string, totalInputTokens, messageCount int, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint string) {
+	generation := st.BeginPressureRequest(threadID)
+	st.UpdatePressureBaselineForRequest(threadID, generation, totalInputTokens, messageCount, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint)
+}
+
+// UpdatePressureBaselineForRequest 在成功主响应后按请求代际原子写回完整 pressure baseline。
+// generation 为零时兼容直接构造 requestMeta 的测试/旧调用，并在写回时分配新代际。
+func (st *SawtoothTrigger) UpdatePressureBaselineForRequest(threadID string, generation uint64, totalInputTokens, messageCount int, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint string) bool {
 	systemFingerprint = sanitizePressureFingerprint(systemFingerprint)
 	toolsFingerprint = sanitizePressureFingerprint(toolsFingerprint)
 	messagesPrefixFingerprint = sanitizePressureFingerprint(messagesPrefixFingerprint)
@@ -721,6 +742,17 @@ func (st *SawtoothTrigger) UpdatePressureBaseline(threadID string, totalInputTok
 	}
 
 	st.mu.Lock()
+	if generation == 0 {
+		st.baselineRequestGeneration[threadID]++
+		generation = st.baselineRequestGeneration[threadID]
+	} else if generation > st.baselineRequestGeneration[threadID] {
+		st.baselineRequestGeneration[threadID] = generation
+	}
+	if generation < st.baselineCommittedGeneration[threadID] {
+		st.mu.Unlock()
+		return false
+	}
+	st.baselineCommittedGeneration[threadID] = generation
 	if totalInputTokens > 0 {
 		st.lastTotalTokens[threadID] = totalInputTokens
 		st.lastMessageCount[threadID] = messageCount
@@ -748,6 +780,7 @@ func (st *SawtoothTrigger) UpdatePressureBaseline(threadID string, totalInputTok
 		}
 	}
 	st.mu.Unlock()
+	return true
 }
 
 func sanitizePressureFingerprint(fingerprint string) string {

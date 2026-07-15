@@ -129,6 +129,97 @@ func TestHandleJSONPressureBaseline(t *testing.T) {
 	}
 }
 
+func TestForwardRawOutOfOrderResponsesKeepNewestRequestBaseline(t *testing.T) {
+	const sessionID = "out-of-order-baseline"
+	requestAStarted := make(chan struct{})
+	releaseA := make(chan struct{})
+	requestBDone := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch body.Model {
+		case "request-a":
+			close(requestAStarted)
+			<-releaseA
+			_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":111}}`))
+		case "request-b":
+			_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":222}}`))
+			close(requestBDone)
+		default:
+			t.Errorf("unexpected model %q", body.Model)
+		}
+	}))
+	defer upstream.Close()
+
+	trigger := NewSawtoothTrigger(time.Hour, 50_000, 1000)
+	var persistedMu sync.Mutex
+	var persisted string
+	trigger.SetPersistFunc(func(_ string, value string) {
+		persistedMu.Lock()
+		persisted = value
+		persistedMu.Unlock()
+	})
+	s := NewServer(Config{Proxy: ProxyConfig{Target: upstream.URL, Deflation: 1}})
+	s.Sawtooth = trigger
+	fingerprint := fingerprintTopLevelJSON(nil)
+
+	makeRequest := func(model string, messages []Message, generation uint64) (*http.Request, *requestMeta) {
+		body, err := json.Marshal(map[string]any{"model": model, "messages": messages})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+		meta := newRequestMeta(generation, sessionID)
+		meta.BaselineGeneration = generation
+		meta.PressureDecision = pressureDecision{
+			Available: true, MessageCount: len(messages),
+			SystemFingerprint: fingerprint, ToolsFingerprint: fingerprint,
+			MessagesPrefixFingerprint: fingerprintMessagesPrefix(messages, len(messages)),
+		}
+		return req, meta
+	}
+
+	messagesA := pipelineMessages(1, 2)
+	generationA := trigger.BeginPressureRequest(sessionID)
+	reqA, metaA := makeRequest("request-a", messagesA, generationA)
+	doneA := make(chan struct{})
+	go func() {
+		s.forwardRaw(httptest.NewRecorder(), reqA, metaA)
+		close(doneA)
+	}()
+	<-requestAStarted
+
+	messagesB := pipelineMessages(2, 3)
+	generationB := trigger.BeginPressureRequest(sessionID)
+	reqB, metaB := makeRequest("request-b", messagesB, generationB)
+	s.forwardRaw(httptest.NewRecorder(), reqB, metaB)
+	<-requestBDone
+	close(releaseA)
+	<-doneA
+
+	baseline := trigger.PressureBaseline(sessionID)
+	if !baseline.Available || baseline.ActualTokens != 222 || baseline.MessageCount != len(messagesB) ||
+		baseline.MessagesPrefixFingerprint != metaB.PressureDecision.MessagesPrefixFingerprint {
+		t.Fatalf("旧响应覆盖了较新内存 baseline: %+v", baseline)
+	}
+	persistedMu.Lock()
+	rawPersisted := persisted
+	persistedMu.Unlock()
+	var state persistedState
+	if err := json.Unmarshal([]byte(rawPersisted), &state); err != nil {
+		t.Fatalf("decode persisted baseline: %v raw=%q", err, rawPersisted)
+	}
+	if state.Tokens != 222 || state.MsgCount != len(messagesB) || state.MessagesPrefixFingerprint != metaB.PressureDecision.MessagesPrefixFingerprint {
+		t.Fatalf("旧响应覆盖了较新持久 baseline: %+v", state)
+	}
+}
+
 func TestHandleJSONAuxiliaryDoesNotUpdate(t *testing.T) {
 	testHandleAuxiliaryDoesNotUpdate(t, false)
 }

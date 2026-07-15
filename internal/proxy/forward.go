@@ -568,11 +568,11 @@ func (s *Server) applyPressureBaselineUsage(meta *requestMeta, actual int) {
 	}
 	decision := meta.PressureDecision
 	if decision.ForwardedCoordinatesChanged {
-		s.Sawtooth.UpdatePressureBaseline(meta.RequestSessionID, 0, 0, "", "", "")
+		s.Sawtooth.UpdatePressureBaselineForRequest(meta.RequestSessionID, meta.BaselineGeneration, 0, 0, "", "", "")
 		return
 	}
 	if meta.BaselineUpdated {
-		s.Sawtooth.UpdatePressureBaseline(meta.RequestSessionID, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint)
+		s.Sawtooth.UpdatePressureBaselineForRequest(meta.RequestSessionID, meta.BaselineGeneration, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint)
 	}
 }
 
