@@ -38,6 +38,7 @@ sawtooth.yaml
 
 # Release draft (local only)
 RELEASE.md
+/releases.md
 
 # Maintenance scripts (local only)
 fix_history.sh
