@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -218,19 +219,35 @@ type Server struct {
 	cachedTTL         string           // 当前生效的 cache TTL（"ephemeral" 或 "1h"），用于检测切换
 	searchAndExpandFn func([]Message, *SQLiteStore, int, *TokenCounter, *Budget, *requestMeta) RecallOutcome
 	requestIdx        atomic.Uint64
+	debugLayout       *DebugLayout
+	debugRunID        string
 }
 
 func (s *Server) nextRequestMeta(requestSessionID string) *requestMeta {
-	return newRequestMeta(s.requestIdx.Add(1), requestSessionID)
+	return newRequestMetaWithRun(s.requestIdx.Add(1), requestSessionID, s.debugRunID)
 }
 
 // NewServer 创建代理服务实例。
 // 若 Debug.Enabled 且 DataDir 非空，自动创建数据目录。
 func NewServer(cfg Config) *Server {
+	server, err := newServerWithDebugRandom(cfg, cryptorand.Reader)
+	if err != nil {
+		slog.Warn("无法初始化 debug run ID，Debug 已安全关闭", "error", err)
+	}
+	return server
+}
+
+func newServerWithDebugRandom(cfg Config, random io.Reader) (*Server, error) {
 	s := &Server{
 		Config:     cfg,
 		HTTPClient: newUpstreamHTTPClient(cfg.Transport),
 	}
+	layout, err := newDebugLayout(cfg.Debug.DataDir, random)
+	if err != nil {
+		return s, err
+	}
+	s.debugLayout = layout
+	s.debugRunID = layout.RunID()
 
 	// 调试模式下创建数据目录
 	if cfg.Debug.Enabled && cfg.Debug.DataDir != "" {
@@ -239,7 +256,7 @@ func NewServer(cfg Config) *Server {
 		}
 	}
 
-	return s
+	return s, nil
 }
 
 // validateConfig 验证配置值合法性，非法值回退到默认值。

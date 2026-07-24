@@ -26,6 +26,8 @@ type requestMeta struct {
 	rawBodyOnce          sync.Once
 	forwardedBodyOnce    sync.Once
 	responseBodyOnce     sync.Once
+	SessionHash          string
+	RunID                string
 }
 
 // tracksSawtoothState 使用默认安全策略：nil、零值、main 与 unknown 都保持状态跟踪，
@@ -61,10 +63,16 @@ func (m *requestMeta) debugOnce(stage debugStage) *sync.Once {
 }
 
 func newRequestMeta(id uint64, requestSessionID string) *requestMeta {
+	return newRequestMetaWithRun(id, requestSessionID, "")
+}
+
+func newRequestMetaWithRun(id uint64, requestSessionID, runID string) *requestMeta {
 	baseLogger := slog.New(slog.Default().Handler()).With("request_id", id)
 	return &requestMeta{
 		ID:                   id,
 		RequestSessionID:     requestSessionID,
+		SessionHash:          stableSessionHash(requestSessionID),
+		RunID:                runID,
 		Logger:               baseLogger.With("request_session_id", requestSessionID),
 		auxiliaryAuditLogger: baseLogger,
 	}

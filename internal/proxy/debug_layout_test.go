@@ -125,13 +125,6 @@ func TestDebugSessionMetadataCreatedOnceAndValidated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(metadataPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0600 {
-		t.Fatalf("session metadata 权限=%#o，want 0600", info.Mode().Perm())
-	}
 	meta := server.nextRequestMeta(sessionID)
 	if err := server.debugLayout.EnsureSessionMetadata(meta); err != nil {
 		t.Fatalf("相同 session metadata 验证失败: %v", err)
@@ -162,9 +155,31 @@ func TestDebugDuplicateStageFailsWithoutOverwrite(t *testing.T) {
 	if string(data) != "first" {
 		t.Fatalf("重复写入覆盖旧证据: %q", data)
 	}
-	info, _ := os.Stat(path)
-	if info.Mode().Perm() != 0600 {
-		t.Fatalf("stage 权限=%#o，want 0600", info.Mode().Perm())
+}
+
+func TestDebugLayoutUsesExclusive0600Writer(t *testing.T) {
+	server := NewServer(Config{Debug: DebugConfig{DataDir: t.TempDir()}})
+	var flags []int
+	var perms []os.FileMode
+	server.debugLayout.openFile = func(name string, flag int, perm os.FileMode) (debugWriteCloser, error) {
+		flags = append(flags, flag)
+		perms = append(perms, perm)
+		return os.OpenFile(name, flag, perm)
+	}
+	meta := server.nextRequestMeta("permission-contract")
+	if err := server.debugLayout.Write(meta, debugArtifactPressure, []byte("{}")); err != nil {
+		t.Fatalf("写入 debug stage: %v", err)
+	}
+	if len(flags) != 2 || len(perms) != 2 {
+		t.Fatalf("metadata/stage opener 调用数=%d/%d，want 2", len(flags), len(perms))
+	}
+	for index := range flags {
+		if flags[index]&(os.O_CREATE|os.O_EXCL|os.O_WRONLY) != (os.O_CREATE | os.O_EXCL | os.O_WRONLY) {
+			t.Fatalf("第 %d 次 opener flags=%#x，缺少 O_CREATE|O_EXCL|O_WRONLY", index, flags[index])
+		}
+		if perms[index] != 0600 {
+			t.Fatalf("第 %d 次 opener perm=%#o，want 0600", index, perms[index])
+		}
 	}
 }
 
