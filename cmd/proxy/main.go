@@ -24,8 +24,9 @@ func main() {
 	flag.Parse()
 
 	// 2. 日志初始化
-	logger := slog.New(proxy.NewLogHandler(os.Stdout, slog.LevelInfo))
-	slog.SetDefault(logger)
+	terminalHandler := proxy.NewLogHandler(os.Stdout, slog.LevelInfo)
+	terminalLogger := slog.New(terminalHandler)
+	slog.SetDefault(terminalLogger)
 
 	// 3. Config 加载
 	cfg, err := proxy.LoadConfig(*configFlag)
@@ -33,6 +34,12 @@ func main() {
 		slog.Error("加载配置失败", "path", *configFlag, "error", err)
 		os.Exit(1)
 	}
+
+	// 配置成功后才安装文件日志；配置读取失败保持仅终端可见。
+	fileHandler := proxy.NewSessionLogHandler(cfg.Debug.DataDir, slog.LevelInfo, func(err error) {
+		terminalLogger.Error("文件日志写入失败", "error", err)
+	})
+	slog.SetDefault(slog.New(proxy.NewCombinedLogHandler(terminalHandler, fileHandler)))
 
 	// -port 标志覆盖配置文件中的端口值
 	if *portFlag != 0 {

@@ -37,7 +37,7 @@ func TestSessionLogRoutesProcessAndSession(t *testing.T) {
 	if !strings.Contains(session, "#27 请求进入 status=200") {
 		t.Fatalf("session.log 缺少紧凑 request 关联: %q", session)
 	}
-	if !strings.Contains(session, "[WARN] 上游返回非 2xx status=502") {
+	if !strings.Contains(session, "[WARN] #27 上游返回非 2xx status=502") {
 		t.Fatalf("session.log Warn 标签格式错误: %q", session)
 	}
 	if strings.Contains(session, "[INFO]") || strings.Contains(session, "\033[") {
