@@ -295,7 +295,7 @@ func validHistoryEpochState(state historyEpochPersisted) bool {
 }
 
 func historyEpochPersistenceKey(sessionID string) string {
-	return historyEpochPersistencePrefix + sessionID
+	return historyEpochPersistencePrefix + stableSessionHash(sessionID)
 }
 
 func historyEpochStateKey(sessionID string, epoch uint64) string {

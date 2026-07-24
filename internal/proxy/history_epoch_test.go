@@ -260,6 +260,9 @@ func TestHistoryEpochPersistenceRoundTrip(t *testing.T) {
 		t.Fatalf("restored decision=%+v, previous=%+v", decision, second)
 	}
 	for key, value := range persisted {
+		if strings.Contains(key, "persisted") {
+			t.Fatalf("history epoch persistence key leaked session plaintext: %q", key)
+		}
 		if strings.Contains(value, "zero") || strings.Contains(value, "changed") || strings.Contains(value, "persisted") {
 			t.Fatalf("persisted history state leaked plaintext at %q: %s", key, value)
 		}
