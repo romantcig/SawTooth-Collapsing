@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestHistoryCanonicalReuseSafetySchemaBoundaries(t *testing.T) {
@@ -308,6 +309,82 @@ func TestHistoryEpochConcurrentBeginsStayMonotonic(t *testing.T) {
 	if !manager.IsCurrent(sessionID, current.Epoch) || manager.IsCurrent(sessionID, stale.Epoch) {
 		t.Fatalf("current/stale epoch check failed: current=%+v stale=%+v", current, stale)
 	}
+}
+
+func TestForwardedCoordinatesUsePositionSensitiveHistoryFingerprint(t *testing.T) {
+	base := historyMessagesFromJSON(t, `[{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"configure","input":{"cache_control":"enabled"}}]}]`)
+	meta := newRequestMeta(901, "forwarded-fingerprint")
+	meta.PressureDecision = pressureDecision{
+		Available:                 true,
+		MessageCount:              len(base),
+		MessagesPrefixFingerprint: fingerprintMessagesPrefix(base, len(base)),
+	}
+	changed := historyMessagesFromJSON(t, `[{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"configure","input":{"cache_control":"disabled"}}]}]`)
+	body, err := json.Marshal(map[string]any{"messages": changed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	markForwardedPressureCoordinates(meta, body)
+	if !meta.PressureDecision.ForwardedCoordinatesChanged {
+		t.Fatal("tool_use.input.cache_control 业务变化未使 forwarded 坐标失效")
+	}
+}
+
+func TestHistoryEpochStateIsolationAndLateResponse(t *testing.T) {
+	manager := NewHistoryEpochManager()
+	trigger := NewSawtoothTrigger(time.Minute, 100_000, 50_000)
+	server := NewServer(Config{})
+	server.HistoryEpoch = manager
+	server.Sawtooth = trigger
+
+	base := historyTextMessages("zero", "one")
+	old := manager.Begin("late-response", base)
+	oldGeneration := trigger.BeginPressureRequest(old.StateKey)
+	oldFingerprint := reuseSafetyPrefixHash(base, len(base))
+	if !trigger.UpdatePressureBaselineForRequest(old.StateKey, oldGeneration, 88_000, len(base), oldFingerprint, oldFingerprint, oldFingerprint) {
+		t.Fatal("old epoch baseline 未写入")
+	}
+
+	branched := deepCopyMessages(base)
+	branched[1].Content = mustMarshal("new branch")
+	current := manager.Begin("late-response", branched)
+	if current.Epoch <= old.Epoch || current.StateKey == old.StateKey {
+		t.Fatalf("branch did not allocate a new state key: old=%+v current=%+v", old, current)
+	}
+	currentGeneration := trigger.BeginPressureRequest(current.StateKey)
+	if !trigger.UpdatePressureBaselineForRequest(current.StateKey, currentGeneration, 12_000, len(branched), currentHistoryFingerprint(branched), currentHistoryFingerprint(branched), currentHistoryFingerprint(branched)) {
+		t.Fatal("current epoch baseline 未写入")
+	}
+
+	meta := newRequestMeta(902, "late-response")
+	meta.HistoryEpoch = old.Epoch
+	meta.HistoryStateKey = old.StateKey
+	meta.BaselineGeneration = oldGeneration
+	meta.PressureDecision = pressureDecision{
+		Available:                 true,
+		MessageCount:              len(base),
+		SelectedPressure:          88_000,
+		SystemFingerprint:         currentHistoryFingerprint(base),
+		ToolsFingerprint:          currentHistoryFingerprint(base),
+		MessagesPrefixFingerprint: oldFingerprint,
+	}
+	if updated := server.applyPressureBaselineUsage(meta, 99_000); updated {
+		t.Fatal("旧 epoch 的迟到响应被接受为 baseline")
+	}
+	if meta.BaselineUpdateKind != pressureBaselineUpdateStale {
+		t.Fatalf("stale baseline kind=%q, want %q", meta.BaselineUpdateKind, pressureBaselineUpdateStale)
+	}
+	got := trigger.PressureBaseline(current.StateKey)
+	if !got.Available || got.ActualTokens != 12_000 {
+		t.Fatalf("旧响应污染 current epoch baseline: %+v", got)
+	}
+	if trigger.PressureBaseline(old.StateKey).ActualTokens != 88_000 {
+		t.Fatal("旧 epoch baseline unexpectedly mutated")
+	}
+}
+
+func currentHistoryFingerprint(messages []Message) string {
+	return reuseSafetyPrefixHash(messages, len(messages))
 }
 
 func historyMessagesFromJSON(t *testing.T, raw string) []Message {
