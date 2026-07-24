@@ -28,7 +28,7 @@ func TestPhase08CombinedLifecycle(t *testing.T) {
 
 	server := newPipelineTestServer(t, upstream.URL)
 	debugDir := t.TempDir()
-	server.Config.Debug = DebugConfig{Enabled: true, FullBody: false, DataDir: debugDir}
+	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, FullBody: false, DataDir: debugDir})
 	var persisted string
 	server.Sawtooth.SetPersistFunc(func(key, value string) {
 		if key == "sawtooth:phase08-combined" {

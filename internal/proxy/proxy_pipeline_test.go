@@ -574,7 +574,7 @@ func testSessionTitleResponseState(t *testing.T, sse bool) {
 
 	server := newPipelineTestServer(t, upstream.URL)
 	server.Config.Proxy.Deflation = 0.5
-	server.Config.Debug = DebugConfig{Enabled: true, DataDir: t.TempDir()}
+	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, DataDir: t.TempDir()})
 	missingFingerprint := fingerprintTopLevelJSON(nil)
 	server.Sawtooth.UpdatePressureBaseline(sessionID, 777, 9, missingFingerprint, missingFingerprint, strings.Repeat("a", 64))
 	baselineBefore := server.Sawtooth.PressureBaseline(sessionID)
@@ -678,7 +678,7 @@ func testSubagentResponseState(t *testing.T, sse bool) {
 
 	server := newPipelineTestServer(t, upstream.URL)
 	server.Config.Proxy.Deflation = 0.5
-	server.Config.Debug = DebugConfig{Enabled: true, DataDir: t.TempDir()}
+	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, DataDir: t.TempDir()})
 	missingFingerprint := fingerprintTopLevelJSON(nil)
 	server.Sawtooth.UpdatePressureBaseline(sessionID, 888, 11, missingFingerprint, missingFingerprint, strings.Repeat("a", 64))
 	baselineBefore := server.Sawtooth.PressureBaseline(sessionID)
