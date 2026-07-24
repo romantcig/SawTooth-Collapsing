@@ -484,6 +484,54 @@ func TestDebugFactsInvalidMediaBase64UsesRestrictedError(t *testing.T) {
 	}
 }
 
+func TestDebugFactsUseUnifiedLayoutAndStableStageNames(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.Debug = DebugConfig{Enabled: true, FullBody: true, DataDir: dataDir}
+	s := NewServer(cfg)
+	meta := s.nextRequestMeta("unified-layout-session-secret")
+	meta.PressureDecision = pressureDecision{
+		Available:        true,
+		SelectedPressure: 17000,
+		Threshold:        16000,
+		Source:           pressureSourceLocalFull,
+	}
+	stamp := time.Date(2026, 7, 24, 12, 34, 56, 789, time.UTC)
+	body := []byte(`{"model":"claude-test","messages":[]}`)
+
+	s.writeRequestDebugFacts(meta, stamp, debugStageRawInbound, body, nil)
+	s.writeRequestDebugFacts(meta, stamp, debugStageForwarded, body, nil)
+	s.writePressureDecisionDebugFacts(meta, stamp)
+	s.writeUsageDebugFacts(meta, stamp, map[string]any{"input_tokens": 18000}, false)
+	s.writeFullBodyDebug(meta, stamp, debugBodyStageRawInbound, body, nil, "claude-test", 0)
+	s.writeFullBodyDebug(meta, stamp, debugBodyStageForwarded, body, nil, "claude-test", 0)
+	s.writeFullBodyDebug(meta, stamp, debugBodyStageResponse, []byte(`{"ok":true}`), nil, "claude-test", 0)
+
+	requestDir := filepath.Join(dataDir, "debug", meta.SessionHash, meta.RunID, "1")
+	entries, err := os.ReadDir(requestDir)
+	if err != nil {
+		t.Fatalf("读取统一 Debug 请求目录: %v", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+	want := []string{"forwarded.json", "forwarded_meta.json", "pressure.json", "raw.json", "raw_meta.json", "response.json", "usage.json"}
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("Debug stage 文件=%v，want %v", names, want)
+	}
+	for _, name := range []string{"raw_meta.json", "forwarded_meta.json", "pressure.json", "usage.json"} {
+		data, err := os.ReadFile(filepath.Join(requestDir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(data, []byte(meta.RequestSessionID)) || bytes.Contains(data, []byte(`"session_id"`)) {
+			t.Fatalf("安全 facts %s 重复保存 session 身份: %s", name, data)
+		}
+	}
+}
+
 func TestDebugFullBodyDefaultsOff(t *testing.T) {
 	cfg := DefaultConfig()
 	if cfg.Debug.FullBody {
@@ -509,17 +557,28 @@ func readDebugFactFiles(t *testing.T, dataDir, sessionID string) [][]byte {
 	if !ok {
 		t.Fatal("debug dir invalid")
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
+	factNames := map[string]bool{
+		"raw_meta.json":       true,
+		"forwarded_meta.json": true,
+		"pressure.json":       true,
+		"usage.json":          true,
+	}
+	var paths []string
+	if err := filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !info.IsDir() && factNames[info.Name()] {
+			paths = append(paths, path)
+		}
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-	files := make([][]byte, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.Contains(entry.Name(), "-facts.json") {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+	sort.Strings(paths)
+	files := make([][]byte, 0, len(paths))
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
 		}

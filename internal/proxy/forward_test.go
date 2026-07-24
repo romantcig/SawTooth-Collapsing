@@ -638,30 +638,40 @@ func (f *failingDebugFile) Close() error {
 
 func TestWriteDebugFileRedactsCredentialHeaders(t *testing.T) {
 	dataDir := t.TempDir()
-	s := NewServer(Config{Debug: DebugConfig{DataDir: dataDir}})
+	s := NewServer(Config{Debug: DebugConfig{Enabled: true, FullBody: true, DataDir: dataDir}})
+	meta := s.nextRequestMeta("session")
 	headers := http.Header{
-		"Authorization":       {"Bearer auth-secret"},
-		"Proxy-Authorization": {"Basic proxy-secret"},
-		"X-Api-Key":           {"api-secret"},
-		"Anthropic-Api-Key":   {"anthropic-secret"},
-		"Cookie":              {"session=cookie-secret"},
+		"AUTHORIZATION":       {"Bearer auth-secret"},
+		"proxy-AUTHORIZATION": {"Basic proxy-secret"},
+		"x-API-key":           {"api-secret"},
+		"ANTHROPIC-api-KEY":   {"anthropic-secret"},
+		"cOoKiE":              {"session=cookie-secret"},
+		"SET-cookie":          {"set-cookie-secret"},
 		"X-Diagnostic":        {"safe-value"},
 	}
 	timestamp := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
-	s.writeDebugFile("session", 1, timestamp, debugBodyStageForwarded, []byte(`{"ok":true}`), headers, "model", 1)
+	body := []byte(`{"authorization":"BODY-SECRET-MUST-STAY","ok":true}`)
+	s.writeFullBodyDebug(meta, timestamp, debugBodyStageForwarded, body, headers, "model", 1)
 
-	debugDir, ok := safeDebugSessionDir(dataDir, "session")
-	if !ok {
-		t.Fatal("合法 session debug 目录校验失败")
+	path, err := s.debugLayout.RequestPath(meta, debugArtifactForwardedBody)
+	if err != nil {
+		t.Fatal(err)
 	}
-	data, err := os.ReadFile(filepath.Join(debugDir, "2026-07-11T120000.000000000-1-forwarded.json"))
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("读取 debug 文件: %v", err)
 	}
-	for _, secret := range []string{"auth-secret", "proxy-secret", "api-secret", "anthropic-secret", "cookie-secret"} {
+	for _, secret := range []string{"auth-secret", "proxy-secret", "api-secret", "anthropic-secret", "cookie-secret", "set-cookie-secret"} {
 		if bytes.Contains(data, []byte(secret)) {
 			t.Fatalf("debug 文件泄漏凭证 %q: %s", secret, data)
 		}
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatalf("解析 debug 字段: %v", err)
+	}
+	if _, ok := fields["session_id"]; ok || bytes.Contains(data, []byte(meta.RequestSessionID)) {
+		t.Fatalf("full-body stage 重复保存 session 身份: %s", data)
 	}
 	var entry debugEntry
 	if err := json.Unmarshal(data, &entry); err != nil {
@@ -673,14 +683,18 @@ func TestWriteDebugFileRedactsCredentialHeaders(t *testing.T) {
 	if !bytes.Contains(entry.Headers, []byte("safe-value")) {
 		t.Fatalf("诊断 header 未保留: %s", entry.Headers)
 	}
+	if !bytes.Contains(entry.Body, []byte("BODY-SECRET-MUST-STAY")) {
+		t.Fatalf("正文中的用户数据被改写: %s", entry.Body)
+	}
 }
 
 func TestWriteDebugFileSessionPathCannotEscapeDebugRoot(t *testing.T) {
 	for _, sessionID := range []string{"../escape", `..\\escape`, `C:\\escape`, `\\\\server\\share\\escape`} {
 		t.Run(sessionID, func(t *testing.T) {
 			dataDir := t.TempDir()
-			s := NewServer(Config{Debug: DebugConfig{DataDir: dataDir}})
-			s.writeDebugFile(sessionID, 1, time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC), debugBodyStageForwarded, []byte(`{}`), nil, "model", 0)
+			s := NewServer(Config{Debug: DebugConfig{Enabled: true, FullBody: true, DataDir: dataDir}})
+			meta := s.nextRequestMeta(sessionID)
+			s.writeFullBodyDebug(meta, time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC), debugBodyStageForwarded, []byte(`{}`), nil, "model", 0)
 
 			debugDir, ok := safeDebugSessionDir(dataDir, sessionID)
 			if !ok {
@@ -691,7 +705,11 @@ func TestWriteDebugFileSessionPathCannotEscapeDebugRoot(t *testing.T) {
 			if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
 				t.Fatalf("debug 目录逃逸: root=%s dir=%s rel=%s err=%v", root, debugDir, rel, err)
 			}
-			if _, err := os.Stat(filepath.Join(debugDir, "2026-07-11T120000.000000000-1-forwarded.json")); err != nil {
+			path, err := s.debugLayout.RequestPath(meta, debugArtifactForwardedBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(path); err != nil {
 				t.Fatalf("debug 文件未写入哈希目录: %v", err)
 			}
 		})
@@ -700,27 +718,72 @@ func TestWriteDebugFileSessionPathCannotEscapeDebugRoot(t *testing.T) {
 
 func TestWriteDebugFileUsesRequestIDToPreventCollisions(t *testing.T) {
 	dataDir := t.TempDir()
-	s := NewServer(Config{Debug: DebugConfig{DataDir: dataDir}})
+	s := NewServer(Config{Debug: DebugConfig{Enabled: true, FullBody: true, DataDir: dataDir}})
 	timestamp := time.Date(2026, 7, 11, 12, 0, 0, 123, time.UTC)
 	var wg sync.WaitGroup
 	for _, requestID := range []uint64{41, 42} {
+		meta := newRequestMetaWithRun(requestID, "session", s.debugRunID)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s.writeDebugFile("session", requestID, timestamp, debugBodyStageForwarded, []byte(`{"request":true}`), nil, "model", 1)
+			s.writeFullBodyDebug(meta, timestamp, debugBodyStageForwarded, []byte(`{"request":true}`), nil, "model", 1)
 		}()
 	}
 	wg.Wait()
-	debugDir, _ := safeDebugSessionDir(dataDir, "session")
-	entries, err := os.ReadDir(debugDir)
-	if err != nil {
-		t.Fatalf("读取 debug 目录: %v", err)
+	for _, requestID := range []uint64{41, 42} {
+		meta := newRequestMetaWithRun(requestID, "session", s.debugRunID)
+		path, err := s.debugLayout.RequestPath(meta, debugArtifactForwardedBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("request %d 的稳定 Debug 文件不存在: %v", requestID, err)
+		}
 	}
-	if len(entries) != 2 {
-		t.Fatalf("并发 debug 文件数=%d, want 2", len(entries))
+}
+
+func TestDebugFullBodyOptInWritesExactlyThreeStableFiles(t *testing.T) {
+	stages := []struct {
+		bodyStage     debugBodyStage
+		artifactStage debugArtifactStage
+		body          []byte
+	}{
+		{bodyStage: debugBodyStageRawInbound, artifactStage: debugArtifactRawBody, body: []byte(`{"raw":true}`)},
+		{bodyStage: debugBodyStageForwarded, artifactStage: debugArtifactForwardedBody, body: []byte(`{"forwarded":true}`)},
+		{bodyStage: debugBodyStageResponse, artifactStage: debugArtifactResponseBody, body: []byte(`{"response":true}`)},
 	}
-	if entries[0].Name() == entries[1].Name() {
-		t.Fatalf("并发请求文件名冲突: %s", entries[0].Name())
+
+	for _, tc := range []struct {
+		name     string
+		enabled  bool
+		fullBody bool
+		want     bool
+	}{
+		{name: "debug disabled", enabled: false, fullBody: true},
+		{name: "full body disabled", enabled: true, fullBody: false},
+		{name: "explicit opt in", enabled: true, fullBody: true, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			s := NewServer(Config{Debug: DebugConfig{Enabled: tc.enabled, FullBody: tc.fullBody, DataDir: dataDir}})
+			meta := s.nextRequestMeta("full-body-opt-in")
+			for _, stage := range stages {
+				s.writeFullBodyDebug(meta, time.Date(2026, 7, 24, 1, 2, 3, 4, time.UTC), stage.bodyStage, stage.body, nil, "model", 1)
+			}
+			for _, stage := range stages {
+				path, err := s.debugLayout.RequestPath(meta, stage.artifactStage)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, statErr := os.Stat(path)
+				if tc.want && statErr != nil {
+					t.Fatalf("显式 full-body 缺少 %s: %v", stage.artifactStage, statErr)
+				}
+				if !tc.want && !os.IsNotExist(statErr) {
+					t.Fatalf("未 opt-in 仍生成 %s: %v", stage.artifactStage, statErr)
+				}
+			}
+		})
 	}
 }
 
