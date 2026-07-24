@@ -52,6 +52,35 @@ type debugSessionMetadata struct {
 	SessionHash string `json:"session_hash"`
 }
 
+// debugMetaForWrite 为手工构造的测试元数据补齐当前 Server 的路由身份。
+// 真实请求由 nextRequestMeta 预先绑定 RunID/SessionHash；这里不修改调用者对象，
+// 避免并发 Debug writer 在补绑定时产生数据竞争，并对跨 Server 串写 fail closed。
+func (s *Server) debugMetaForWrite(meta *requestMeta) (*requestMeta, error) {
+	if s == nil || s.debugLayout == nil || meta == nil || meta.ID == 0 {
+		return nil, fmt.Errorf("debug request meta 未初始化")
+	}
+	runID := meta.RunID
+	if runID == "" {
+		runID = s.debugLayout.RunID()
+	}
+	if runID != s.debugLayout.RunID() || !validLowerHex16(runID) {
+		return nil, fmt.Errorf("debug run ID 不匹配")
+	}
+	sessionHash := meta.SessionHash
+	if sessionHash == "" {
+		sessionHash = stableSessionHash(meta.RequestSessionID)
+	}
+	if !validLowerHex16(sessionHash) || sessionHash != stableSessionHash(meta.RequestSessionID) {
+		return nil, fmt.Errorf("debug session hash 不匹配")
+	}
+	return &requestMeta{
+		ID:               meta.ID,
+		RequestSessionID: meta.RequestSessionID,
+		SessionHash:      sessionHash,
+		RunID:            runID,
+	}, nil
+}
+
 func newDebugLayout(dataDir string, random io.Reader) (*DebugLayout, error) {
 	if random == nil {
 		random = rand.Reader

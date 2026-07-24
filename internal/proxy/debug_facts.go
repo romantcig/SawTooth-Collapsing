@@ -3,12 +3,9 @@ package proxy
 import (
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -90,7 +87,7 @@ func (s *Server) writeRequestDebugFacts(meta *requestMeta, timestamp time.Time, 
 		var bodyMap map[string]json.RawMessage
 		if err := json.Unmarshal(body, &bodyMap); err != nil {
 			fact.Error = debugErrorInvalidJSON
-			s.writeDebugFact(meta.RequestSessionID, timestamp, fact)
+			s.writeDebugFact(meta, fact)
 			return
 		}
 		fact.ModelFamily = extractAgentModelFamily(bodyMap["model"])
@@ -116,7 +113,7 @@ func (s *Server) writeRequestDebugFacts(meta *requestMeta, timestamp time.Time, 
 		classification := classifyAgentRequest(request, bodyMap, messages)
 		fact.AgentRole = classification.Role
 		fact.AgentReason = classification.Reason
-		s.writeDebugFact(meta.RequestSessionID, timestamp, fact)
+		s.writeDebugFact(meta, fact)
 	})
 }
 
@@ -149,7 +146,7 @@ func (s *Server) writePressureDecisionDebugFacts(meta *requestMeta, timestamp ti
 			SystemFingerprintChanged: &decision.SystemFingerprintChanged,
 			ToolsFingerprintChanged:  &decision.ToolsFingerprintChanged,
 		}
-		s.writeDebugFact(meta.RequestSessionID, timestamp, fact)
+		s.writeDebugFact(meta, fact)
 	})
 }
 
@@ -178,18 +175,34 @@ func (s *Server) writeUsageDebugFacts(meta *requestMeta, timestamp time.Time, us
 			actualMinusSelected := saturatingSubtract(actual, meta.PressureDecision.SelectedPressure)
 			fact.ActualMinusSelectedTokens = &actualMinusSelected
 		}
-		s.writeDebugFact(meta.RequestSessionID, timestamp, fact)
+		s.writeDebugFact(meta, fact)
 	})
 }
 
-func (s *Server) writeDebugFact(sessionID string, timestamp time.Time, fact debugFact) {
-	debugDir, ok := safeDebugSessionDir(s.Config.Debug.DataDir, sessionID)
+func debugFactArtifactStage(stage debugStage) (debugArtifactStage, bool) {
+	switch stage {
+	case debugStageRawInbound:
+		return debugArtifactRawMetadata, true
+	case debugStageForwarded:
+		return debugArtifactForwardedMeta, true
+	case debugStagePressureDecision:
+		return debugArtifactPressure, true
+	case debugStageResponseUsage:
+		return debugArtifactUsage, true
+	default:
+		return "", false
+	}
+}
+
+func (s *Server) writeDebugFact(meta *requestMeta, fact debugFact) {
+	stage, ok := debugFactArtifactStage(fact.Stage)
 	if !ok {
-		slog.Warn("debug facts session 目录校验失败")
+		slog.Warn("debug facts stage 无效", "stage", fact.Stage)
 		return
 	}
-	if err := os.MkdirAll(debugDir, 0755); err != nil {
-		slog.Warn("无法创建 debug facts 目录", "error", err)
+	routingMeta, err := s.debugMetaForWrite(meta)
+	if err != nil {
+		slog.Warn("debug facts 元数据校验失败", "stage", fact.Stage, "error", err)
 		return
 	}
 	data, err := json.Marshal(fact)
@@ -197,11 +210,7 @@ func (s *Server) writeDebugFact(sessionID string, timestamp time.Time, fact debu
 		slog.Warn("无法序列化 debug facts", "error", err)
 		return
 	}
-	filename := fmt.Sprintf("%s-%d-%s-facts.json", timestamp.Format("2006-01-02T150405.000000000"), fact.RequestID, fact.Stage)
-	filePath := filepath.Join(debugDir, filename)
-	if err := writeDebugEntryFile(filePath, data, func(name string, flag int, perm os.FileMode) (debugWriteCloser, error) {
-		return os.OpenFile(name, flag, perm)
-	}); err != nil {
+	if err := s.debugLayout.Write(routingMeta, stage, data); err != nil {
 		slog.Warn("无法写入 debug facts", "stage", fact.Stage, "error", err)
 	}
 }

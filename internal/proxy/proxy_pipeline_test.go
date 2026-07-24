@@ -249,7 +249,7 @@ func TestHandleMessagesDebugStages(t *testing.T) {
 
 	server := newPipelineTestServer(t, upstream.URL)
 	dataDir := t.TempDir()
-	server.Config.Debug = DebugConfig{Enabled: true, FullBody: false, DataDir: dataDir}
+	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, FullBody: false, DataDir: dataDir})
 	raw := append([]Message{pipelinePersistentContextMessage(t, "DEBUG-STAGE-CLAUDE-MD-SECRET")}, pipelineMessages(4, 5)...)
 	servePipelineRequest(t, server, "debug-stage-session-secret", raw)
 
@@ -279,14 +279,10 @@ func TestHandleMessagesDebugStages(t *testing.T) {
 		t.Fatalf("facts request_id 不一致: %v", requestIDs)
 	}
 
-	dir, _ := safeDebugSessionDir(dataDir, "debug-stage-session-secret")
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, entry := range entries {
-		if !strings.HasSuffix(entry.Name(), "-facts.json") {
-			t.Fatalf("full_body=false 仍写完整 body: %s", entry.Name())
+	requestDir := filepath.Join(dataDir, "debug", stableSessionHash("debug-stage-session-secret"), server.debugRunID, "1")
+	for _, name := range []string{"raw.json", "forwarded.json", "response.json"} {
+		if _, err := os.Stat(filepath.Join(requestDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("full_body=false 仍写完整 body %s: %v", name, err)
 		}
 	}
 }
@@ -300,20 +296,20 @@ func TestHandleMessagesDebugFullBodyOptIn(t *testing.T) {
 
 	server := newPipelineTestServer(t, upstream.URL)
 	dataDir := t.TempDir()
-	server.Config.Debug = DebugConfig{Enabled: true, FullBody: true, DataDir: dataDir}
+	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, FullBody: true, DataDir: dataDir})
 	servePipelineRequest(t, server, "debug-full-body-session", pipelineMessages(2, 2))
 
-	dir, _ := safeDebugSessionDir(dataDir, "debug-full-body-session")
-	entries, err := os.ReadDir(dir)
+	requestDir := filepath.Join(dataDir, "debug", stableSessionHash("debug-full-body-session"), server.debugRunID, "1")
+	entries, err := os.ReadDir(requestDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	stages := make(map[debugBodyStage]bool)
 	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), "-facts.json") {
+		if entry.Name() != "raw.json" && entry.Name() != "forwarded.json" && entry.Name() != "response.json" {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		data, err := os.ReadFile(filepath.Join(requestDir, entry.Name()))
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -275,7 +274,6 @@ type debugEntry struct {
 	Timestamp    string          `json:"timestamp"`
 	RequestID    uint64          `json:"request_id"`
 	Stage        debugBodyStage  `json:"stage"`
-	SessionID    string          `json:"session_id"`
 	Model        string          `json:"model"`
 	MessageCount int             `json:"message_count"`
 	Headers      json.RawMessage `json:"headers,omitempty"`
@@ -290,6 +288,19 @@ const (
 	debugBodyStageResponse   debugBodyStage = "response"
 )
 
+func debugBodyArtifactStage(stage debugBodyStage) (debugArtifactStage, bool) {
+	switch stage {
+	case debugBodyStageRawInbound:
+		return debugArtifactRawBody, true
+	case debugBodyStageForwarded:
+		return debugArtifactForwardedBody, true
+	case debugBodyStageResponse:
+		return debugArtifactResponseBody, true
+	default:
+		return "", false
+	}
+}
+
 type debugWriteCloser interface {
 	Write([]byte) (int, error)
 	Close() error
@@ -297,23 +308,17 @@ type debugWriteCloser interface {
 
 type debugFileOpener func(string, int, os.FileMode) (debugWriteCloser, error)
 
-// writeDebugFile 将请求/响应落盘到 data_dir/debug/{sessionID}/{timestamp}-{direction}.json（D-03）。
-// headers 参数仅在 req 方向传入（用于 redact Authorization）。
-func (s *Server) writeDebugFile(sessionID string, requestID uint64, timestamp time.Time, stage debugBodyStage, body []byte, headers http.Header, model string, messageCount int) {
-	debugDir, ok := safeDebugSessionDir(s.Config.Debug.DataDir, sessionID)
+// writeDebugFile 将请求/响应写入统一的 run/session/request/stage Debug 树。
+// headers 参数仅在请求方向传入（用于大小写不敏感地脱敏认证凭证）。
+func (s *Server) writeDebugFile(meta *requestMeta, timestamp time.Time, stage debugBodyStage, body []byte, headers http.Header, model string, messageCount int) error {
+	artifactStage, ok := debugBodyArtifactStage(stage)
 	if !ok {
-		slog.Warn("debug session 目录校验失败")
-		return
+		return fmt.Errorf("debug body stage 无效: %q", stage)
 	}
-	if err := os.MkdirAll(debugDir, 0755); err != nil {
-		slog.Warn("无法创建 debug 目录", "path", debugDir, "error", err)
-		return
+	routingMeta, err := s.debugMetaForWrite(meta)
+	if err != nil {
+		return err
 	}
-
-	// 文件安全的时间戳格式（RFC3339 中冒号替换为连字符）
-	tsSafe := timestamp.Format("2006-01-02T150405.000000000")
-	filename := fmt.Sprintf("%s-%d-%s.json", tsSafe, requestID, stage)
-	filePath := filepath.Join(debugDir, filename)
 
 	// 解析 body 为 JSON 对象（若解析失败则存为字符串）
 	var bodyJSON json.RawMessage
@@ -340,9 +345,8 @@ func (s *Server) writeDebugFile(sessionID string, requestID uint64, timestamp ti
 
 	entry := debugEntry{
 		Timestamp:    timestamp.Format(time.RFC3339),
-		RequestID:    requestID,
+		RequestID:    meta.ID,
 		Stage:        stage,
-		SessionID:    sessionID,
 		Model:        model,
 		MessageCount: messageCount,
 		Headers:      headersJSON,
@@ -351,15 +355,9 @@ func (s *Server) writeDebugFile(sessionID string, requestID uint64, timestamp ti
 
 	data, err := json.Marshal(entry)
 	if err != nil {
-		slog.Warn("无法序列化 debug 条目", "file", filePath, "error", err)
-		return
+		return fmt.Errorf("序列化 debug 条目失败: %w", err)
 	}
-
-	if err := writeDebugEntryFile(filePath, data, func(name string, flag int, perm os.FileMode) (debugWriteCloser, error) {
-		return os.OpenFile(name, flag, perm)
-	}); err != nil {
-		slog.Warn("无法写入 debug 文件", "file", filePath, "error", err)
-	}
+	return s.debugLayout.Write(routingMeta, artifactStage, data)
 }
 
 // writeFullBodyDebug 在显式开启 full_body 时，为每个请求阶段最多写入一份完整正文。
@@ -373,7 +371,9 @@ func (s *Server) writeFullBodyDebug(meta *requestMeta, timestamp time.Time, stag
 		return
 	}
 	once.Do(func() {
-		s.writeDebugFile(meta.RequestSessionID, meta.ID, timestamp, stage, body, headers, model, messageCount)
+		if err := s.writeDebugFile(meta, timestamp, stage, body, headers, model, messageCount); err != nil {
+			slog.Warn("无法写入 debug 文件", "stage", stage, "request_id", meta.ID, "error", err)
+		}
 	})
 }
 
@@ -403,10 +403,8 @@ func safeDebugSessionDir(dataDir, sessionID string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	sessionHash := fmt.Sprintf("%x", sha256.Sum256([]byte(sessionID)))
-	dir := filepath.Join(root, sessionHash)
-	rel, err := filepath.Rel(root, dir)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+	dir := filepath.Join(root, stableSessionHash(sessionID))
+	if !pathWithinRoot(root, dir) {
 		return "", false
 	}
 	return dir, true

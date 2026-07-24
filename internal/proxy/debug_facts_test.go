@@ -551,6 +551,17 @@ func TestDebugFullBodyDefaultsOff(t *testing.T) {
 	}
 }
 
+func setServerDebugConfigForTest(t *testing.T, server *Server, cfg DebugConfig) {
+	t.Helper()
+	layout, err := newDebugLayout(cfg.DataDir, nil)
+	if err != nil {
+		t.Fatalf("初始化测试 DebugLayout: %v", err)
+	}
+	server.Config.Debug = cfg
+	server.debugLayout = layout
+	server.debugRunID = layout.RunID()
+}
+
 func readDebugFactFiles(t *testing.T, dataDir, sessionID string) [][]byte {
 	t.Helper()
 	dir, ok := safeDebugSessionDir(dataDir, sessionID)

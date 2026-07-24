@@ -40,6 +40,7 @@ func main() {
 		terminalLogger.Error("文件日志写入失败", "error", err)
 	})
 	slog.SetDefault(slog.New(proxy.NewCombinedLogHandler(terminalHandler, fileHandler)))
+	logFullBodyDebugNotice(cfg)
 
 	// -port 标志覆盖配置文件中的端口值
 	if *portFlag != 0 {
@@ -183,6 +184,12 @@ func main() {
 			slog.Error("服务启动失败", "addr", addr, "error", err)
 		}
 		os.Exit(1)
+	}
+}
+
+func logFullBodyDebugNotice(cfg proxy.Config) {
+	if cfg.Debug.Enabled && cfg.Debug.FullBody {
+		slog.Info("完整正文 Debug 已开启")
 	}
 }
 
