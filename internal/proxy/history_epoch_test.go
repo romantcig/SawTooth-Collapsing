@@ -57,6 +57,13 @@ func TestHistoryCanonicalReuseSafetySchemaBoundaries(t *testing.T) {
 			reuseEqual: false,
 			inputEqual: false,
 		},
+		{
+			name:       "unknown content block cache_control is business data",
+			before:     `[{"role":"user","content":[{"type":"future_block","cache_control":"enabled","value":"same"}]}]`,
+			after:      `[{"role":"user","content":[{"type":"future_block","cache_control":"disabled","value":"same"}]}]`,
+			reuseEqual: false,
+			inputEqual: false,
+		},
 	}
 
 	for _, tt := range tests {
