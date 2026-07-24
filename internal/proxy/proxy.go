@@ -209,14 +209,15 @@ func DefaultConfig() Config {
 type Server struct {
 	Config            Config
 	HTTPClient        *http.Client
-	TokenCounter      *TokenCounter    // Phase 2: token 计数单例 (D-01)
-	DecayTracker      *DecayTracker    // Phase B: per-message decay tracking
-	Store             *SQLiteStore     // Phase 3: SQLite 持久化 (D-14)
-	Frozen            *FrozenStubs     // Phase 4: frozen prefix 存储 (D-12)
-	Sawtooth          *SawtoothTrigger // Phase 4: 桩化周期触发 (D-03)
-	EagerStub         *EagerStubMemory // Phase 5: eager stub memory (EAGER-01)
-	cacheMu           sync.Mutex       // 保护 cachedTTL 的比较与下游 TTL 更新
-	cachedTTL         string           // 当前生效的 cache TTL（"ephemeral" 或 "1h"），用于检测切换
+	TokenCounter      *TokenCounter        // Phase 2: token 计数单例 (D-01)
+	DecayTracker      *DecayTracker        // Phase B: per-message decay tracking
+	Store             *SQLiteStore         // Phase 3: SQLite 持久化 (D-14)
+	Frozen            *FrozenStubs         // Phase 4: frozen prefix 存储 (D-12)
+	Sawtooth          *SawtoothTrigger     // Phase 4: 桩化周期触发 (D-03)
+	EagerStub         *EagerStubMemory     // Phase 5: eager stub memory (EAGER-01)
+	HistoryEpoch      *HistoryEpochManager // Phase 11: raw history epoch/state isolation
+	cacheMu           sync.Mutex           // 保护 cachedTTL 的比较与下游 TTL 更新
+	cachedTTL         string               // 当前生效的 cache TTL（"ephemeral" 或 "1h"），用于检测切换
 	searchAndExpandFn func([]Message, *SQLiteStore, int, *TokenCounter, *Budget, *requestMeta) RecallOutcome
 	requestIdx        atomic.Uint64
 	debugLayout       *DebugLayout
@@ -239,8 +240,9 @@ func NewServer(cfg Config) *Server {
 
 func newServerWithDebugRandom(cfg Config, random io.Reader) (*Server, error) {
 	s := &Server{
-		Config:     cfg,
-		HTTPClient: newUpstreamHTTPClient(cfg.Transport),
+		Config:       cfg,
+		HTTPClient:   newUpstreamHTTPClient(cfg.Transport),
+		HistoryEpoch: NewHistoryEpochManager(),
 	}
 	layout, err := newDebugLayout(cfg.Debug.DataDir, random)
 	if err != nil {
@@ -465,15 +467,26 @@ func fingerprintTopLevelJSON(raw json.RawMessage) string {
 }
 
 // fingerprintMessagesPrefix 只保存消息坐标的 SHA-256 证明，不保存消息正文。
+// 规范化委托给 HistoryEpoch 的位置敏感 reuse-safety canonicalizer，
+// 因而只忽略已知 content block 的直接 cache_control。
 func fingerprintMessagesPrefix(messages []Message, count int) string {
-	if count < 0 || count > len(messages) {
-		return ""
-	}
-	canonical, err := json.Marshal(messages[:count])
+	return reuseSafetyPrefixHash(messages, count)
+}
+
+func canonicalMessageForFingerprint(message Message) map[string]any {
+	result, err := canonicalHistoryMessage(message, false)
 	if err != nil {
-		return ""
+		return map[string]any{"$history_invalid": true}
 	}
-	return sha256hex(canonical)
+	return result
+}
+
+func canonicalMessageContent(raw json.RawMessage) any {
+	content, err := decodeHistoryJSON(bytes.TrimSpace(raw))
+	if err != nil {
+		return map[string]any{"$history_invalid": true}
+	}
+	return normalizeHistoryContent(content, "", false)
 }
 
 // buildPressureDecision 在 local_full 与 actual_plus_delta 中只选择一次。
@@ -655,21 +668,56 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// History epoch gate：detach persistent context、清理已知 reminder 后，
+		// 在任何 request sequence、pressure、Frozen、Archive、Decay 或 Eager
+		// 状态读取前证明当前 raw history 的连续性。
+		historyMessages = StripReminders(historyMessages)
+		rawHistory := deepCopyMessages(historyMessages)
+		if rawHistory == nil {
+			rawHistory = append([]Message(nil), historyMessages...)
+		}
+		stateKey := sessionID
+		historyReuseSafe := true
+		if s.HistoryEpoch != nil {
+			epochDecision := s.HistoryEpoch.Begin(sessionID, historyMessages)
+			meta.HistoryEpoch = epochDecision.Epoch
+			meta.HistoryStateKey = epochDecision.StateKey
+			meta.HistoryEpochReason = epochDecision.Reason
+			meta.HistoryReuseSafe = epochDecision.ReuseSafe
+			meta.HistoryEpochChanged = epochDecision.EpochChanged
+			stateKey = epochDecision.StateKey
+			historyReuseSafe = epochDecision.ReuseSafe
+			if s.Frozen != nil {
+				s.Frozen.SetCurrentAlias(sessionID, stateKey)
+			}
+		}
+		if s.HistoryEpoch != nil && !historyReuseSafe && !meta.HistoryEpochChanged {
+			if s.Frozen != nil {
+				s.Frozen.InvalidateWithLogger(meta.Logger, stateKey)
+			}
+			if s.Sawtooth != nil {
+				s.Sawtooth.ResetPressureBaseline(stateKey)
+			}
+		}
+
 		// Phase B: 只有进入有状态主请求管线时才递增请求序号（DecayTracker 用）。
 		if s.Sawtooth != nil {
-			requestSeq = s.Sawtooth.IncrementRequestSeq(sessionID)
-			meta.BaselineGeneration = s.Sawtooth.BeginPressureRequest(sessionID)
+			requestSeq = s.Sawtooth.IncrementRequestSeq(stateKey)
+			meta.BaselineGeneration = s.Sawtooth.BeginPressureRequest(stateKey)
 		}
 		threshold := s.Config.Stubify.TokenThreshold
 		baseline := pressureBaseline{}
-		if s.Sawtooth != nil {
-			baseline = s.Sawtooth.PressureBaseline(sessionID)
+		if s.Sawtooth != nil && historyReuseSafe {
+			baseline = s.Sawtooth.PressureBaseline(stateKey)
 		}
 		decision := buildPressureDecision(rawMessages, bodyMap["system"], bodyMap["tools"], baseline, s.TokenCounter, threshold)
 		if s.Sawtooth != nil {
-			decision.TriggerReason = s.Sawtooth.ShouldTrigger(sessionID, decision.SelectedPressure)
+			decision.TriggerReason = s.Sawtooth.ShouldTrigger(stateKey, decision.SelectedPressure)
 		} else if decision.SelectedPressure > threshold {
 			decision.TriggerReason = TriggerTokens
+		}
+		if s.HistoryEpoch != nil && !historyReuseSafe && !meta.HistoryEpochChanged {
+			decision.ResetReason = baselineResetMessagesChanged
 		}
 		decision.CompressDecision = decision.TriggerReason != TriggerNone
 		meta.PressureDecision = decision
@@ -688,15 +736,9 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			contextTokens = 0
 		}
 
-		// Phase 6 Step 0: StripReminders (REMIND-04) — 在 Frozen.Get / SearchAndExpand 之前
-		// 移除旧消息中过期的 system-reminder / skill-hint，使 frozen prefix 的 boundary hash
-		// 与 reexpand 的关键词搜索都基于已清理消息。strip 不增删消息，rawCutoff 不受影响。
-		messages = StripReminders(messages)
-
 		// 保存 stripped 原始消息副本——frozen prefix 失效时需从原始消息重新压缩
 		// 对标 YesMem: messages 不被覆盖；frozen 有效时走快速路径，失效时从原始消息重新压缩
-		originalMessages := make([]Message, len(messages))
-		copy(originalMessages, messages)
+		originalMessages := rawHistory
 
 		// 保存 boundary 消息——用于 frozen prefix 验证（检测用户撤回/编辑）
 		// boundary = 原始请求中 frozen prefix 覆盖范围内的最后一条消息
@@ -712,12 +754,12 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		var frozenRawCutoff int
 		var frozenPrefixLen int
 		var frozenTokens int // YesMem shouldInvalidateFrozen: 存储 frozen prefix 的 token 估算
-		if s.Frozen != nil {
-			result := s.Frozen.GetWithLogger(meta.Logger, sessionID, messages)
+		if s.Frozen != nil && historyReuseSafe {
+			result := s.Frozen.GetWithLogger(meta.Logger, stateKey, messages)
 			if result != nil {
 				if result.Cutoff <= 0 || result.Cutoff > len(messages) {
 					meta.Logger.Warn("frozen cutoff 非法，忽略状态", "cutoff", result.Cutoff, "message_count", len(messages))
-					s.Frozen.InvalidateWithLogger(meta.Logger, sessionID)
+					s.Frozen.InvalidateWithLogger(meta.Logger, stateKey)
 					result = nil
 				}
 			}
@@ -770,7 +812,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				)
 				// frozen prefix 失效——清除并从原始消息重新压缩
 				// 对标 YesMem: frozen=nil 后 runStubCycle(messages) 使用原始未压缩消息
-				s.Frozen.InvalidateWithLogger(meta.Logger, sessionID)
+				s.Frozen.InvalidateWithLogger(meta.Logger, stateKey)
 				messages = originalMessages
 				frozenRawCutoff = 0
 				frozenPrefixLen = 0
@@ -869,7 +911,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					// 折叠后消息数组完全重建（indices 0:blank, 1:archive, 2+:tail），
 					// 旧 indices 不再有效。
 					if s.DecayTracker != nil {
-						s.DecayTracker.ClearSession(sessionID)
+						s.DecayTracker.ClearSession(stateKey)
 					}
 
 					// 重建请求体
@@ -882,7 +924,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 						messagesAny := messagesToAny(messages)
 						messagesAny = EagerStubToolResults(messagesAny, 0,
 							func(text string) int { return s.TokenCounter.CountTokens(text) },
-							WithStubMemory(s.EagerStub, sessionID),
+							WithStubMemory(s.EagerStub, stateKey),
 							WithStubCounters(&stickyHits, &freshStubs),
 						)
 						messages = anyToMessages(messagesAny)
@@ -914,7 +956,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 							frozenPrefixLen = len(messages)
 							s.applyCacheControl(messages, frozenPrefixLen, sessionID)
 							compressedTokens := s.TokenCounter.CountMessagesTokens(messages)
-							s.Frozen.StoreWithLogger(meta.Logger, sessionID, messages, rawCutoff, rawBoundary, compressedTokens, rawEstimate)
+							s.Frozen.StoreWithLogger(meta.Logger, stateKey, messages, rawCutoff, rawBoundary, compressedTokens, rawEstimate)
 						}
 					}
 
@@ -936,14 +978,14 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 			// 步骤 1: stubify（保护 messages[0] 和最近 4 条消息）
 			intensity := estimateIntensity(messages)
-			stubbedMessages, stats := stubifyMessages(messages, s.TokenCounter, pivotText, s.Config.Stubify.KeepRecent, s.Config.Stubify.KeepThinking, s.DecayTracker, sessionID, requestSeq, intensity, threshold)
+			stubbedMessages, stats := stubifyMessages(messages, s.TokenCounter, pivotText, s.Config.Stubify.KeepRecent, s.Config.Stubify.KeepThinking, s.DecayTracker, stateKey, requestSeq, intensity, threshold)
 
 			// Phase B: 提取 pinnedPaths
 			pinnedPaths := extractPinnedPaths(messages)
 			s.DecayTracker.SetPinnedPaths(pinnedPaths)
 
 			// 步骤 2: decay
-			decayedMessages, phase := s.DecayTracker.ApplyDecayBatch(stubbedMessages, sessionID, totalTokens, threshold, s.TokenCounter, pivotText, requestSeq)
+			decayedMessages, phase := s.DecayTracker.ApplyDecayBatch(stubbedMessages, stateKey, totalTokens, threshold, s.TokenCounter, pivotText, requestSeq)
 
 			meta.Logger.Info("stubify+decay 完成",
 				"original_tokens", stats.OriginalTokens,
@@ -961,7 +1003,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				pressure := float64(totalTokens) / float64(threshold)
 				beforeCompact := len(decayedMessages)
 				var compactedBlocks []CompactedBlock
-				decayedMessages, compactedBlocks = CompactMessages(decayedMessages, originalMessages, s.DecayTracker, sessionID, requestSeq, pressure)
+				decayedMessages, compactedBlocks = CompactMessages(decayedMessages, originalMessages, s.DecayTracker, stateKey, requestSeq, pressure)
 				if len(compactedBlocks) > 0 {
 					meta.Logger.Info("compact 完成",
 						"before", beforeCompact,
@@ -979,7 +1021,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				messagesAny := messagesToAny(messages)
 				messagesAny = EagerStubToolResults(messagesAny, frozenPrefixLen,
 					func(text string) int { return s.TokenCounter.CountTokens(text) },
-					WithStubMemory(s.EagerStub, sessionID),
+					WithStubMemory(s.EagerStub, stateKey),
 					WithStubCounters(&stickyHits, &freshStubs),
 				)
 				messages = anyToMessages(messagesAny)
@@ -1011,7 +1053,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					frozenPrefixLen = len(messages)
 					s.applyCacheControl(messages, frozenPrefixLen, sessionID)
 					compressedTokens := s.TokenCounter.CountMessagesTokens(messages)
-					s.Frozen.StoreWithLogger(meta.Logger, sessionID, messages, rawCutoff, rawBoundary, compressedTokens, rawEstimate)
+					s.Frozen.StoreWithLogger(meta.Logger, stateKey, messages, rawCutoff, rawBoundary, compressedTokens, rawEstimate)
 				} else {
 					s.applyCacheControl(messages, frozenPrefixLen, sessionID)
 				}
@@ -1037,7 +1079,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				messagesAny := messagesToAny(messages)
 				messagesAny = EagerStubToolResults(messagesAny, frozenPrefixLen,
 					func(text string) int { return s.TokenCounter.CountTokens(text) },
-					WithStubMemory(s.EagerStub, sessionID),
+					WithStubMemory(s.EagerStub, stateKey),
 					WithStubCounters(&stickyHits, &freshStubs),
 				)
 				messages = anyToMessages(messagesAny)

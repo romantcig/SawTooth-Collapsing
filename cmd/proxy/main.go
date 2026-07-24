@@ -69,6 +69,17 @@ func main() {
 	srv.Store = store
 	slog.Info("SQLite 存储已初始化", "path", dbPath)
 
+	// Phase 11: history epoch 只持久化数字、受限原因和固定长度 hash；
+	// 状态键由 session + 本地单调 epoch 构成，不保存历史正文。
+	if srv.HistoryEpoch == nil {
+		srv.HistoryEpoch = proxy.NewHistoryEpochManager()
+	}
+	srv.HistoryEpoch.SetPersistFunc(func(key, value string) {
+		_ = store.PersistState(key, value) // best-effort
+	})
+	srv.HistoryEpoch.SetLoadFunc(store.LoadState)
+	slog.Info("history epoch 已初始化")
+
 	// Phase B: DecayTracker 初始化（per-message decay tracking）
 	srv.DecayTracker = proxy.NewDecayTracker()
 	srv.DecayTracker.SetPersistFunc(func(key, value string) {
