@@ -112,3 +112,28 @@ func TestFrozenThinkingSignatureChangeMissesButDoesNotNeedBoundaryGuess(t *testi
 		t.Fatal("thinking/signature 变化后 Frozen 不应仅凭 boundary 命中")
 	}
 }
+
+func TestFrozenFullRawPrefixPersistsAndRestores(t *testing.T) {
+	raw := frozenTestMessages(4)
+	persisted := make(map[string]string)
+	source := NewFrozenStubs()
+	source.SetPersistFunc(func(key, value string) { persisted[key] = value })
+	source.Store("persisted-full", raw[:1], 3, raw[2], 10, 100, raw)
+
+	var state frozenPersisted
+	if err := json.Unmarshal([]byte(persisted["frozen:persisted-full"]), &state); err != nil {
+		t.Fatalf("解析 Frozen 持久状态: %v", err)
+	}
+	if state.RawPrefixMode != frozenRawPrefixModeFull || !validPressureFingerprint(state.RawPrefixHash) {
+		t.Fatalf("持久化 raw prefix proof 不完整: mode=%q hash=%q", state.RawPrefixMode, state.RawPrefixHash)
+	}
+
+	restored := NewFrozenStubs()
+	restored.SetLoadFunc(func(key string) (string, bool) {
+		value, ok := persisted[key]
+		return value, ok
+	})
+	if got := restored.Get("persisted-full", raw); got == nil {
+		t.Fatal("完整 raw prefix proof 冷启动后未命中")
+	}
+}
