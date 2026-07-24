@@ -20,34 +20,43 @@ type LoadFunc func(key string) (string, bool)
 // DeleteFunc 删除外部存储中的指定状态键。
 type DeleteFunc func(key string)
 
+const (
+	frozenRawPrefixModeFull   = "full"
+	frozenRawPrefixModeLegacy = "legacy_boundary"
+)
+
 // FrozenStubs 存储每个 thread 的冻结桩化消息前缀，用于缓存优化。
 // 桩化周期之间，冻结前缀被逐字节复用，使 API 缓存在前缀部分可命中。
 type FrozenStubs struct {
-	mu           sync.RWMutex
-	ttl          time.Duration        // eviction TTL —— 默认 30 分钟
-	messages     map[string][]Message // threadID → 深拷贝的桩化消息
-	cutoff       map[string]int       // threadID → Store 时的原始消息总数
-	boundaryHash map[string]string    // threadID → messages[cutoff-1] 的稳定 hash
-	prefixHash   map[string]string    // threadID → 序列化后 frozen prefix 的 SHA-256 hash
-	stubTime     map[string]time.Time
-	tokens       map[string]int // threadID → frozen stubs 的 token 估算
-	rawTokens    map[string]int // threadID → Store 时原始 token 估算（压缩前）
-	lastAccess   map[string]time.Time
-	persistFn    PersistFunc       // 可选：持久化 frozen 状态到 DB
-	loadFn       LoadFunc          // 可选：冷启动时从 DB 加载 frozen 状态
-	deleteFn     DeleteFunc        // 可选：失效时删除 DB 中的 frozen 状态
-	loadedFromDB map[string]bool   // threadID → 已尝试从 DB 加载
-	currentAlias map[string]string // legacy session key → 当前 epoch state key
+	mu            sync.RWMutex
+	ttl           time.Duration        // eviction TTL —— 默认 30 分钟
+	messages      map[string][]Message // threadID → 深拷贝的桩化消息
+	cutoff        map[string]int       // threadID → Store 时的原始消息总数
+	boundaryHash  map[string]string    // threadID → messages[cutoff-1] 的稳定 hash
+	prefixHash    map[string]string    // threadID → 序列化后 frozen prefix 的 SHA-256 hash
+	rawPrefixHash map[string]string    // threadID → raw history[:cutoff] 的完整 reuse hash
+	rawPrefixMode map[string]string    // threadID → full 或 legacy_boundary（仅兼容旧内存调用）
+	stubTime      map[string]time.Time
+	tokens        map[string]int // threadID → frozen stubs 的 token 估算
+	rawTokens     map[string]int // threadID → Store 时原始 token 估算（压缩前）
+	lastAccess    map[string]time.Time
+	persistFn     PersistFunc       // 可选：持久化 frozen 状态到 DB
+	loadFn        LoadFunc          // 可选：冷启动时从 DB 加载 frozen 状态
+	deleteFn      DeleteFunc        // 可选：失效时删除 DB 中的 frozen 状态
+	loadedFromDB  map[string]bool   // threadID → 已尝试从 DB 加载
+	currentAlias  map[string]string // legacy session key → 当前 epoch state key
 }
 
 // frozenPersisted 是 frozen 桩化状态的可 JSON 序列化形式。
 type frozenPersisted struct {
-	Messages     []Message `json:"messages"`
-	Cutoff       int       `json:"cutoff"`
-	BoundaryHash string    `json:"boundary_hash"`
-	PrefixHash   string    `json:"prefix_hash"`
-	Tokens       int       `json:"tokens"`
-	RawTokens    int       `json:"raw_tokens,omitempty"`
+	Messages      []Message `json:"messages"`
+	Cutoff        int       `json:"cutoff"`
+	BoundaryHash  string    `json:"boundary_hash"`
+	PrefixHash    string    `json:"prefix_hash"`
+	RawPrefixHash string    `json:"raw_prefix_hash"`
+	RawPrefixMode string    `json:"raw_prefix_mode,omitempty"`
+	Tokens        int       `json:"tokens"`
+	RawTokens     int       `json:"raw_tokens,omitempty"`
 }
 
 // FrozenResult 包含一个已验证的 frozen prefix 及其元数据。
@@ -66,17 +75,19 @@ func NewFrozenStubs() *FrozenStubs {
 // NewFrozenStubsWithTTL 创建使用自定义 eviction TTL 的 FrozenStubs 存储。
 func NewFrozenStubsWithTTL(ttl time.Duration) *FrozenStubs {
 	return &FrozenStubs{
-		ttl:          ttl,
-		messages:     make(map[string][]Message),
-		cutoff:       make(map[string]int),
-		boundaryHash: make(map[string]string),
-		prefixHash:   make(map[string]string),
-		stubTime:     make(map[string]time.Time),
-		tokens:       make(map[string]int),
-		rawTokens:    make(map[string]int),
-		lastAccess:   make(map[string]time.Time),
-		loadedFromDB: make(map[string]bool),
-		currentAlias: make(map[string]string),
+		ttl:           ttl,
+		messages:      make(map[string][]Message),
+		cutoff:        make(map[string]int),
+		boundaryHash:  make(map[string]string),
+		prefixHash:    make(map[string]string),
+		rawPrefixHash: make(map[string]string),
+		rawPrefixMode: make(map[string]string),
+		stubTime:      make(map[string]time.Time),
+		tokens:        make(map[string]int),
+		rawTokens:     make(map[string]int),
+		lastAccess:    make(map[string]time.Time),
+		loadedFromDB:  make(map[string]bool),
+		currentAlias:  make(map[string]string),
 	}
 }
 
@@ -107,6 +118,8 @@ func (f *FrozenStubs) mirrorCurrentAliasesLocked(stateKey string) {
 		f.cutoff[sessionID] = f.cutoff[stateKey]
 		f.boundaryHash[sessionID] = f.boundaryHash[stateKey]
 		f.prefixHash[sessionID] = f.prefixHash[stateKey]
+		f.rawPrefixHash[sessionID] = f.rawPrefixHash[stateKey]
+		f.rawPrefixMode[sessionID] = f.rawPrefixMode[stateKey]
 		f.stubTime[sessionID] = f.stubTime[stateKey]
 		f.tokens[sessionID] = f.tokens[stateKey]
 		f.rawTokens[sessionID] = f.rawTokens[stateKey]
@@ -140,25 +153,25 @@ func (f *FrozenStubs) SetDeleteFunc(fn DeleteFunc) {
 // 深拷贝消息并计算 boundary/prefix hash 用于验证。
 // cutoff 是 detached history 总数（第一条未桩化历史消息的索引）。
 // boundaryMsg 是 historicalMessages[cutoff-1]，用于 boundary 验证。
-func (f *FrozenStubs) Store(threadID string, stubbed []Message, cutoff int, boundaryMsg Message, tokenEstimate int, rawTokenEstimate int) {
-	f.StoreWithLogger(slog.Default(), threadID, stubbed, cutoff, boundaryMsg, tokenEstimate, rawTokenEstimate)
+func (f *FrozenStubs) Store(threadID string, stubbed []Message, cutoff int, boundaryMsg Message, tokenEstimate int, rawTokenEstimate int, rawHistory ...[]Message) {
+	f.StoreWithLogger(slog.Default(), threadID, stubbed, cutoff, boundaryMsg, tokenEstimate, rawTokenEstimate, rawHistory...)
 }
 
-func (f *FrozenStubs) StoreWithLogger(logger *slog.Logger, threadID string, stubbed []Message, cutoff int, boundaryMsg Message, tokenEstimate int, rawTokenEstimate int) {
+func (f *FrozenStubs) StoreWithLogger(logger *slog.Logger, threadID string, stubbed []Message, cutoff int, boundaryMsg Message, tokenEstimate int, rawTokenEstimate int, rawHistory ...[]Message) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	if cutoff <= 0 || tokenEstimate < 0 || rawTokenEstimate < 0 {
-		logger.Warn("frozen 状态元数据非法，跳过存储", "thread_id", threadID, "cutoff", cutoff)
+		logger.Debug("frozen 状态未存储", "reason", "metadata_invalid")
 		return
 	}
 	if ExtractPersistentUserContext(stubbed) != nil {
-		logger.Warn("frozen prefix 包含 persistent user context，拒绝存储", "thread_id", threadID)
+		logger.Debug("frozen 状态未存储", "reason", "persistent_context")
 		return
 	}
 	frozen := deepCopyMessages(stubbed)
 	if frozen == nil {
-		logger.Warn("frozen prefix 深拷贝失败，跳过存储", "thread_id", threadID)
+		logger.Debug("frozen 状态未存储", "reason", "copy_failed")
 		return
 	}
 
@@ -166,10 +179,20 @@ func (f *FrozenStubs) StoreWithLogger(logger *slog.Logger, threadID string, stub
 	pHash := sha256hex(frozenJSON)
 
 	bHash := stableBoundaryHash(boundaryMsg)
+	rawHash := legacyRawPrefixHash(cutoff, boundaryMsg)
+	rawMode := frozenRawPrefixModeLegacy
+	if len(rawHistory) > 0 {
+		rawHash = reuseSafetyPrefixHash(rawHistory[0], cutoff)
+		if rawHash == "" {
+			logger.Debug("frozen 状态未存储", "reason", "raw_prefix_unavailable")
+			return
+		}
+		rawMode = frozenRawPrefixModeFull
+	}
 
 	now := time.Now()
 	fp := frozenPersisted{
-		Messages: frozen, Cutoff: cutoff, BoundaryHash: bHash, PrefixHash: pHash,
+		Messages: frozen, Cutoff: cutoff, BoundaryHash: bHash, PrefixHash: pHash, RawPrefixHash: rawHash, RawPrefixMode: rawMode,
 		Tokens: tokenEstimate, RawTokens: rawTokenEstimate,
 	}
 	persisted, _ := json.Marshal(fp)
@@ -179,6 +202,8 @@ func (f *FrozenStubs) StoreWithLogger(logger *slog.Logger, threadID string, stub
 	f.cutoff[threadID] = cutoff
 	f.boundaryHash[threadID] = bHash
 	f.prefixHash[threadID] = pHash
+	f.rawPrefixHash[threadID] = rawHash
+	f.rawPrefixMode[threadID] = rawMode
 	f.stubTime[threadID] = now
 	f.tokens[threadID] = tokenEstimate
 	f.rawTokens[threadID] = rawTokenEstimate
@@ -191,12 +216,7 @@ func (f *FrozenStubs) StoreWithLogger(logger *slog.Logger, threadID string, stub
 	}
 	f.mu.Unlock()
 
-	logger.Info("frozen prefix 已存储",
-		"thread_id", threadID,
-		"cutoff", cutoff,
-		"prefix_hash", pHash[:min(16, len(pHash))],
-		"tokens", tokenEstimate,
-	)
+	logger.Info("frozen prefix 已存储", "cutoff", cutoff, "tokens", tokenEstimate)
 }
 
 // Get 返回指定 thread 的已验证 frozen stubs（若存在且有效）。
@@ -227,23 +247,21 @@ func (f *FrozenStubs) GetWithLogger(logger *slog.Logger, threadID string, curren
 	msgs, ok := f.messages[stateKey]
 	if !ok {
 		f.mu.RUnlock()
-		logger.Debug("frozen prefix 未命中", "thread_id", threadID)
+		logger.Debug("frozen prefix 未命中", "reason", "not_found")
 		return nil
 	}
 	cutoff := f.cutoff[stateKey]
 	pHash := f.prefixHash[stateKey]
 	bHash := f.boundaryHash[stateKey]
+	rawHash := f.rawPrefixHash[stateKey]
+	rawMode := f.rawPrefixMode[stateKey]
 	tokens := f.tokens[stateKey]
 	rawTokens := f.rawTokens[stateKey]
 	f.mu.RUnlock()
 
 	// 验证 1：持久化元数据与当前消息边界必须可安全切片。
-	if cutoff <= 0 || cutoff > len(currentMessages) || bHash == "" || tokens < 0 || rawTokens < 0 {
-		logger.Warn("frozen prefix 验证失败：状态元数据非法",
-			"thread_id", threadID,
-			"current", len(currentMessages),
-			"cutoff", cutoff,
-		)
+	if cutoff <= 0 || cutoff > len(currentMessages) || bHash == "" || !validPressureFingerprint(rawHash) || (rawMode != frozenRawPrefixModeFull && rawMode != frozenRawPrefixModeLegacy) || tokens < 0 || rawTokens < 0 {
+		logger.Debug("frozen prefix 未命中", "reason", "metadata_invalid")
 		f.InvalidateWithLogger(logger, stateKey)
 		return nil
 	}
@@ -251,22 +269,31 @@ func (f *FrozenStubs) GetWithLogger(logger *slog.Logger, threadID string, curren
 	// 验证 2：prefix hash 不匹配（内存被意外修改）
 	frozenJSON, _ := json.Marshal(msgs)
 	if sha256hex(frozenJSON) != pHash {
-		logger.Warn("frozen prefix 验证失败：hash 不匹配",
-			"thread_id", threadID,
-		)
+		logger.Debug("frozen prefix 未命中", "reason", "stored_prefix_changed")
 		f.InvalidateWithLogger(logger, stateKey)
 		return nil
 	}
 
-	// 验证 3：boundary hash 不匹配（用户编辑了 frozen 范围内的消息）
+	// 验证 3：完整 raw cutoff 前缀 reuse-safety 证明。
+	// 单条 boundary 相同不足以证明 cutoff 前的早期消息仍连续。
+	if rawMode == frozenRawPrefixModeFull {
+		if currentHash := reuseSafetyPrefixHash(currentMessages, cutoff); currentHash == "" || currentHash != rawHash {
+			logger.Debug("frozen prefix 未命中", "reason", "raw_prefix_changed")
+			f.InvalidateWithLogger(logger, stateKey)
+			return nil
+		}
+	} else if legacyRawPrefixHash(cutoff, currentMessages[cutoff-1]) != rawHash {
+		logger.Debug("frozen prefix 未命中", "reason", "boundary_changed")
+		f.InvalidateWithLogger(logger, stateKey)
+		return nil
+	}
+
+	// 验证 4：保留 boundary 双坐标检查，便于检测元数据损坏。
 	// sawtooth-proxy 在 Get 之前运行 StripReminders，CC 注入不会误触发
 	if cutoff > 0 && cutoff <= len(currentMessages) {
 		currentBHash := stableBoundaryHash(currentMessages[cutoff-1])
 		if currentBHash != bHash {
-			logger.Warn("frozen prefix 验证失败：boundary 已变化（用户可能编辑了消息）",
-				"thread_id", threadID,
-				"cutoff", cutoff,
-			)
+			logger.Debug("frozen prefix 未命中", "reason", "boundary_changed")
 			f.InvalidateWithLogger(logger, stateKey)
 			return nil
 		}
@@ -275,9 +302,7 @@ func (f *FrozenStubs) GetWithLogger(logger *slog.Logger, threadID string, curren
 	// 深拷贝——防止下游（cache_control inject 等）原地修改 frozen 数据
 	copied := deepCopyMessages(msgs)
 	if copied == nil {
-		logger.Warn("frozen prefix 验证失败：深拷贝失败",
-			"thread_id", threadID,
-		)
+		logger.Debug("frozen prefix 未命中", "reason", "copy_failed")
 		f.InvalidateWithLogger(logger, stateKey)
 		return nil
 	}
@@ -287,11 +312,7 @@ func (f *FrozenStubs) GetWithLogger(logger *slog.Logger, threadID string, curren
 	f.lastAccess[stateKey] = time.Now()
 	f.mu.Unlock()
 
-	logger.Info("frozen prefix 命中",
-		"thread_id", threadID,
-		"cutoff", cutoff,
-		"frozen_tokens", tokens,
-	)
+	logger.Info("frozen prefix 命中", "cutoff", cutoff, "frozen_tokens", tokens)
 
 	return &FrozenResult{
 		Messages:  copied,
@@ -324,29 +345,35 @@ func (f *FrozenStubs) UpdateMessages(threadID string, newMsgs []Message) bool {
 	pHash := sha256hex(freshJSON)
 
 	f.mu.Lock()
-	existing, ok := f.messages[threadID]
+	stateKey := f.resolveStateKeyLocked(threadID)
+	existing, ok := f.messages[stateKey]
 	if !ok || len(fresh) != len(existing) {
 		f.mu.Unlock()
 		return false
 	}
-	f.messages[threadID] = fresh
-	f.prefixHash[threadID] = pHash
-	f.lastAccess[threadID] = time.Now()
-	cutoff := f.cutoff[threadID]
-	bHash := f.boundaryHash[threadID]
-	tokens := f.tokens[threadID]
-	rawTokens := f.rawTokens[threadID]
+	f.messages[stateKey] = fresh
+	f.prefixHash[stateKey] = pHash
+	f.lastAccess[stateKey] = time.Now()
+	f.mirrorCurrentAliasesLocked(stateKey)
+	cutoff := f.cutoff[stateKey]
+	bHash := f.boundaryHash[stateKey]
+	rawHash := f.rawPrefixHash[stateKey]
+	rawMode := f.rawPrefixMode[stateKey]
+	tokens := f.tokens[stateKey]
+	rawTokens := f.rawTokens[stateKey]
 	if f.persistFn != nil {
 		fp := frozenPersisted{
-			Messages:     fresh,
-			Cutoff:       cutoff,
-			BoundaryHash: bHash,
-			PrefixHash:   pHash,
-			Tokens:       tokens,
-			RawTokens:    rawTokens,
+			Messages:      fresh,
+			Cutoff:        cutoff,
+			BoundaryHash:  bHash,
+			PrefixHash:    pHash,
+			RawPrefixHash: rawHash,
+			RawPrefixMode: rawMode,
+			Tokens:        tokens,
+			RawTokens:     rawTokens,
 		}
 		if data, err := json.Marshal(fp); err == nil {
-			f.persistFn("frozen:"+threadID, string(data))
+			f.persistFn("frozen:"+stateKey, string(data))
 		}
 	}
 	f.mu.Unlock()
@@ -370,6 +397,8 @@ func (f *FrozenStubs) InvalidateWithLogger(logger *slog.Logger, threadID string)
 	delete(f.cutoff, stateKey)
 	delete(f.boundaryHash, stateKey)
 	delete(f.prefixHash, stateKey)
+	delete(f.rawPrefixHash, stateKey)
+	delete(f.rawPrefixMode, stateKey)
 	delete(f.stubTime, stateKey)
 	delete(f.tokens, stateKey)
 	delete(f.rawTokens, stateKey)
@@ -380,6 +409,8 @@ func (f *FrozenStubs) InvalidateWithLogger(logger *slog.Logger, threadID string)
 			delete(f.cutoff, sessionID)
 			delete(f.boundaryHash, sessionID)
 			delete(f.prefixHash, sessionID)
+			delete(f.rawPrefixHash, sessionID)
+			delete(f.rawPrefixMode, sessionID)
 			delete(f.stubTime, sessionID)
 			delete(f.tokens, sessionID)
 			delete(f.rawTokens, sessionID)
@@ -391,7 +422,7 @@ func (f *FrozenStubs) InvalidateWithLogger(logger *slog.Logger, threadID string)
 	if f.deleteFn != nil {
 		f.deleteFn("frozen:" + stateKey)
 	}
-	logger.Warn("frozen prefix 已失效", "thread_id", threadID)
+	logger.Debug("frozen prefix 已失效", "reason", "state_invalidated")
 }
 
 // UpdateTTL 动态更新 FrozenStubs 的 eviction TTL。
@@ -414,6 +445,8 @@ func (f *FrozenStubs) Evict() int {
 			delete(f.cutoff, tid)
 			delete(f.boundaryHash, tid)
 			delete(f.prefixHash, tid)
+			delete(f.rawPrefixHash, tid)
+			delete(f.rawPrefixMode, tid)
 			delete(f.stubTime, tid)
 			delete(f.tokens, tid)
 			delete(f.rawTokens, tid)
@@ -432,11 +465,12 @@ func (f *FrozenStubs) Evict() int {
 // 每个 thread 在冷启动时仅调用一次（由 Get 触发 lazy-load）。
 func (f *FrozenStubs) loadFrozenFromDB(logger *slog.Logger, threadID string) {
 	f.mu.Lock()
-	if f.loadedFromDB[threadID] {
+	stateKey := f.resolveStateKeyLocked(threadID)
+	if f.loadedFromDB[stateKey] {
 		f.mu.Unlock()
 		return
 	}
-	f.loadedFromDB[threadID] = true
+	f.loadedFromDB[stateKey] = true
 	loadFn := f.loadFn
 	f.mu.Unlock()
 
@@ -444,25 +478,25 @@ func (f *FrozenStubs) loadFrozenFromDB(logger *slog.Logger, threadID string) {
 		return
 	}
 
-	raw, ok := loadFn("frozen:" + threadID)
+	raw, ok := loadFn("frozen:" + stateKey)
 	if !ok || raw == "" {
 		return
 	}
 
 	var fp frozenPersisted
 	if err := json.Unmarshal([]byte(raw), &fp); err != nil {
-		f.InvalidateWithLogger(logger, threadID)
+		f.InvalidateWithLogger(logger, stateKey)
 		return
 	}
-	if len(fp.Messages) == 0 || fp.Cutoff <= 0 || fp.BoundaryHash == "" || fp.PrefixHash == "" || fp.Tokens < 0 || fp.RawTokens < 0 || ExtractPersistentUserContext(fp.Messages) != nil {
-		f.InvalidateWithLogger(logger, threadID)
+	if len(fp.Messages) == 0 || fp.Cutoff <= 0 || fp.BoundaryHash == "" || fp.PrefixHash == "" || !validPressureFingerprint(fp.RawPrefixHash) || (fp.RawPrefixMode != frozenRawPrefixModeFull && fp.RawPrefixMode != frozenRawPrefixModeLegacy) || fp.Tokens < 0 || fp.RawTokens < 0 || ExtractPersistentUserContext(fp.Messages) != nil {
+		f.InvalidateWithLogger(logger, stateKey)
 		return
 	}
 
 	// 验证 prefix hash 与存储的消息一致
 	frozenJSON, _ := json.Marshal(fp.Messages)
 	if sha256hex(frozenJSON) != fp.PrefixHash {
-		logger.Warn("从 DB 恢复的 frozen 状态 hash 不匹配，丢弃", "thread_id", threadID)
+		logger.Debug("frozen prefix 未命中", "reason", "stored_prefix_changed")
 		f.InvalidateWithLogger(logger, threadID)
 		return
 	}
@@ -471,23 +505,22 @@ func (f *FrozenStubs) loadFrozenFromDB(logger *slog.Logger, threadID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	// 仅在仍为空时写入（Store() 可能在并发中被调用）
-	if _, exists := f.messages[threadID]; exists {
+	if _, exists := f.messages[stateKey]; exists {
 		return
 	}
-	f.messages[threadID] = fp.Messages
-	f.cutoff[threadID] = fp.Cutoff
-	f.boundaryHash[threadID] = fp.BoundaryHash
-	f.prefixHash[threadID] = fp.PrefixHash
-	f.tokens[threadID] = fp.Tokens
-	f.rawTokens[threadID] = fp.RawTokens
-	f.stubTime[threadID] = now
-	f.lastAccess[threadID] = now
+	f.messages[stateKey] = fp.Messages
+	f.cutoff[stateKey] = fp.Cutoff
+	f.boundaryHash[stateKey] = fp.BoundaryHash
+	f.prefixHash[stateKey] = fp.PrefixHash
+	f.rawPrefixHash[stateKey] = fp.RawPrefixHash
+	f.rawPrefixMode[stateKey] = fp.RawPrefixMode
+	f.tokens[stateKey] = fp.Tokens
+	f.rawTokens[stateKey] = fp.RawTokens
+	f.stubTime[stateKey] = now
+	f.lastAccess[stateKey] = now
+	f.mirrorCurrentAliasesLocked(stateKey)
 
-	logger.Info("从 SQLite 恢复 frozen 状态",
-		"thread_id", threadID,
-		"cutoff", fp.Cutoff,
-		"tokens", fp.Tokens,
-	)
+	logger.Info("从 SQLite 恢复 frozen 状态", "cutoff", fp.Cutoff, "tokens", fp.Tokens)
 }
 
 // deepCopyMessages 通过 JSON round-trip 创建消息切片的深拷贝。
@@ -512,6 +545,17 @@ func stableBoundaryHash(msg Message) string {
 	}
 	canonical, _ := json.Marshal(canonicalMessage)
 	return sha256hex(canonical)
+}
+
+// legacyRawPrefixHash 为没有传入 raw history 的旧内存 API 保留受限兼容证明。
+// 它只绑定 cutoff 与 boundary，生产主管线始终传入完整 raw history 并使用 full 模式。
+func legacyRawPrefixHash(cutoff int, boundary Message) string {
+	payload := struct {
+		Cutoff   int    `json:"cutoff"`
+		Boundary string `json:"boundary"`
+	}{Cutoff: cutoff, Boundary: stableBoundaryHash(boundary)}
+	data, _ := json.Marshal(payload)
+	return sha256hex(data)
 }
 
 // canonicalMessageForHash 将完整消息解码为可确定性序列化的 JSON 对象。

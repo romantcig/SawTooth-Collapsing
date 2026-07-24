@@ -956,7 +956,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 							frozenPrefixLen = len(messages)
 							s.applyCacheControl(messages, frozenPrefixLen, sessionID)
 							compressedTokens := s.TokenCounter.CountMessagesTokens(messages)
-							s.Frozen.StoreWithLogger(meta.Logger, stateKey, messages, rawCutoff, rawBoundary, compressedTokens, rawEstimate)
+							s.Frozen.StoreWithLogger(meta.Logger, stateKey, messages, rawCutoff, rawBoundary, compressedTokens, rawEstimate, rawHistory)
 						}
 					}
 
@@ -1053,7 +1053,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					frozenPrefixLen = len(messages)
 					s.applyCacheControl(messages, frozenPrefixLen, sessionID)
 					compressedTokens := s.TokenCounter.CountMessagesTokens(messages)
-					s.Frozen.StoreWithLogger(meta.Logger, stateKey, messages, rawCutoff, rawBoundary, compressedTokens, rawEstimate)
+					s.Frozen.StoreWithLogger(meta.Logger, stateKey, messages, rawCutoff, rawBoundary, compressedTokens, rawEstimate, rawHistory)
 				} else {
 					s.applyCacheControl(messages, frozenPrefixLen, sessionID)
 				}
