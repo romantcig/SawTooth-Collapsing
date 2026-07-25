@@ -31,7 +31,9 @@ func TestPhase08CombinedLifecycle(t *testing.T) {
 	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, FullBody: false, DataDir: debugDir})
 	var persisted string
 	server.Sawtooth.SetPersistFunc(func(key, value string) {
-		if key == "sawtooth:phase08-combined" {
+		// Phase 11 起生产状态始终使用显式 epoch-scoped key；测试只观察
+		// 当前 epoch，不把旧裸 session key 重新当作当前状态。
+		if strings.HasPrefix(key, "sawtooth:phase08-combined:history_epoch:") {
 			persisted = value
 		}
 	})

@@ -40,6 +40,8 @@ type DecayTracker struct {
 	persistFn    PersistFunc
 	loadFn       LoadFunc
 	loadedFromDB map[string]bool
+	stateFoundDB map[string]bool
+	currentAlias map[string]string
 }
 
 // NewDecayTracker 创建新的衰减追踪器。
@@ -50,6 +52,91 @@ func NewDecayTracker() *DecayTracker {
 		filePaths:    make(map[string]string),
 		pinnedPaths:  make(map[string]bool),
 		loadedFromDB: make(map[string]bool),
+		stateFoundDB: make(map[string]bool),
+		currentAlias: make(map[string]string),
+	}
+}
+
+// SetCurrentAlias 让旧 session 级观察调用解析到当前 epoch key。
+// 主管线自身始终传入显式 stateKey。
+func (d *DecayTracker) SetCurrentAlias(sessionID, stateKey string) {
+	if d == nil || sessionID == "" || stateKey == "" {
+		return
+	}
+	d.mu.Lock()
+	d.currentAlias[sessionID] = stateKey
+	d.mu.Unlock()
+}
+
+func (d *DecayTracker) resolveStateKeyLocked(sessionID string) string {
+	if alias := d.currentAlias[sessionID]; alias != "" {
+		return alias
+	}
+	return sessionID
+}
+
+func (d *DecayTracker) hasSessionStateLocked(sessionID string) bool {
+	prefix := sessionID + ":msg_"
+	for key := range d.stubbedAt {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	for key := range d.intensity {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	for key := range d.filePaths {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// MigrateLegacyState 一次性把裸 session 前缀的衰减状态复制到 epoch 1 key。
+// 显式目标 key 已存在时目标优先，绝不再读取旧裸 key。
+func (d *DecayTracker) MigrateLegacyState(sessionID, stateKey string) {
+	if d == nil || sessionID == "" || stateKey == "" || sessionID == stateKey {
+		return
+	}
+	d.LoadFromDB(stateKey)
+	d.mu.RLock()
+	targetExists := d.hasSessionStateLocked(stateKey)
+	targetFound := d.stateFoundDB[stateKey]
+	d.mu.RUnlock()
+	if targetExists || targetFound {
+		return
+	}
+
+	d.LoadFromDB(sessionID)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.hasSessionStateLocked(stateKey) || d.stateFoundDB[stateKey] || !d.hasSessionStateLocked(sessionID) {
+		return
+	}
+	legacyPrefix := sessionID + ":msg_"
+	targetPrefix := stateKey + ":msg_"
+	for key, value := range d.stubbedAt {
+		if strings.HasPrefix(key, legacyPrefix) {
+			d.stubbedAt[targetPrefix+strings.TrimPrefix(key, legacyPrefix)] = value
+		}
+	}
+	for key, value := range d.intensity {
+		if strings.HasPrefix(key, legacyPrefix) {
+			d.intensity[targetPrefix+strings.TrimPrefix(key, legacyPrefix)] = value
+		}
+	}
+	for key, value := range d.filePaths {
+		if strings.HasPrefix(key, legacyPrefix) {
+			d.filePaths[targetPrefix+strings.TrimPrefix(key, legacyPrefix)] = value
+		}
+	}
+	d.loadedFromDB[stateKey] = true
+	if d.persistFn != nil {
+		d.PersistUnlocked(stateKey)
+		d.stateFoundDB[stateKey] = true
 	}
 }
 
@@ -72,9 +159,10 @@ func (d *DecayTracker) SetLoadFunc(fn LoadFunc) {
 // emotionalIntensity 是桩化时的情绪强度（0.0-1.0），影响衰减速度。
 // key 格式: "sessionID:msg_N"（session-scoped，多 session 并发安全）。
 func (d *DecayTracker) MarkStubbed(sessionID string, msgIndex, requestIdx int, emotionalIntensity float64) {
-	key := fmt.Sprintf("%s:msg_%d", sessionID, msgIndex)
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	sessionID = d.resolveStateKeyLocked(sessionID)
+	key := fmt.Sprintf("%s:msg_%d", sessionID, msgIndex)
 	if _, exists := d.stubbedAt[key]; !exists {
 		d.stubbedAt[key] = requestIdx
 		d.intensity[key] = emotionalIntensity
@@ -87,9 +175,10 @@ func (d *DecayTracker) SetFilePath(sessionID string, msgIndex int, path string) 
 	if path == "" {
 		return
 	}
-	key := fmt.Sprintf("%s:msg_%d", sessionID, msgIndex)
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	sessionID = d.resolveStateKeyLocked(sessionID)
+	key := fmt.Sprintf("%s:msg_%d", sessionID, msgIndex)
 	d.filePaths[key] = path
 }
 
@@ -156,8 +245,9 @@ func decayBoundaries(threadLen int, pressure float64) (s0end, s1end, s2end int) 
 // currentRequestIdx 是当前请求序号，threadLen 是原始线程长度。
 // key 格式: "sessionID:msg_N"。
 func (d *DecayTracker) GetStage(sessionID string, msgIndex, currentRequestIdx, threadLen int, pressure float64) DecayPhase {
-	key := fmt.Sprintf("%s:msg_%d", sessionID, msgIndex)
 	d.mu.RLock()
+	sessionID = d.resolveStateKeyLocked(sessionID)
+	key := fmt.Sprintf("%s:msg_%d", sessionID, msgIndex)
 	stubbedAt, exists := d.stubbedAt[key]
 	emotionalIntensity := d.intensity[key]
 	filePath := d.filePaths[key]
@@ -193,6 +283,7 @@ func (d *DecayTracker) GetStage(sessionID string, msgIndex, currentRequestIdx, t
 // Persist 将当前衰减状态持久化到 DB。
 func (d *DecayTracker) Persist(threadID string) {
 	d.mu.RLock()
+	threadID = d.resolveStateKeyLocked(threadID)
 	fn := d.persistFn
 	if fn == nil {
 		d.mu.RUnlock()
@@ -222,6 +313,7 @@ func (d *DecayTracker) Persist(threadID string) {
 // LoadFromDB 从 DB 恢复衰减状态。每个 thread 仅加载一次。
 func (d *DecayTracker) LoadFromDB(threadID string) {
 	d.mu.Lock()
+	threadID = d.resolveStateKeyLocked(threadID)
 	if d.loadedFromDB[threadID] {
 		d.mu.Unlock()
 		return
@@ -238,6 +330,9 @@ func (d *DecayTracker) LoadFromDB(threadID string) {
 	if !ok || raw == "" {
 		return
 	}
+	d.mu.Lock()
+	d.stateFoundDB[threadID] = true
+	d.mu.Unlock()
 
 	var dp decayPersisted
 	if err := json.Unmarshal([]byte(raw), &dp); err != nil {
@@ -269,6 +364,7 @@ func (d *DecayTracker) LoadFromDB(threadID string) {
 func (d *DecayTracker) ClearSession(sessionID string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	sessionID = d.resolveStateKeyLocked(sessionID)
 
 	prefix := sessionID + ":"
 	for k := range d.stubbedAt {

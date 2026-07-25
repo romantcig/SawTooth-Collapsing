@@ -125,7 +125,7 @@ func TestHistoryBoundaryEpochTransitionsAndCommonPrefix(t *testing.T) {
 	base := historyTextMessages("zero", "one", "two")
 
 	initial := manager.Begin(sessionID, base)
-	if initial.Epoch != 1 || initial.CommonPrefix != 0 || initial.StateKey == "" || !initial.ReuseSafe {
+	if initial.Epoch != 1 || initial.CommonPrefix != 0 || initial.StateKey == "" || initial.StateKey == sessionID || !strings.HasSuffix(initial.StateKey, ":history_epoch:1") || !initial.ReuseSafe {
 		t.Fatalf("initial decision=%+v", initial)
 	}
 	appended := manager.Begin(sessionID, append(deepCopyMessages(base), Message{Role: "assistant", Content: mustMarshal("three")}))

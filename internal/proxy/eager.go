@@ -281,27 +281,84 @@ func eagerFirstN(lines []string, n int) string {
 // subsequent call — independent of hasFollowingAssistant or frozenBoundary.
 // That keeps prefix bytes byte-identical across turns, so the prompt cache hits.
 type EagerStubMemory struct {
-	mu        sync.RWMutex
-	stubbed   map[string]map[string]bool
-	persistFn PersistFunc
-	loadFn    LoadFunc
-	loaded    map[string]bool
+	mu           sync.RWMutex
+	stubbed      map[string]map[string]bool
+	persistFn    PersistFunc
+	loadFn       LoadFunc
+	loaded       map[string]bool
+	stateFoundDB map[string]bool
+	currentAlias map[string]string
 }
 
 func NewEagerStubMemory() *EagerStubMemory {
 	return &EagerStubMemory{
-		stubbed: make(map[string]map[string]bool),
-		loaded:  make(map[string]bool),
+		stubbed:      make(map[string]map[string]bool),
+		loaded:       make(map[string]bool),
+		stateFoundDB: make(map[string]bool),
+		currentAlias: make(map[string]string),
 	}
 }
 
 func (m *EagerStubMemory) SetPersistFunc(fn PersistFunc) { m.persistFn = fn }
 func (m *EagerStubMemory) SetLoadFunc(fn LoadFunc)       { m.loadFn = fn }
 
+// SetCurrentAlias 让旧 session 级观察调用解析到当前 epoch key。
+// 主管线自身始终传入显式 stateKey。
+func (m *EagerStubMemory) SetCurrentAlias(sessionID, stateKey string) {
+	if m == nil || sessionID == "" || stateKey == "" {
+		return
+	}
+	m.mu.Lock()
+	m.currentAlias[sessionID] = stateKey
+	m.mu.Unlock()
+}
+
+func (m *EagerStubMemory) resolveStateKey(threadID string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if alias := m.currentAlias[threadID]; alias != "" {
+		return alias
+	}
+	return threadID
+}
+
+// MigrateLegacyState 一次性把裸 session 的 sticky tool 记录复制到 epoch 1 key。
+// 显式目标 key 已存在时目标优先，绝不再读取旧裸 key。
+func (m *EagerStubMemory) MigrateLegacyState(sessionID, stateKey string) {
+	if m == nil || sessionID == "" || stateKey == "" || sessionID == stateKey {
+		return
+	}
+	m.ensureLoaded(stateKey)
+	m.mu.RLock()
+	targetExists := len(m.stubbed[stateKey]) > 0
+	targetFound := m.stateFoundDB[stateKey]
+	m.mu.RUnlock()
+	if targetExists || targetFound {
+		return
+	}
+
+	m.ensureLoaded(sessionID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.stubbed[stateKey]) > 0 || m.stateFoundDB[stateKey] || len(m.stubbed[sessionID]) == 0 {
+		return
+	}
+	m.stubbed[stateKey] = make(map[string]bool, len(m.stubbed[sessionID]))
+	for toolUseID, stubbed := range m.stubbed[sessionID] {
+		m.stubbed[stateKey][toolUseID] = stubbed
+	}
+	m.loaded[stateKey] = true
+	if m.persistFn != nil {
+		m.persistLocked(stateKey)
+		m.stateFoundDB[stateKey] = true
+	}
+}
+
 func (m *EagerStubMemory) WasStubbed(threadID, toolUseID string) bool {
 	if m == nil || threadID == "" || toolUseID == "" {
 		return false
 	}
+	threadID = m.resolveStateKey(threadID)
 	m.ensureLoaded(threadID)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -315,6 +372,7 @@ func (m *EagerStubMemory) RecordStubbed(threadID, toolUseID string) {
 	if m == nil || threadID == "" || toolUseID == "" {
 		return
 	}
+	threadID = m.resolveStateKey(threadID)
 	m.ensureLoaded(threadID)
 	m.mu.Lock()
 	if m.stubbed[threadID] == nil {
@@ -328,10 +386,14 @@ func (m *EagerStubMemory) RecordStubbed(threadID, toolUseID string) {
 	// 更新、快照和同步持久化使用同一把写锁串行化，防止旧快照在新快照
 	// 之后落库。persistFn 是本地 SQLite 写入，调用约定必须同步返回。
 	m.persistLocked(threadID)
+	if m.persistFn != nil {
+		m.stateFoundDB[threadID] = true
+	}
 	m.mu.Unlock()
 }
 
 func (m *EagerStubMemory) ensureLoaded(threadID string) {
+	threadID = m.resolveStateKey(threadID)
 	m.mu.RLock()
 	already := m.loaded[threadID]
 	m.mu.RUnlock()
@@ -353,6 +415,9 @@ func (m *EagerStubMemory) ensureLoaded(threadID string) {
 		m.mu.Unlock()
 		return
 	}
+	m.mu.Lock()
+	m.stateFoundDB[threadID] = true
+	m.mu.Unlock()
 
 	var payload struct {
 		ToolUseIDs []string `json:"tool_use_ids"`

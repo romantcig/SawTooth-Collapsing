@@ -299,11 +299,6 @@ func historyEpochPersistenceKey(sessionID string) string {
 }
 
 func historyEpochStateKey(sessionID string, epoch uint64) string {
-	// epoch 1 复用既有 session key 作为无损冷启动兼容别名；
-	// 一旦发生真实分叉，epoch 2+ 使用独立命名空间，旧状态永不回流。
-	if epoch == 1 {
-		return sessionID
-	}
 	return sessionID + historyEpochStateKeySeparator + strconv.FormatUint(epoch, 10)
 }
 

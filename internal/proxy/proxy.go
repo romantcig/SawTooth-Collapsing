@@ -687,8 +687,34 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			meta.HistoryEpochChanged = epochDecision.EpochChanged
 			stateKey = epochDecision.StateKey
 			historyReuseSafe = epochDecision.ReuseSafe
+			// epoch 1 是升级后的唯一兼容窗口：先尝试把旧裸 session 状态
+			// 一次性复制到显式 epoch key，再建立只用于旧观察 API 的 alias。
+			// epoch 2+ 永不读取裸 key，避免已放弃分支重新进入当前主管线。
+			if epochDecision.Epoch == 1 {
+				if s.Sawtooth != nil {
+					s.Sawtooth.MigrateLegacyState(sessionID, stateKey)
+				}
+				if s.Frozen != nil {
+					s.Frozen.MigrateLegacyState(meta.Logger, sessionID, stateKey)
+				}
+				if s.DecayTracker != nil {
+					s.DecayTracker.MigrateLegacyState(sessionID, stateKey)
+				}
+				if s.EagerStub != nil {
+					s.EagerStub.MigrateLegacyState(sessionID, stateKey)
+				}
+			}
+			if s.Sawtooth != nil {
+				s.Sawtooth.SetCurrentAlias(sessionID, stateKey)
+			}
 			if s.Frozen != nil {
 				s.Frozen.SetCurrentAlias(sessionID, stateKey)
+			}
+			if s.DecayTracker != nil {
+				s.DecayTracker.SetCurrentAlias(sessionID, stateKey)
+			}
+			if s.EagerStub != nil {
+				s.EagerStub.SetCurrentAlias(sessionID, stateKey)
 			}
 		}
 		if s.HistoryEpoch != nil && !historyReuseSafe && !meta.HistoryEpochChanged {

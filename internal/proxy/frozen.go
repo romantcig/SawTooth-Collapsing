@@ -44,6 +44,7 @@ type FrozenStubs struct {
 	loadFn        LoadFunc          // 可选：冷启动时从 DB 加载 frozen 状态
 	deleteFn      DeleteFunc        // 可选：失效时删除 DB 中的 frozen 状态
 	loadedFromDB  map[string]bool   // threadID → 已尝试从 DB 加载
+	stateFoundDB  map[string]bool   // threadID → DB 中曾存在显式状态（即使内容无效）
 	currentAlias  map[string]string // legacy session key → 当前 epoch state key
 }
 
@@ -87,6 +88,7 @@ func NewFrozenStubsWithTTL(ttl time.Duration) *FrozenStubs {
 		rawTokens:     make(map[string]int),
 		lastAccess:    make(map[string]time.Time),
 		loadedFromDB:  make(map[string]bool),
+		stateFoundDB:  make(map[string]bool),
 		currentAlias:  make(map[string]string),
 	}
 }
@@ -99,6 +101,7 @@ func (f *FrozenStubs) SetCurrentAlias(sessionID, stateKey string) {
 	}
 	f.mu.Lock()
 	f.currentAlias[sessionID] = stateKey
+	f.mirrorCurrentAliasesLocked(stateKey)
 	f.mu.Unlock()
 }
 
@@ -114,6 +117,20 @@ func (f *FrozenStubs) mirrorCurrentAliasesLocked(stateKey string) {
 		if current != stateKey || sessionID == stateKey {
 			continue
 		}
+		if _, exists := f.messages[stateKey]; !exists {
+			delete(f.messages, sessionID)
+			delete(f.cutoff, sessionID)
+			delete(f.boundaryHash, sessionID)
+			delete(f.prefixHash, sessionID)
+			delete(f.rawPrefixHash, sessionID)
+			delete(f.rawPrefixMode, sessionID)
+			delete(f.stubTime, sessionID)
+			delete(f.tokens, sessionID)
+			delete(f.rawTokens, sessionID)
+			delete(f.lastAccess, sessionID)
+			f.loadedFromDB[sessionID] = true
+			continue
+		}
 		f.messages[sessionID] = f.messages[stateKey]
 		f.cutoff[sessionID] = f.cutoff[stateKey]
 		f.boundaryHash[sessionID] = f.boundaryHash[stateKey]
@@ -125,6 +142,79 @@ func (f *FrozenStubs) mirrorCurrentAliasesLocked(stateKey string) {
 		f.rawTokens[sessionID] = f.rawTokens[stateKey]
 		f.lastAccess[sessionID] = f.lastAccess[stateKey]
 		f.loadedFromDB[sessionID] = true
+		f.stateFoundDB[sessionID] = f.stateFoundDB[stateKey]
+	}
+}
+
+// MigrateLegacyState 一次性把旧裸 session key 的 Frozen 快照复制到明确的 epoch key。
+// 迁移后主管线只访问 stateKey；旧键仅作为兼容性观察镜像，不再作为当前读取键。
+func (f *FrozenStubs) MigrateLegacyState(logger *slog.Logger, sessionID, stateKey string) {
+	if f == nil || sessionID == "" || stateKey == "" || sessionID == stateKey {
+		return
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	// 目标 key 永远优先。即使持久化内容无效并已 fail-closed 删除，也不能
+	// 再退回裸 key，否则旧状态可能在显式 epoch 状态之后重新进入主管线。
+	f.loadFrozenFromDB(logger, stateKey)
+	f.mu.RLock()
+	_, targetExists := f.messages[stateKey]
+	targetFound := f.stateFoundDB[stateKey]
+	f.mu.RUnlock()
+	if targetExists || targetFound {
+		return
+	}
+
+	f.loadFrozenFromDB(logger, sessionID)
+	f.mu.RLock()
+	legacy, exists := f.messages[sessionID]
+	if !exists {
+		f.mu.RUnlock()
+		return
+	}
+	messages := deepCopyMessages(legacy)
+	cutoff := f.cutoff[sessionID]
+	boundaryHash := f.boundaryHash[sessionID]
+	prefixHash := f.prefixHash[sessionID]
+	rawPrefixHash := f.rawPrefixHash[sessionID]
+	rawPrefixMode := f.rawPrefixMode[sessionID]
+	stubTime := f.stubTime[sessionID]
+	tokens := f.tokens[sessionID]
+	rawTokens := f.rawTokens[sessionID]
+	lastAccess := f.lastAccess[sessionID]
+	f.mu.RUnlock()
+	if messages == nil {
+		return
+	}
+	persisted, err := json.Marshal(frozenPersisted{
+		Messages: messages, Cutoff: cutoff, BoundaryHash: boundaryHash,
+		PrefixHash: prefixHash, RawPrefixHash: rawPrefixHash, RawPrefixMode: rawPrefixMode,
+		Tokens: tokens, RawTokens: rawTokens,
+	})
+	if err != nil {
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, exists := f.messages[stateKey]; exists || f.stateFoundDB[stateKey] {
+		return
+	}
+	f.messages[stateKey] = messages
+	f.cutoff[stateKey] = cutoff
+	f.boundaryHash[stateKey] = boundaryHash
+	f.prefixHash[stateKey] = prefixHash
+	f.rawPrefixHash[stateKey] = rawPrefixHash
+	f.rawPrefixMode[stateKey] = rawPrefixMode
+	f.stubTime[stateKey] = stubTime
+	f.tokens[stateKey] = tokens
+	f.rawTokens[stateKey] = rawTokens
+	f.lastAccess[stateKey] = lastAccess
+	f.loadedFromDB[stateKey] = true
+	if f.persistFn != nil {
+		f.persistFn("frozen:"+stateKey, string(persisted))
+		f.stateFoundDB[stateKey] = true
 	}
 }
 
@@ -209,6 +299,9 @@ func (f *FrozenStubs) StoreWithLogger(logger *slog.Logger, threadID string, stub
 	f.rawTokens[threadID] = rawTokenEstimate
 	f.lastAccess[threadID] = now
 	f.loadedFromDB[threadID] = true // 内存中的是最新权威数据
+	if f.persistFn != nil {
+		f.stateFoundDB[threadID] = true
+	}
 	f.mirrorCurrentAliasesLocked(threadID)
 	// 持久化在同一临界区内执行，保证同一 thread 的内存与 SQLite 顺序一致。
 	if f.persistFn != nil && persisted != nil {
@@ -452,6 +545,7 @@ func (f *FrozenStubs) Evict() int {
 			delete(f.rawTokens, tid)
 			delete(f.lastAccess, tid)
 			delete(f.loadedFromDB, tid)
+			delete(f.stateFoundDB, tid)
 			evicted++
 		}
 	}
@@ -482,6 +576,9 @@ func (f *FrozenStubs) loadFrozenFromDB(logger *slog.Logger, threadID string) {
 	if !ok || raw == "" {
 		return
 	}
+	f.mu.Lock()
+	f.stateFoundDB[stateKey] = true
+	f.mu.Unlock()
 
 	var fp frozenPersisted
 	if err := json.Unmarshal([]byte(raw), &fp); err != nil {
@@ -626,6 +723,7 @@ type persistedState struct {
 	SystemFingerprint         string `json:"system_fingerprint,omitempty"`
 	ToolsFingerprint          string `json:"tools_fingerprint,omitempty"`
 	MessagesPrefixFingerprint string `json:"messages_prefix_fingerprint,omitempty"`
+	Conservative              bool   `json:"conservative,omitempty"`
 }
 
 // baselineResetReason 表示 pressure baseline 不能沿用时的受限原因。
@@ -649,6 +747,7 @@ type pressureBaseline struct {
 	SystemFingerprint         string
 	ToolsFingerprint          string
 	MessagesPrefixFingerprint string
+	Conservative              bool
 	Available                 bool
 	ResetReason               baselineResetReason
 }
@@ -661,14 +760,17 @@ type SawtoothTrigger struct {
 	systemFingerprints          map[string]string        // threadID → 上次主请求 system 的 SHA-256 指纹
 	toolsFingerprints           map[string]string        // threadID → 上次主请求 tools 的 SHA-256 指纹
 	messagesPrefixFingerprints  map[string]string        // threadID → 上次主请求消息前缀的 SHA-256 指纹
+	conservativeBaselines       map[string]bool          // threadID → actual 仅作为不得压低的 pressure floor
 	lastRequestTime             map[string]time.Time     // threadID → 上次 API 响应时间
 	loadedFromDB                map[string]bool          // threadID → DB 加载已完成
+	stateFoundDB                map[string]bool          // threadID → DB 中曾存在显式状态（即使内容无效）
 	loadingFromDB               map[string]chan struct{} // threadID → 正在进行的 DB 加载完成信号
 	baselineGeneration          map[string]uint64        // threadID → 响应写回版本，防止慢加载覆盖新状态
 	baselineRequestGeneration   map[string]uint64        // threadID → 请求进入有状态主管线时分配的代际
 	baselineCommittedGeneration map[string]uint64        // threadID → 最近接受的响应请求代际
 	baselinePersistLocks        map[string]*sync.Mutex   // threadID → 锁外持久化串行锁
 	requestSeq                  map[string]int           // threadID → 当前请求序号（Phase B: DecayTracker 用）
+	currentAlias                map[string]string        // legacy session key → 当前 epoch state key
 	pauseThreshold              time.Duration            // 暂停检测阈值（cache TTL - 安全边距）
 	tokenThreshold              int                      // 超过此值触发桩化周期（来自配置）
 	tokenMinimum                int                      // 桩化下限（来自配置）
@@ -684,17 +786,165 @@ func NewSawtoothTrigger(pauseThreshold time.Duration, tokenThreshold, tokenMinim
 		systemFingerprints:          make(map[string]string),
 		toolsFingerprints:           make(map[string]string),
 		messagesPrefixFingerprints:  make(map[string]string),
+		conservativeBaselines:       make(map[string]bool),
 		lastRequestTime:             make(map[string]time.Time),
 		loadedFromDB:                make(map[string]bool),
+		stateFoundDB:                make(map[string]bool),
 		loadingFromDB:               make(map[string]chan struct{}),
 		baselineGeneration:          make(map[string]uint64),
 		baselineRequestGeneration:   make(map[string]uint64),
 		baselineCommittedGeneration: make(map[string]uint64),
 		baselinePersistLocks:        make(map[string]*sync.Mutex),
 		requestSeq:                  make(map[string]int),
+		currentAlias:                make(map[string]string),
 		pauseThreshold:              pauseThreshold,
 		tokenThreshold:              tokenThreshold,
 		tokenMinimum:                tokenMinimum,
+	}
+}
+
+// SetCurrentAlias 让旧的 session 级观察 API 指向当前 epoch key。
+// 主管线始终传入显式 stateKey；alias 不会把旧 epoch key 重定向。
+func (st *SawtoothTrigger) SetCurrentAlias(sessionID, stateKey string) {
+	if st == nil || sessionID == "" || stateKey == "" {
+		return
+	}
+	st.mu.Lock()
+	st.currentAlias[sessionID] = stateKey
+	st.mirrorCurrentAliasesLocked(stateKey)
+	st.mu.Unlock()
+}
+
+func (st *SawtoothTrigger) resolveStateKeyLocked(threadID string) string {
+	if alias := st.currentAlias[threadID]; alias != "" {
+		return alias
+	}
+	return threadID
+}
+
+func (st *SawtoothTrigger) hasStateLocked(stateKey string) bool {
+	_, hasTokens := st.lastTotalTokens[stateKey]
+	_, hasTime := st.lastRequestTime[stateKey]
+	_, hasSeq := st.requestSeq[stateKey]
+	return hasTokens || hasTime || hasSeq || st.baselineGeneration[stateKey] != 0 ||
+		st.baselineRequestGeneration[stateKey] != 0 || st.baselineCommittedGeneration[stateKey] != 0
+}
+
+func (st *SawtoothTrigger) copyStateLocked(sourceKey, targetKey string) {
+	if value, ok := st.lastTotalTokens[sourceKey]; ok {
+		st.lastTotalTokens[targetKey] = value
+	} else {
+		delete(st.lastTotalTokens, targetKey)
+	}
+	if value, ok := st.lastMessageCount[sourceKey]; ok {
+		st.lastMessageCount[targetKey] = value
+	} else {
+		delete(st.lastMessageCount, targetKey)
+	}
+	if value, ok := st.systemFingerprints[sourceKey]; ok {
+		st.systemFingerprints[targetKey] = value
+	} else {
+		delete(st.systemFingerprints, targetKey)
+	}
+	if value, ok := st.toolsFingerprints[sourceKey]; ok {
+		st.toolsFingerprints[targetKey] = value
+	} else {
+		delete(st.toolsFingerprints, targetKey)
+	}
+	if value, ok := st.messagesPrefixFingerprints[sourceKey]; ok {
+		st.messagesPrefixFingerprints[targetKey] = value
+	} else {
+		delete(st.messagesPrefixFingerprints, targetKey)
+	}
+	if value, ok := st.conservativeBaselines[sourceKey]; ok {
+		st.conservativeBaselines[targetKey] = value
+	} else {
+		delete(st.conservativeBaselines, targetKey)
+	}
+	if value, ok := st.lastRequestTime[sourceKey]; ok {
+		st.lastRequestTime[targetKey] = value
+	} else {
+		delete(st.lastRequestTime, targetKey)
+	}
+	if value, ok := st.baselineGeneration[sourceKey]; ok {
+		st.baselineGeneration[targetKey] = value
+	} else {
+		delete(st.baselineGeneration, targetKey)
+	}
+	if value, ok := st.baselineRequestGeneration[sourceKey]; ok {
+		st.baselineRequestGeneration[targetKey] = value
+	} else {
+		delete(st.baselineRequestGeneration, targetKey)
+	}
+	if value, ok := st.baselineCommittedGeneration[sourceKey]; ok {
+		st.baselineCommittedGeneration[targetKey] = value
+	} else {
+		delete(st.baselineCommittedGeneration, targetKey)
+	}
+	if value, ok := st.requestSeq[sourceKey]; ok {
+		st.requestSeq[targetKey] = value
+	} else {
+		delete(st.requestSeq, targetKey)
+	}
+}
+
+func (st *SawtoothTrigger) mirrorCurrentAliasesLocked(stateKey string) {
+	for sessionID, current := range st.currentAlias {
+		if current != stateKey || sessionID == stateKey {
+			continue
+		}
+		st.copyStateLocked(stateKey, sessionID)
+		st.loadedFromDB[sessionID] = true
+		st.stateFoundDB[sessionID] = st.stateFoundDB[stateKey]
+	}
+}
+
+// MigrateLegacyState 一次性把旧裸 session key 的 Sawtooth 状态复制到 epoch 1 key。
+// 若显式目标 key 已存在（包括无效后 fail-closed 的持久状态），绝不回退读取裸 key。
+func (st *SawtoothTrigger) MigrateLegacyState(sessionID, stateKey string) {
+	if st == nil || sessionID == "" || stateKey == "" || sessionID == stateKey {
+		return
+	}
+	st.loadSawtoothFromDB(stateKey)
+	st.mu.RLock()
+	targetExists := st.hasStateLocked(stateKey)
+	targetFound := st.stateFoundDB[stateKey]
+	st.mu.RUnlock()
+	if targetExists || targetFound {
+		return
+	}
+
+	st.loadSawtoothFromDB(sessionID)
+	persistLock := st.pressurePersistLock(stateKey)
+	persistLock.Lock()
+	defer persistLock.Unlock()
+
+	st.mu.Lock()
+	if st.hasStateLocked(stateKey) || st.stateFoundDB[stateKey] || !st.hasStateLocked(sessionID) {
+		st.mu.Unlock()
+		return
+	}
+	st.copyStateLocked(sessionID, stateKey)
+	st.loadedFromDB[stateKey] = true
+	state := persistedState{
+		Tokens:                    st.lastTotalTokens[stateKey],
+		MsgCount:                  st.lastMessageCount[stateKey],
+		SystemFingerprint:         st.systemFingerprints[stateKey],
+		ToolsFingerprint:          st.toolsFingerprints[stateKey],
+		MessagesPrefixFingerprint: st.messagesPrefixFingerprints[stateKey],
+		Conservative:              st.conservativeBaselines[stateKey],
+	}
+	persistFn := st.persistFn
+	shouldPersist := persistFn != nil && state.Tokens > 0 && state.MsgCount >= 0
+	if shouldPersist {
+		st.stateFoundDB[stateKey] = true
+	}
+	st.mu.Unlock()
+
+	if shouldPersist {
+		if data, err := json.Marshal(state); err == nil {
+			persistFn("sawtooth:"+stateKey, string(data))
+		}
 	}
 }
 
@@ -703,18 +953,20 @@ func NewSawtoothTrigger(pauseThreshold time.Duration, tokenThreshold, tokenMinim
 func (st *SawtoothTrigger) PressureBaseline(threadID string) pressureBaseline {
 	for {
 		st.mu.RLock()
-		_, hasActual := st.lastTotalTokens[threadID]
-		loaded := st.loadedFromDB[threadID]
-		loading := st.loadingFromDB[threadID]
+		stateKey := st.resolveStateKeyLocked(threadID)
+		_, hasActual := st.lastTotalTokens[stateKey]
+		loaded := st.loadedFromDB[stateKey]
+		loading := st.loadingFromDB[stateKey]
 		st.mu.RUnlock()
 		if hasActual || loaded {
+			threadID = stateKey
 			break
 		}
 		if loading != nil {
 			<-loading
 			continue
 		}
-		st.loadSawtoothFromDB(threadID)
+		st.loadSawtoothFromDB(stateKey)
 	}
 
 	st.mu.RLock()
@@ -724,6 +976,7 @@ func (st *SawtoothTrigger) PressureBaseline(threadID string) pressureBaseline {
 		SystemFingerprint:         st.systemFingerprints[threadID],
 		ToolsFingerprint:          st.toolsFingerprints[threadID],
 		MessagesPrefixFingerprint: st.messagesPrefixFingerprints[threadID],
+		Conservative:              st.conservativeBaselines[threadID],
 		ResetReason:               baselineResetNoActual,
 	}
 	baseline.Available = baseline.ActualTokens > 0 && baseline.MessageCount >= 0 &&
@@ -768,6 +1021,7 @@ func (st *SawtoothTrigger) SetLoadFunc(fn LoadFunc) {
 // 历史 actual 不在此处再次参与 token 判定；它只应通过 pressureDecision 进入。
 func (st *SawtoothTrigger) ShouldTrigger(threadID string, selectedPressure int) TriggerReason {
 	st.mu.RLock()
+	threadID = st.resolveStateKeyLocked(threadID)
 	emergencyThreshold := st.tokenThreshold + 10_000 // 比阈值多 10k 安全边距
 	tokenThreshold := st.tokenThreshold
 	tokenMinimum := st.tokenMinimum
@@ -813,7 +1067,9 @@ func (st *SawtoothTrigger) ResetPressureBaseline(threadID string) {
 func (st *SawtoothTrigger) BeginPressureRequest(threadID string) uint64 {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	threadID = st.resolveStateKeyLocked(threadID)
 	st.baselineRequestGeneration[threadID]++
+	st.mirrorCurrentAliasesLocked(threadID)
 	return st.baselineRequestGeneration[threadID]
 }
 
@@ -828,6 +1084,20 @@ func (st *SawtoothTrigger) UpdatePressureBaseline(threadID string, totalInputTok
 // UpdatePressureBaselineForRequest 在成功主响应后按请求代际原子写回完整 pressure baseline。
 // generation 为零时兼容直接构造 requestMeta 的测试/旧调用，并在写回时分配新代际。
 func (st *SawtoothTrigger) UpdatePressureBaselineForRequest(threadID string, generation uint64, totalInputTokens, messageCount int, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint string) bool {
+	return st.updatePressureBaselineForRequest(threadID, generation, totalInputTokens, messageCount, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint, false)
+}
+
+// UpdatePressureFloorForRequest 保存与原始请求坐标绑定的保守压力高水位。
+// 它用于 forwarded 历史被改写、上游 actual 不能冒充精确 raw baseline 的场景；
+// 后续决策只能用它抬高 pressure，绝不能让它压低完整本地估算。
+func (st *SawtoothTrigger) UpdatePressureFloorForRequest(threadID string, generation uint64, pressureFloor, messageCount int, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint string) bool {
+	return st.updatePressureBaselineForRequest(threadID, generation, pressureFloor, messageCount, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint, true)
+}
+
+func (st *SawtoothTrigger) updatePressureBaselineForRequest(threadID string, generation uint64, totalInputTokens, messageCount int, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint string, conservative bool) bool {
+	st.mu.RLock()
+	threadID = st.resolveStateKeyLocked(threadID)
+	st.mu.RUnlock()
 	systemFingerprint = sanitizePressureFingerprint(systemFingerprint)
 	toolsFingerprint = sanitizePressureFingerprint(toolsFingerprint)
 	messagesPrefixFingerprint = sanitizePressureFingerprint(messagesPrefixFingerprint)
@@ -837,6 +1107,7 @@ func (st *SawtoothTrigger) UpdatePressureBaselineForRequest(threadID string, gen
 		systemFingerprint = ""
 		toolsFingerprint = ""
 		messagesPrefixFingerprint = ""
+		conservative = false
 	}
 
 	state := persistedState{
@@ -845,6 +1116,7 @@ func (st *SawtoothTrigger) UpdatePressureBaselineForRequest(threadID string, gen
 		SystemFingerprint:         systemFingerprint,
 		ToolsFingerprint:          toolsFingerprint,
 		MessagesPrefixFingerprint: messagesPrefixFingerprint,
+		Conservative:              conservative,
 	}
 	data, marshalErr := json.Marshal(state)
 	persistLock := st.pressurePersistLock(threadID)
@@ -869,6 +1141,7 @@ func (st *SawtoothTrigger) UpdatePressureBaselineForRequest(threadID string, gen
 		st.systemFingerprints[threadID] = systemFingerprint
 		st.toolsFingerprints[threadID] = toolsFingerprint
 		st.messagesPrefixFingerprints[threadID] = messagesPrefixFingerprint
+		st.conservativeBaselines[threadID] = conservative
 		st.lastRequestTime[threadID] = time.Now()
 	} else {
 		delete(st.lastTotalTokens, threadID)
@@ -876,14 +1149,19 @@ func (st *SawtoothTrigger) UpdatePressureBaselineForRequest(threadID string, gen
 		delete(st.systemFingerprints, threadID)
 		delete(st.toolsFingerprints, threadID)
 		delete(st.messagesPrefixFingerprints, threadID)
+		delete(st.conservativeBaselines, threadID)
 		delete(st.lastRequestTime, threadID)
 	}
 	st.loadedFromDB[threadID] = true
+	if st.persistFn != nil {
+		st.stateFoundDB[threadID] = true
+	}
 	st.baselineGeneration[threadID]++
 	if st.loadingFromDB[threadID] != nil {
 		st.loadedFromDB[threadID] = false
 	}
 	persistFn := st.persistFn
+	st.mirrorCurrentAliasesLocked(threadID)
 	st.mu.Unlock()
 	if persistFn != nil && marshalErr == nil {
 		persistFn("sawtooth:"+threadID, string(data))
@@ -893,6 +1171,7 @@ func (st *SawtoothTrigger) UpdatePressureBaselineForRequest(threadID string, gen
 
 func (st *SawtoothTrigger) pressurePersistLock(threadID string) *sync.Mutex {
 	st.mu.Lock()
+	threadID = st.resolveStateKeyLocked(threadID)
 	lock := st.baselinePersistLocks[threadID]
 	if lock == nil {
 		lock = &sync.Mutex{}
@@ -914,7 +1193,9 @@ func sanitizePressureFingerprint(fingerprint string) string {
 func (st *SawtoothTrigger) IncrementRequestSeq(threadID string) int {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	threadID = st.resolveStateKeyLocked(threadID)
 	st.requestSeq[threadID]++
+	st.mirrorCurrentAliasesLocked(threadID)
 	return st.requestSeq[threadID]
 }
 
@@ -922,6 +1203,7 @@ func (st *SawtoothTrigger) IncrementRequestSeq(threadID string) int {
 func (st *SawtoothTrigger) GetRequestSeq(threadID string) int {
 	st.mu.RLock()
 	defer st.mu.RUnlock()
+	threadID = st.resolveStateKeyLocked(threadID)
 	return st.requestSeq[threadID]
 }
 
@@ -937,6 +1219,7 @@ func (st *SawtoothTrigger) SetPauseThreshold(pauseThreshold time.Duration) {
 // 每个 thread 在冷启动时仅调用一次（由 ShouldTrigger 触发 lazy-load）。
 func (st *SawtoothTrigger) loadSawtoothFromDB(threadID string) {
 	st.mu.Lock()
+	threadID = st.resolveStateKeyLocked(threadID)
 	if st.loadedFromDB[threadID] {
 		st.mu.Unlock()
 		return
@@ -956,6 +1239,11 @@ func (st *SawtoothTrigger) loadSawtoothFromDB(threadID string) {
 	valid := false
 	if loadFn != nil {
 		raw, ok := loadFn("sawtooth:" + threadID)
+		if ok && raw != "" {
+			st.mu.Lock()
+			st.stateFoundDB[threadID] = true
+			st.mu.Unlock()
+		}
 		if ok && raw != "" && json.Unmarshal([]byte(raw), &state) == nil && state.Tokens > 0 && state.MsgCount >= 0 {
 			state.SystemFingerprint = sanitizePressureFingerprint(state.SystemFingerprint)
 			state.ToolsFingerprint = sanitizePressureFingerprint(state.ToolsFingerprint)
@@ -973,6 +1261,8 @@ func (st *SawtoothTrigger) loadSawtoothFromDB(threadID string) {
 			st.systemFingerprints[threadID] = state.SystemFingerprint
 			st.toolsFingerprints[threadID] = state.ToolsFingerprint
 			st.messagesPrefixFingerprints[threadID] = state.MessagesPrefixFingerprint
+			st.conservativeBaselines[threadID] = state.Conservative
+			st.mirrorCurrentAliasesLocked(threadID)
 			applied = true
 		}
 	}
@@ -985,7 +1275,6 @@ func (st *SawtoothTrigger) loadSawtoothFromDB(threadID string) {
 
 	if applied {
 		slog.Info("从 SQLite 恢复 Sawtooth 状态",
-			"thread_id", threadID,
 			"tokens", state.Tokens,
 			"msg_count", state.MsgCount,
 		)
