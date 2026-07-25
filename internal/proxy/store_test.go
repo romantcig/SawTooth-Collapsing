@@ -6,9 +6,281 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"sync"
 	"testing"
 )
+
+func TestSQLiteStoreMigrationPreservesArchiveVisibilityData(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy-visibility.db")
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("打开旧库失败: %v", err)
+	}
+	_, err = legacy.Exec(`CREATE TABLE archive_blocks (
+		id TEXT PRIMARY KEY,
+		session_id TEXT NOT NULL,
+		block_range_start INTEGER NOT NULL,
+		block_range_end INTEGER NOT NULL,
+		message_count INTEGER NOT NULL,
+		estimated_tokens INTEGER NOT NULL,
+		messages_json TEXT NOT NULL,
+		summary_text TEXT NOT NULL,
+		created_at TEXT NOT NULL,
+		content_hash TEXT
+	);
+	CREATE TABLE archive_keywords (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		block_id TEXT NOT NULL REFERENCES archive_blocks(id),
+		keyword TEXT NOT NULL,
+		source TEXT NOT NULL
+	);
+	INSERT INTO archive_blocks VALUES
+		('legacy-visible', 'legacy-session', 1, 4, 4, 17,
+		 '[{"role":"user","content":{"keep":"exact bytes"}}]',
+		 'legacy summary', '2026-01-01', 'legacy-content-hash');
+	INSERT INTO archive_keywords(block_id, keyword, source)
+	VALUES ('legacy-visible', 'needle', 'user_message');`)
+	if err != nil {
+		legacy.Close()
+		t.Fatalf("构造旧 Archive schema 失败: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("关闭旧库失败: %v", err)
+	}
+
+	for open := 1; open <= 2; open++ {
+		store, err := NewSQLiteStore(dbPath)
+		if err != nil {
+			t.Fatalf("第 %d 次迁移旧库失败: %v", open, err)
+		}
+
+		var messagesJSON, contentHash string
+		var historyEpoch uint64
+		var isolated int
+		if err := store.db.QueryRow(`SELECT messages_json, content_hash, history_epoch, isolated
+			FROM archive_blocks WHERE id = 'legacy-visible'`).Scan(&messagesJSON, &contentHash, &historyEpoch, &isolated); err != nil {
+			store.Close()
+			t.Fatalf("读取迁移后 Archive 失败: %v", err)
+		}
+		if messagesJSON != `[{"role":"user","content":{"keep":"exact bytes"}}]` || contentHash != "legacy-content-hash" {
+			store.Close()
+			t.Fatalf("迁移重写旧 Archive bytes/hash: messages=%q hash=%q", messagesJSON, contentHash)
+		}
+		if historyEpoch != 1 || isolated != 0 {
+			store.Close()
+			t.Fatalf("旧 Archive 默认 visibility=%d/%d, want epoch=1 isolated=0", historyEpoch, isolated)
+		}
+		var keywordCount int
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM archive_keywords
+			WHERE block_id = 'legacy-visible' AND keyword = 'needle' AND source = 'user_message'`).Scan(&keywordCount); err != nil {
+			store.Close()
+			t.Fatalf("读取迁移后关键词失败: %v", err)
+		}
+		if keywordCount != 1 {
+			store.Close()
+			t.Fatalf("迁移改变关键词行数: %d", keywordCount)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("第 %d 次关闭迁移库失败: %v", open, err)
+		}
+	}
+}
+
+func TestSQLiteStoreCommitHistoryTransitionIsolatesArchiveSuffix(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "history-transition.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	blocks := []ArchiveBlock{
+		archiveRangeTestBlock("before", "branch-session", 0, 2, 1, "before-only"),
+		archiveRangeTestBlock("cross", "branch-session", 1, 3, 1, "cross-boundary"),
+		archiveRangeTestBlock("after", "branch-session", 3, 5, 1, "after-only"),
+		archiveRangeTestBlock("other-session", "other-session", 3, 5, 1, "other-session"),
+	}
+	for _, block := range blocks {
+		if err := store.SaveArchive(block); err != nil {
+			t.Fatalf("SaveArchive(%s): %v", block.ID, err)
+		}
+	}
+
+	const stateKey = "history_epoch:stable-session-hash"
+	const stateValue = `{"version":1,"epoch":2}`
+	if err := store.CommitHistoryTransition(HistoryTransition{
+		SessionID:    "branch-session",
+		StateKey:     stateKey,
+		StateValue:   stateValue,
+		CommonPrefix: 3,
+	}); err != nil {
+		t.Fatalf("CommitHistoryTransition: %v", err)
+	}
+	if got, ok := store.LoadState(stateKey); !ok || got != stateValue {
+		t.Fatalf("history state 未随 transition 提交: got=%q ok=%v", got, ok)
+	}
+
+	rows, err := store.db.Query(`SELECT id, isolated FROM archive_blocks ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	got := make(map[string]int)
+	for rows.Next() {
+		var id string
+		var isolated int
+		if err := rows.Scan(&id, &isolated); err != nil {
+			t.Fatal(err)
+		}
+		got[id] = isolated
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{"before": 0, "cross": 1, "after": 1, "other-session": 0}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Archive isolation=%v, want %v", got, want)
+	}
+
+	var beforeJSON, crossJSON, afterJSON string
+	if err := store.db.QueryRow(`SELECT
+		MAX(CASE WHEN id='before' THEN messages_json END),
+		MAX(CASE WHEN id='cross' THEN messages_json END),
+		MAX(CASE WHEN id='after' THEN messages_json END)
+		FROM archive_blocks`).Scan(&beforeJSON, &crossJSON, &afterJSON); err != nil {
+		t.Fatal(err)
+	}
+	if beforeJSON == "" || crossJSON == "" || afterJSON == "" {
+		t.Fatalf("transition 删除或裁剪 Archive messages: before=%q cross=%q after=%q", beforeJSON, crossJSON, afterJSON)
+	}
+}
+
+func TestSQLiteStoreCommitHistoryTransitionCommonPrefixZeroIsolatesAll(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "history-transition-zero.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, block := range []ArchiveBlock{
+		archiveRangeTestBlock("first", "zero-session", 0, 0, 1, "first"),
+		archiveRangeTestBlock("later", "zero-session", 1, 2, 1, "later"),
+	} {
+		if err := store.SaveArchive(block); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.CommitHistoryTransition(HistoryTransition{
+		SessionID: "zero-session", StateKey: "history_epoch:zero", StateValue: `{}`, CommonPrefix: 0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var visible int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM archive_blocks WHERE isolated = 0`).Scan(&visible); err != nil {
+		t.Fatal(err)
+	}
+	if visible != 0 {
+		t.Fatalf("commonPrefix=0 后仍有 %d 个可见 Archive", visible)
+	}
+}
+
+func TestSQLiteStoreCommitHistoryTransitionRollsBackStateAndVisibility(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "history-transition-rollback.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.SaveArchive(archiveRangeTestBlock("rollback", "rollback-session", 1, 4, 1, "rollback")); err != nil {
+		t.Fatal(err)
+	}
+	const stateKey = "history_epoch:rollback"
+	if err := store.PersistState(stateKey, "old-state"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`CREATE TRIGGER fail_history_archive_isolation
+		BEFORE UPDATE OF isolated ON archive_blocks
+		BEGIN SELECT RAISE(ABORT, 'forced archive isolation failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	err = store.CommitHistoryTransition(HistoryTransition{
+		SessionID: "rollback-session", StateKey: stateKey, StateValue: "new-state", CommonPrefix: 2,
+	})
+	if err == nil {
+		t.Fatal("Archive isolation 故障时 transition 应失败")
+	}
+	if got, ok := store.LoadState(stateKey); !ok || got != "old-state" {
+		t.Fatalf("失败 transition 部分提交了 state: got=%q ok=%v", got, ok)
+	}
+	var isolated int
+	if err := store.db.QueryRow(`SELECT isolated FROM archive_blocks WHERE id='rollback'`).Scan(&isolated); err != nil {
+		t.Fatal(err)
+	}
+	if isolated != 0 {
+		t.Fatalf("失败 transition 部分提交了 visibility: isolated=%d", isolated)
+	}
+}
+
+func TestSearchArchivesVisibleGateAppliesBeforeLimit(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "visible-search.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	isolated := archiveRangeTestBlock("isolated-top", "branch-session", 2, 5, 1, "isolated")
+	isolated.Keywords = []KeywordEntry{{Word: "quasar", Source: "user_message"}, {Word: "nebula", Source: "user_message"}}
+	visible := archiveRangeTestBlock("visible-second", "branch-session", 0, 1, 2, "visible")
+	visible.Keywords = []KeywordEntry{{Word: "quasar", Source: "user_message"}}
+	noise := archiveRangeTestBlock("noise", "branch-session", 0, 1, 2, "noise")
+	noise.Keywords = []KeywordEntry{{Word: "pulsar", Source: "user_message"}, {Word: "comet", Source: "user_message"}}
+	for _, block := range []ArchiveBlock{isolated, visible, noise} {
+		if err := store.SaveArchive(block); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.db.Exec(`UPDATE archive_blocks SET isolated = 1 WHERE id = 'isolated-top'`); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := store.SearchArchives(`"quasar" OR "nebula"`, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].ID != "visible-second" {
+		t.Fatalf("SQL visibility gate 未在 LIMIT 前生效: %+v", results)
+	}
+}
+
+func TestSaveArchivePersistsHistoryEpoch(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "archive-epoch.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	block := archiveRangeTestBlock("epoch-seven", "epoch-session", 1, 2, 7, "epoch")
+	if err := store.SaveArchive(block); err != nil {
+		t.Fatal(err)
+	}
+	var epoch uint64
+	if err := store.db.QueryRow(`SELECT history_epoch FROM archive_blocks WHERE id='epoch-seven'`).Scan(&epoch); err != nil {
+		t.Fatal(err)
+	}
+	if epoch != 7 {
+		t.Fatalf("保存 Archive epoch=%d, want 7", epoch)
+	}
+}
+
+func archiveRangeTestBlock(id, sessionID string, start, end int, epoch uint64, text string) ArchiveBlock {
+	keywords := []KeywordEntry{{Word: text, Source: "user_message"}}
+	sort.Slice(keywords, func(i, j int) bool { return keywords[i].Word < keywords[j].Word })
+	return ArchiveBlock{
+		ID: id, SessionID: sessionID, HistoryEpoch: epoch,
+		BlockRangeStart: start, BlockRangeEnd: end,
+		MessageCount: end - start + 1, EstimatedTokens: 10,
+		Messages:    []Message{{Role: "user", Content: mustMarshal(text)}},
+		SummaryText: text, Keywords: keywords,
+	}
+}
 
 func TestSQLiteStoreMigrationPreservesLegacyDuplicateRows(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "legacy.db")
