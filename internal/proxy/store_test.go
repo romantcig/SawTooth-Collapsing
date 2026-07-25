@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"sync"
 	"testing"
 )
@@ -272,7 +271,6 @@ func TestSaveArchivePersistsHistoryEpoch(t *testing.T) {
 
 func archiveRangeTestBlock(id, sessionID string, start, end int, epoch uint64, text string) ArchiveBlock {
 	keywords := []KeywordEntry{{Word: text, Source: "user_message"}}
-	sort.Slice(keywords, func(i, j int) bool { return keywords[i].Word < keywords[j].Word })
 	return ArchiveBlock{
 		ID: id, SessionID: sessionID, HistoryEpoch: epoch,
 		BlockRangeStart: start, BlockRangeEnd: end,

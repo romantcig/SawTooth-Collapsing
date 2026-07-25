@@ -23,6 +23,7 @@ type SQLiteStore struct {
 type ArchiveBlock struct {
 	ID              string         `json:"id"`
 	SessionID       string         `json:"session_id"`
+	HistoryEpoch    uint64         `json:"history_epoch"`
 	ContentHash     string         `json:"content_hash"`
 	BlockRangeStart int            `json:"block_range_start"`
 	BlockRangeEnd   int            `json:"block_range_end"`
@@ -56,6 +57,16 @@ type ArchiveSummary struct {
 type KeywordEntry struct {
 	Word   string `json:"word"`
 	Source string `json:"source"` // 取值: "file_path"、"tool_name"、"user_message"
+}
+
+// HistoryTransition 描述一次需要原子提交的 history epoch 切换。
+// SessionID 仅用于隔离该会话的 Archive；StateKey 使用稳定 session hash，
+// StateValue 只允许包含无正文的 epoch 状态。
+type HistoryTransition struct {
+	SessionID    string
+	StateKey     string
+	StateValue   string
+	CommonPrefix int
 }
 
 // NewSQLiteStore 打开或创建指定路径的 SQLite 数据库。
@@ -119,7 +130,8 @@ func tryInitDB(path string) (*SQLiteStore, error) {
 // createSchema 创建全部表、索引、FTS5 虚拟表及触发器。
 // 所有 DDL 使用 IF NOT EXISTS，幂等执行。
 func (s *SQLiteStore) createSchema() error {
-	// 存档块主表。content_hash 对新库直接创建；旧库由下方显式迁移补列。
+	// 存档块主表。content_hash/history_epoch/isolated 对新库直接创建；
+	// 旧库由下方显式迁移补列，旧行不做 UPDATE 回填或正文重写。
 	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS archive_blocks (
 			id               TEXT PRIMARY KEY,
 			session_id       TEXT NOT NULL,
@@ -130,17 +142,22 @@ func (s *SQLiteStore) createSchema() error {
 			messages_json    TEXT NOT NULL,
 			summary_text     TEXT NOT NULL,
 			created_at       TEXT NOT NULL DEFAULT (datetime('now')),
-			content_hash     TEXT
+			content_hash     TEXT,
+			history_epoch   INTEGER NOT NULL DEFAULT 1,
+			isolated        INTEGER NOT NULL DEFAULT 0 CHECK (isolated IN (0, 1))
 		)`); err != nil {
 		return fmt.Errorf("执行 schema 失败: %w", err)
 	}
-	if err := s.ensureArchiveContentHashSchema(); err != nil {
+	if err := s.ensureArchiveSchema(); err != nil {
 		return err
 	}
 
 	schema := []string{
 		`CREATE INDEX IF NOT EXISTS idx_archive_blocks_session
 		 ON archive_blocks(session_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_archive_blocks_visible_session_range
+		 ON archive_blocks(session_id, block_range_end)
+		 WHERE isolated = 0`,
 
 		// 关键词表
 		`CREATE TABLE IF NOT EXISTS archive_keywords (
@@ -195,14 +212,15 @@ func (s *SQLiteStore) createSchema() error {
 	return nil
 }
 
-// ensureArchiveContentHashSchema 为旧 archive_blocks 表幂等补充内容指纹。
-// 旧行保持 NULL，不回填也不清理；partial unique index 只约束新写入的非空 hash。
-func (s *SQLiteStore) ensureArchiveContentHashSchema() error {
+// ensureArchiveSchema 为旧 archive_blocks 表幂等补充内容指纹、epoch 与可见性列。
+// 旧行保持原始 bytes/hash/关键词，不执行 UPDATE 或清理；SQLite DEFAULT 仅让旧行
+// 在读取时表现为 epoch 1、可见。partial unique index 只约束新写入的非空 hash。
+func (s *SQLiteStore) ensureArchiveSchema() error {
 	rows, err := s.db.Query(`PRAGMA table_info(archive_blocks)`)
 	if err != nil {
 		return fmt.Errorf("读取 archive_blocks schema 失败: %w", err)
 	}
-	hasContentHash := false
+	columns := make(map[string]bool)
 	for rows.Next() {
 		var cid, notNull, primaryKey int
 		var name, columnType string
@@ -211,9 +229,7 @@ func (s *SQLiteStore) ensureArchiveContentHashSchema() error {
 			rows.Close()
 			return fmt.Errorf("扫描 archive_blocks schema 失败: %w", err)
 		}
-		if name == "content_hash" {
-			hasContentHash = true
-		}
+		columns[name] = true
 	}
 	if err := rows.Close(); err != nil {
 		return fmt.Errorf("关闭 archive_blocks schema 查询失败: %w", err)
@@ -222,9 +238,19 @@ func (s *SQLiteStore) ensureArchiveContentHashSchema() error {
 		return fmt.Errorf("遍历 archive_blocks schema 失败: %w", err)
 	}
 
-	if !hasContentHash {
+	if !columns["content_hash"] {
 		if _, err := s.db.Exec(`ALTER TABLE archive_blocks ADD COLUMN content_hash TEXT`); err != nil {
 			return fmt.Errorf("迁移 archive_blocks.content_hash 失败: %w", err)
+		}
+	}
+	if !columns["history_epoch"] {
+		if _, err := s.db.Exec(`ALTER TABLE archive_blocks ADD COLUMN history_epoch INTEGER NOT NULL DEFAULT 1`); err != nil {
+			return fmt.Errorf("迁移 archive_blocks.history_epoch 失败: %w", err)
+		}
+	}
+	if !columns["isolated"] {
+		if _, err := s.db.Exec(`ALTER TABLE archive_blocks ADD COLUMN isolated INTEGER NOT NULL DEFAULT 0 CHECK (isolated IN (0, 1))`); err != nil {
+			return fmt.Errorf("迁移 archive_blocks.isolated 失败: %w", err)
 		}
 	}
 
@@ -254,16 +280,21 @@ func (s *SQLiteStore) SaveArchive(block ArchiveBlock) error {
 	if err != nil {
 		return err
 	}
+	historyEpoch := block.HistoryEpoch
+	if historyEpoch == 0 {
+		historyEpoch = 1
+	}
 
 	result, err := tx.Exec(
 		`INSERT INTO archive_blocks
 		 (id, session_id, block_range_start, block_range_end,
-		  message_count, estimated_tokens, messages_json, summary_text, created_at, content_hash)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
+		  message_count, estimated_tokens, messages_json, summary_text, created_at, content_hash,
+		  history_epoch, isolated)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, 0)
 		 ON CONFLICT DO NOTHING`,
 		block.ID, block.SessionID, block.BlockRangeStart, block.BlockRangeEnd,
 		block.MessageCount, block.EstimatedTokens,
-		string(messagesJSON), block.SummaryText, block.ContentHash,
+		string(messagesJSON), block.SummaryText, block.ContentHash, historyEpoch,
 	)
 	if err != nil {
 		return fmt.Errorf("插入 archive_block 失败: %w", err)
@@ -288,6 +319,47 @@ func (s *SQLiteStore) SaveArchive(block ArchiveBlock) error {
 	}
 
 	return tx.Commit()
+}
+
+// CommitHistoryTransition 在单一 SQLite transaction 内持久化 history state，
+// 并隔离同 session 中不完整位于 [0, commonPrefix) 的 Archive。
+// 只更新 visibility 标记，不删除、裁剪或重写 Archive 正文、hash 与关键词。
+func (s *SQLiteStore) CommitHistoryTransition(transition HistoryTransition) error {
+	if transition.SessionID == "" {
+		return errors.New("history transition 缺少 session")
+	}
+	if transition.StateKey == "" {
+		return errors.New("history transition 缺少 state key")
+	}
+	if transition.CommonPrefix < 0 {
+		return fmt.Errorf("history transition common prefix 无效: %d", transition.CommonPrefix)
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("开启 history transition 事务失败: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.Exec(
+		`INSERT OR REPLACE INTO frozen_state (key, value, updated_at)
+		 VALUES (?, ?, datetime('now'))`,
+		transition.StateKey, transition.StateValue,
+	); err != nil {
+		return fmt.Errorf("持久化 history transition 状态失败: %w", err)
+	}
+	if _, err := tx.Exec(
+		`UPDATE archive_blocks
+		 SET isolated = 1
+		 WHERE session_id = ? AND isolated = 0 AND block_range_end >= ?`,
+		transition.SessionID, transition.CommonPrefix,
+	); err != nil {
+		return fmt.Errorf("隔离 history transition Archive 失败: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交 history transition 事务失败: %w", err)
+	}
+	return nil
 }
 
 // PersistState 将 key-value 状态持久化到 frozen_state 表（Phase 4, D-08）。
@@ -358,6 +430,7 @@ func (s *SQLiteStore) SearchArchives(query string, limit int) ([]ArchiveSummary,
 		 FROM archive_blocks a
 		 JOIN archive_keywords k ON k.block_id = a.id
 		 JOIN matched fts ON fts.rowid = k.id
+		 WHERE a.isolated = 0
 		 GROUP BY a.id
 		 ORDER BY COUNT(DISTINCT fts.keyword) DESC, SUM(fts.rank) ASC, a.created_at DESC, a.id ASC
 		 LIMIT ?`,
