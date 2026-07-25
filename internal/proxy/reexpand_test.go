@@ -289,6 +289,106 @@ func TestSearchAndExpandRecoveryIntent(t *testing.T) {
 	}
 }
 
+func TestSearchAndExpandVisibilityGateBlocksIsolatedArchiveAcrossPaths(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "visibility-matrix.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	tc, err := NewTokenCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	commonPath := `C:\work\common.go`
+	mixedPath := `C:\work\mixed.go`
+	oldPath := `C:\work\old.go`
+	blocks := []ArchiveBlock{
+		{
+			ID: "common-visible", SessionID: "visibility-session", HistoryEpoch: 1,
+			BlockRangeStart: 0, BlockRangeEnd: 1, MessageCount: 2, EstimatedTokens: 40,
+			Messages:    []Message{{Role: "user", Content: mustMarshal("common raw detail")}},
+			SummaryText: "common visible archive", Keywords: []KeywordEntry{{Word: commonPath, Source: "file_path"}},
+		},
+		{
+			ID: "mixed-isolated", SessionID: "visibility-session", HistoryEpoch: 1,
+			BlockRangeStart: 1, BlockRangeEnd: 2, MessageCount: 2, EstimatedTokens: 40,
+			Messages:    []Message{{Role: "user", Content: mustMarshal("mixed secret detail")}},
+			SummaryText: "mixed isolated archive", Keywords: []KeywordEntry{{Word: mixedPath, Source: "file_path"}},
+		},
+		{
+			ID: "old-isolated", SessionID: "visibility-session", HistoryEpoch: 1,
+			BlockRangeStart: 3, BlockRangeEnd: 5, MessageCount: 3, EstimatedTokens: 40,
+			Messages:    []Message{{Role: "user", Content: mustMarshal("old secret detail")}},
+			SummaryText: "old isolated archive", Keywords: []KeywordEntry{{Word: oldPath, Source: "file_path"}},
+		},
+	}
+	for _, block := range blocks {
+		if err := store.SaveArchive(block); err != nil {
+			t.Fatalf("SaveArchive(%s): %v", block.ID, err)
+		}
+	}
+	if err := store.CommitHistoryTransition(HistoryTransition{
+		SessionID: "visibility-session", StateKey: "history_epoch:visibility", StateValue: `{"epoch":2}`, CommonPrefix: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("common prefix recovery remains visible", func(t *testing.T) {
+		messages := []Message{{Role: "user", Content: mustRawJSON(t, "restore archive from "+commonPath)}}
+		outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "visibility-session")
+		if outcome.Injected != 1 || outcome.Candidates != 1 {
+			t.Fatalf("common prefix outcome=%+v", outcome)
+		}
+		if payload := singleRecallPayload(t, outcome.Messages); !strings.Contains(payload, "common visible archive") {
+			t.Fatalf("common prefix payload=%q", payload)
+		}
+	})
+
+	t.Run("mixed recovery is invisible", func(t *testing.T) {
+		messages := []Message{{Role: "user", Content: mustRawJSON(t, "restore archive from "+mixedPath)}}
+		outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "visibility-session")
+		if !outcome.Attempted || outcome.Candidates != 0 || outcome.Selected != 0 || outcome.Injected != 0 {
+			t.Fatalf("mixed archive leaked through recovery: %+v", outcome)
+		}
+		if !reflect.DeepEqual(outcome.Messages, messages) {
+			t.Fatalf("mixed recovery changed messages: %+v", outcome.Messages)
+		}
+	})
+
+	t.Run("deep search old branch is invisible", func(t *testing.T) {
+		stub := "[tool result archived → deep_search('" + oldPath + "')]"
+		messages := []Message{
+			{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "text", Text: stub}})},
+			{Role: "user", Content: mustRawJSON(t, "please inspect "+oldPath)},
+		}
+		outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "visibility-session")
+		if !outcome.Attempted || outcome.Candidates != 0 || outcome.Injected != 0 {
+			t.Fatalf("old archive leaked through deep_search: %+v", outcome)
+		}
+		if !reflect.DeepEqual(outcome.Messages, messages) {
+			t.Fatalf("old deep_search altered stub despite no visible candidate: %+v", outcome.Messages)
+		}
+	})
+
+	t.Run("isolated rows remain for offline inspection", func(t *testing.T) {
+		var count, isolated int
+		if err := store.db.QueryRow(`SELECT COUNT(*), SUM(isolated) FROM archive_blocks WHERE session_id='visibility-session'`).Scan(&count, &isolated); err != nil {
+			t.Fatal(err)
+		}
+		if count != 3 || isolated != 2 {
+			t.Fatalf("visibility migration deleted/changed rows: count=%d isolated=%d", count, isolated)
+		}
+		var messagesJSON string
+		if err := store.db.QueryRow(`SELECT messages_json FROM archive_blocks WHERE id='mixed-isolated'`).Scan(&messagesJSON); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(messagesJSON, "mixed secret detail") {
+			t.Fatalf("isolated archive body was rewritten: %q", messagesJSON)
+		}
+	})
+}
+
 func seedExactPathRecallStore(t *testing.T) (*SQLiteStore, *TokenCounter, string) {
 	t.Helper()
 	tc, err := NewTokenCounter()

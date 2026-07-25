@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -383,6 +385,141 @@ func TestHistoryEpochStateIsolationAndLateResponse(t *testing.T) {
 	}
 	if trigger.PressureBaseline(old.StateKey).ActualTokens != 88_000 {
 		t.Fatal("旧 epoch baseline unexpectedly mutated")
+	}
+}
+
+func TestHistoryEpochArchiveTransitionPublishesAfterSQLiteCommit(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "epoch-archive.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	manager := NewHistoryEpochManager()
+	manager.SetPersistFunc(func(key, value string) { _ = store.PersistState(key, value) })
+	manager.SetLoadFunc(store.LoadState)
+	manager.SetTransitionFunc(store.CommitHistoryTransition)
+	base := historyTextMessages("zero", "one", "two", "three")
+	initial := manager.Begin("epoch-archive-session", base)
+	if initial.Epoch != 1 || initial.TransitionFailed {
+		t.Fatalf("initial decision=%+v", initial)
+	}
+	for _, block := range []ArchiveBlock{
+		{ID: "common-prefix", SessionID: "epoch-archive-session", HistoryEpoch: initial.Epoch, BlockRangeStart: 0, BlockRangeEnd: 1, MessageCount: 2, SummaryText: "common", Keywords: []KeywordEntry{{Word: "common", Source: "user_message"}}},
+		{ID: "mixed-branch", SessionID: "epoch-archive-session", HistoryEpoch: initial.Epoch, BlockRangeStart: 1, BlockRangeEnd: 2, MessageCount: 2, SummaryText: "mixed", Keywords: []KeywordEntry{{Word: "mixed", Source: "user_message"}}},
+	} {
+		if err := store.SaveArchive(block); err != nil {
+			t.Fatalf("SaveArchive(%s): %v", block.ID, err)
+		}
+	}
+	branched := deepCopyMessages(base)
+	branched[2].Content = mustMarshal("edited-two")
+	current := manager.Begin("epoch-archive-session", branched)
+	if current.Epoch != 2 || !current.EpochChanged || current.TransitionFailed || current.CommonPrefix != 2 {
+		t.Fatalf("branch decision=%+v", current)
+	}
+	if !manager.IsCurrent("epoch-archive-session", current.Epoch) || manager.IsCurrent("epoch-archive-session", initial.Epoch) {
+		t.Fatalf("manager current epoch gate failed: initial=%+v current=%+v", initial, current)
+	}
+
+	var commonIsolated, mixedIsolated int
+	if err := store.db.QueryRow(`SELECT isolated FROM archive_blocks WHERE id='common-prefix'`).Scan(&commonIsolated); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT isolated FROM archive_blocks WHERE id='mixed-branch'`).Scan(&mixedIsolated); err != nil {
+		t.Fatal(err)
+	}
+	if commonIsolated != 0 || mixedIsolated != 1 {
+		t.Fatalf("transition visibility=%d/%d, want common=0 mixed=1", commonIsolated, mixedIsolated)
+	}
+	state, ok := store.LoadState(historyEpochPersistenceKey("epoch-archive-session"))
+	if !ok || !strings.Contains(state, `"epoch":2`) {
+		t.Fatalf("SQLite 未提交 current epoch state: %q ok=%v", state, ok)
+	}
+}
+
+func TestHistoryEpochTransitionFailureDoesNotPublishOrReadOldArchive(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "epoch-archive-failure.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	manager := NewHistoryEpochManager()
+	manager.SetPersistFunc(func(key, value string) { _ = store.PersistState(key, value) })
+	manager.SetLoadFunc(store.LoadState)
+	manager.SetTransitionFunc(func(HistoryTransition) error {
+		return fmt.Errorf("forced transition failure")
+	})
+	base := historyTextMessages("zero", "one", "two")
+	initial := manager.Begin("failed-transition-session", base)
+	if err := store.SaveArchive(ArchiveBlock{
+		ID: "old-branch", SessionID: "failed-transition-session", HistoryEpoch: initial.Epoch,
+		BlockRangeStart: 0, BlockRangeEnd: 2, MessageCount: 3, SummaryText: "old branch",
+		Keywords: []KeywordEntry{{Word: "old", Source: "user_message"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	branched := deepCopyMessages(base)
+	branched[1].Content = mustMarshal("new branch")
+	failed := manager.Begin("failed-transition-session", branched)
+	if !failed.TransitionFailed || failed.Reason != HistoryEpochReasonTransitionFailed || !failed.EpochChanged || failed.Epoch != initial.Epoch+1 {
+		t.Fatalf("failed transition decision=%+v", failed)
+	}
+	if !manager.IsCurrent("failed-transition-session", initial.Epoch) || manager.IsCurrent("failed-transition-session", failed.Epoch) {
+		t.Fatalf("failed transition published epoch: initial=%+v failed=%+v", initial, failed)
+	}
+	if _, ok := store.LoadState(historyEpochStateKey("failed-transition-session", failed.Epoch)); ok {
+		t.Fatal("failed transition wrote target epoch state")
+	}
+	var isolated int
+	if err := store.db.QueryRow(`SELECT isolated FROM archive_blocks WHERE id='old-branch'`).Scan(&isolated); err != nil {
+		t.Fatal(err)
+	}
+	if isolated != 0 {
+		t.Fatalf("failed transition changed old Archive visibility: %d", isolated)
+	}
+
+	// The manager keeps the old state, so the same branch must retry rather than
+	// silently accepting a stale target or reading a partially published epoch.
+	retry := manager.Begin("failed-transition-session", branched)
+	if !retry.TransitionFailed || retry.Epoch != failed.Epoch || retry.StateKey != failed.StateKey {
+		t.Fatalf("failed transition retry=%+v, first=%+v", retry, failed)
+	}
+}
+
+func TestHistoryEpochTransitionCarriesOnlyStableState(t *testing.T) {
+	manager := NewHistoryEpochManager()
+	var transition HistoryTransition
+	manager.SetTransitionFunc(func(got HistoryTransition) error {
+		transition = got
+		return nil
+	})
+	manager.SetPersistFunc(func(key, value string) {
+		if strings.Contains(key, "session-with-sensitive") || strings.Contains(value, "zero") {
+			t.Fatalf("transition persistence leaked sensitive history: key=%q value=%q", key, value)
+		}
+	})
+	base := historyTextMessages("zero", "one")
+	manager.Begin("session-with-sensitive", base)
+	changed := deepCopyMessages(base)
+	changed[0].Content = mustMarshal("secret body")
+	decision := manager.Begin("session-with-sensitive", changed)
+	if decision.TransitionFailed || transition.SessionID != "session-with-sensitive" || transition.CommonPrefix != 0 {
+		t.Fatalf("transition=%+v decision=%+v", transition, decision)
+	}
+	if strings.Contains(transition.StateKey, "session-with-sensitive") || strings.Contains(transition.StateValue, "secret body") {
+		t.Fatalf("transition carried identity/body: %+v", transition)
+	}
+	var persisted historyEpochPersisted
+	if err := json.Unmarshal([]byte(transition.StateValue), &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Epoch != decision.Epoch || !persisted.Valid || len(persisted.InputMessageHashes) != len(changed) {
+		t.Fatalf("transition state=%+v decision=%+v", persisted, decision)
+	}
+	if len(persisted.RecentMismatchDigests) != 1 {
+		t.Fatalf("unexpected mismatch state=%+v", persisted)
 	}
 }
 
