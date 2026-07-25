@@ -18,8 +18,11 @@ type requestMeta struct {
 	HistoryEpoch            uint64
 	HistoryStateKey         string
 	HistoryEpochReason      HistoryEpochReason
+	HistoryCommonPrefix     int
 	HistoryReuseSafe        bool
 	HistoryEpochChanged     bool
+	HistoryMismatch         bool
+	HistoryMismatchFirst    bool
 	HistoryTransitionFailed bool
 	OriginalMessageCount    int
 	Logger                  *slog.Logger

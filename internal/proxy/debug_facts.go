@@ -48,6 +48,12 @@ type debugFact struct {
 	CacheCreationInputTokens  int                       `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens      int                       `json:"cache_read_input_tokens"`
 	TotalInputTokens          int                       `json:"total_input_tokens"`
+	HistoryEpoch              *uint64                   `json:"history_epoch,omitempty"`
+	HistoryCommonPrefix       *int                      `json:"history_common_prefix,omitempty"`
+	HistoryTransitionReason   *HistoryEpochReason       `json:"history_transition_reason,omitempty"`
+	HistoryEpochChanged       *bool                     `json:"history_epoch_changed,omitempty"`
+	HistoryMismatchFirst      *bool                     `json:"history_mismatch_first,omitempty"`
+	HistoryTransitionFailed   *bool                     `json:"history_transition_failed,omitempty"`
 	MessagesLocalTokens       *int                      `json:"messages_local_tokens,omitempty"`
 	SystemLocalTokens         *int                      `json:"system_local_tokens,omitempty"`
 	ToolsLocalTokens          *int                      `json:"tools_local_tokens,omitempty"`
@@ -84,6 +90,7 @@ func (s *Server) writeRequestDebugFacts(meta *requestMeta, timestamp time.Time, 
 			ModelFamily: agentModelFamilyUnknown,
 			AgentRole:   agentRoleUnknown,
 		}
+		populateHistoryDebugFact(meta, &fact)
 		var bodyMap map[string]json.RawMessage
 		if err := json.Unmarshal(body, &bodyMap); err != nil {
 			fact.Error = debugErrorInvalidJSON
@@ -146,6 +153,7 @@ func (s *Server) writePressureDecisionDebugFacts(meta *requestMeta, timestamp ti
 			SystemFingerprintChanged: &decision.SystemFingerprintChanged,
 			ToolsFingerprintChanged:  &decision.ToolsFingerprintChanged,
 		}
+		populateHistoryDebugFact(meta, &fact)
 		s.writeDebugFact(meta, fact)
 	})
 }
@@ -175,8 +183,37 @@ func (s *Server) writeUsageDebugFacts(meta *requestMeta, timestamp time.Time, us
 			actualMinusSelected := saturatingSubtract(actual, meta.PressureDecision.SelectedPressure)
 			fact.ActualMinusSelectedTokens = &actualMinusSelected
 		}
+		populateHistoryDebugFact(meta, &fact)
 		s.writeDebugFact(meta, fact)
 	})
+}
+
+// populateHistoryDebugFact 只把 request-scoped 数字、布尔值和受限枚举复制到
+// facts。HistoryStateKey、session hash、canonical hash 与 dedup digest 均不在接口中。
+func populateHistoryDebugFact(meta *requestMeta, fact *debugFact) {
+	if meta == nil || fact == nil || meta.HistoryEpoch == 0 {
+		return
+	}
+	epoch := meta.HistoryEpoch
+	fact.HistoryEpoch = &epoch
+	if meta.HistoryCommonPrefix >= 0 {
+		commonPrefix := meta.HistoryCommonPrefix
+		fact.HistoryCommonPrefix = &commonPrefix
+	}
+	if validHistoryEpochReason(meta.HistoryEpochReason) {
+		reason := meta.HistoryEpochReason
+		fact.HistoryTransitionReason = &reason
+	}
+	epochChanged := meta.HistoryEpochChanged
+	fact.HistoryEpochChanged = &epochChanged
+	if meta.HistoryMismatch {
+		first := meta.HistoryMismatchFirst
+		fact.HistoryMismatchFirst = &first
+	}
+	if meta.HistoryTransitionFailed {
+		failed := true
+		fact.HistoryTransitionFailed = &failed
+	}
 }
 
 func debugFactArtifactStage(stage debugStage) (debugArtifactStage, bool) {

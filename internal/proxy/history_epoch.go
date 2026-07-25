@@ -201,7 +201,7 @@ func (m *HistoryEpochManager) Begin(sessionID string, messages []Message) Histor
 	}
 	next.RecentMismatchDigests = append([]string(nil), previous.RecentMismatchDigests...)
 	if decision.Reason == HistoryEpochReasonReuseChanged || decision.EpochChanged && previous.Epoch != 0 {
-		digest := historyMismatchDigest(previous, next, decision.CommonPrefix, decision.Reason)
+		digest := historyMismatchDigestForSession(sessionID, previous, next, decision.CommonPrefix, decision.Reason)
 		decision.FirstMismatch = !containsHistoryDigest(next.RecentMismatchDigests, digest)
 		if decision.FirstMismatch {
 			next.RecentMismatchDigests = append(next.RecentMismatchDigests, digest)
@@ -354,24 +354,75 @@ func historyEpochStateKey(sessionID string, epoch uint64) string {
 	return sessionID + historyEpochStateKeySeparator + strconv.FormatUint(epoch, 10)
 }
 
+// historyMismatchDigest 保留旧包内调用签名；生产判定必须使用
+// historyMismatchDigestForSession，把稳定 session hash 纳入精确四元组。
 func historyMismatchDigest(previous, current historyEpochPersisted, commonPrefix int, reason HistoryEpochReason) string {
+	return historyMismatchDigestForSession("", previous, current, commonPrefix, reason)
+}
+
+// historyMismatchDigestForSession 只对精确四元组
+// (sessionHash, cutoff, oldCanonicalHash, newCanonicalHash) 求摘要。
+// reason 仅用于选择 input-history 或 reuse-safety canonical hash，不进入 key；
+// 普通日志和 Debug facts 永远不会接收或输出该摘要。
+func historyMismatchDigestForSession(sessionID string, previous, current historyEpochPersisted, commonPrefix int, reason HistoryEpochReason) string {
+	oldCanonicalHash := previous.InputHash
+	newCanonicalHash := current.InputHash
+	if reason == HistoryEpochReasonReuseChanged {
+		oldCanonicalHash = previous.ReuseHash
+		newCanonicalHash = current.ReuseHash
+	}
 	payload := struct {
-		PreviousInput string             `json:"previous_input"`
-		CurrentInput  string             `json:"current_input"`
-		PreviousReuse string             `json:"previous_reuse"`
-		CurrentReuse  string             `json:"current_reuse"`
-		CommonPrefix  int                `json:"common_prefix"`
-		Reason        HistoryEpochReason `json:"reason"`
+		SessionHash      string `json:"session_hash"`
+		Cutoff           int    `json:"cutoff"`
+		OldCanonicalHash string `json:"old_canonical_hash"`
+		NewCanonicalHash string `json:"new_canonical_hash"`
 	}{
-		PreviousInput: previous.InputHash,
-		CurrentInput:  current.InputHash,
-		PreviousReuse: previous.ReuseHash,
-		CurrentReuse:  current.ReuseHash,
-		CommonPrefix:  commonPrefix,
-		Reason:        reason,
+		SessionHash:      stableSessionHash(sessionID),
+		Cutoff:           commonPrefix,
+		OldCanonicalHash: oldCanonicalHash,
+		NewCanonicalHash: newCanonicalHash,
 	}
 	data, _ := json.Marshal(payload)
 	return sha256hex(data)
+}
+
+func validHistoryEpochReason(reason HistoryEpochReason) bool {
+	switch reason {
+	case HistoryEpochReasonInitial,
+		HistoryEpochReasonUnchanged,
+		HistoryEpochReasonAppended,
+		HistoryEpochReasonReuseChanged,
+		HistoryEpochReasonShrunk,
+		HistoryEpochReasonChanged,
+		HistoryEpochReasonInvalid,
+		HistoryEpochReasonTransitionFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func historyDecisionHasMismatch(decision HistoryEpochDecision) bool {
+	switch decision.Reason {
+	case HistoryEpochReasonReuseChanged:
+		return true
+	case HistoryEpochReasonShrunk, HistoryEpochReasonChanged, HistoryEpochReasonInvalid:
+		return decision.Epoch > 1
+	default:
+		return false
+	}
+}
+
+func shouldWarnHistoryMismatch(decision HistoryEpochDecision) bool {
+	if !decision.FirstMismatch || !decision.EpochChanged || decision.Epoch <= 1 || decision.TransitionFailed {
+		return false
+	}
+	switch decision.Reason {
+	case HistoryEpochReasonShrunk, HistoryEpochReasonChanged, HistoryEpochReasonInvalid:
+		return true
+	default:
+		return false
+	}
 }
 
 func containsHistoryDigest(values []string, target string) bool {

@@ -23,6 +23,8 @@ var allowedDebugFactKeys = map[string]bool{
 	"estimated_tokens": true, "agent_role": true, "agent_reason": true,
 	"input_tokens": true, "cache_creation_input_tokens": true,
 	"cache_read_input_tokens": true, "total_input_tokens": true, "error": true,
+	"history_epoch": true, "history_common_prefix": true, "history_transition_reason": true,
+	"history_epoch_changed": true, "history_mismatch_first": true, "history_transition_failed": true,
 	"messages_local_tokens": true, "system_local_tokens": true, "tools_local_tokens": true,
 	"full_local_tokens": true, "previous_actual_tokens": true, "previous_message_count": true,
 	"new_message_delta_tokens": true, "selected_pressure_tokens": true,

@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -149,6 +150,45 @@ func TestHistoryMismatchConcurrent(t *testing.T) {
 	}
 	if firstCount != 1 || transitionCount != 1 {
 		t.Fatalf("concurrent mismatch first/transition=%d/%d, want 1/1", firstCount, transitionCount)
+	}
+}
+
+func TestHistoryMismatchBoundedDeterministicEviction(t *testing.T) {
+	const sessionID = "mismatch-eviction-session"
+	var persisted string
+	manager := NewHistoryEpochManager()
+	manager.SetPersistFunc(func(_ string, value string) { persisted = value })
+
+	currentMessages := historyTextMessages("seed")
+	currentPrints, err := canonicalizeHistory(currentMessages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Begin(sessionID, currentMessages)
+	expected := make([]string, 0, historyMismatchDigestLimit+5)
+	previousState := historyEpochPersisted{InputHash: currentPrints.InputHash, ReuseHash: currentPrints.ReuseHash}
+	for index := 0; index < historyMismatchDigestLimit+5; index++ {
+		nextMessages := historyTextMessages(fmt.Sprintf("branch-%d", index))
+		nextPrints, err := canonicalizeHistory(nextMessages)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nextState := historyEpochPersisted{InputHash: nextPrints.InputHash, ReuseHash: nextPrints.ReuseHash}
+		expected = append(expected, historyMismatchDigestForSession(sessionID, previousState, nextState, 0, HistoryEpochReasonChanged))
+		decision := manager.Begin(sessionID, nextMessages)
+		if !decision.FirstMismatch || !decision.EpochChanged {
+			t.Fatalf("unique transition %d was not first: %+v", index, decision)
+		}
+		previousState = nextState
+	}
+
+	var state historyEpochPersisted
+	if err := json.Unmarshal([]byte(persisted), &state); err != nil {
+		t.Fatal(err)
+	}
+	want := expected[len(expected)-historyMismatchDigestLimit:]
+	if !reflect.DeepEqual(state.RecentMismatchDigests, want) {
+		t.Fatalf("bounded mismatch eviction is not deterministic:\ngot=%v\nwant=%v", state.RecentMismatchDigests, want)
 	}
 }
 

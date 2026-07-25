@@ -553,6 +553,26 @@ func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessa
 	return decision
 }
 
+// logHistoryMismatch 只记录 manager 已持久去重后的首次 input-history 差异。
+// 使用 request_id-only logger，避免通用 request logger 预绑定的完整 session ID
+// 进入终端日志；canonical hash、dedup key 与消息正文不进入该接口。
+func logHistoryMismatch(meta *requestMeta, decision HistoryEpochDecision) {
+	if meta == nil || !shouldWarnHistoryMismatch(decision) {
+		return
+	}
+	reason := decision.Reason
+	if !validHistoryEpochReason(reason) {
+		reason = HistoryEpochReasonInvalid
+	}
+	meta.auxiliaryLogger().Warn("历史不再连续",
+		"epoch", decision.Epoch,
+		"cutoff", decision.CommonPrefix,
+		"common_prefix", decision.CommonPrefix,
+		"reason", reason,
+		"first", true,
+	)
+}
+
 // HandleMessages 处理 POST /v1/messages 请求。
 // 管线顺序: parse -> FrozenStubs.Get -> Reexpand -> CompressContext -> CalcCollapseCutoff
 //
@@ -683,10 +703,14 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			meta.HistoryEpoch = epochDecision.Epoch
 			meta.HistoryStateKey = epochDecision.StateKey
 			meta.HistoryEpochReason = epochDecision.Reason
+			meta.HistoryCommonPrefix = epochDecision.CommonPrefix
 			meta.HistoryReuseSafe = epochDecision.ReuseSafe
 			meta.HistoryEpochChanged = epochDecision.EpochChanged
+			meta.HistoryMismatch = historyDecisionHasMismatch(epochDecision)
+			meta.HistoryMismatchFirst = epochDecision.FirstMismatch
 			stateKey = epochDecision.StateKey
 			historyReuseSafe = epochDecision.ReuseSafe
+			logHistoryMismatch(meta, epochDecision)
 			if epochDecision.TransitionFailed {
 				// SQLite state + Archive visibility 未能原子提交时，当前请求
 				// 不得读取任何旧派生状态；直接以本轮 raw history 继续，
