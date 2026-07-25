@@ -7,33 +7,34 @@ import (
 
 // requestMeta 保存一次代理请求的审计元数据。
 type requestMeta struct {
-	ID                   uint64
-	RequestSessionID     string
-	RequestKind          requestKind
-	AgentRole            agentRole
-	AgentReason          agentClassificationReason
-	PressureDecision     pressureDecision
-	BaselineUpdateKind   pressureBaselineUpdateKind
-	BaselineGeneration   uint64
-	HistoryEpoch         uint64
-	HistoryStateKey      string
-	HistoryEpochReason   HistoryEpochReason
-	HistoryReuseSafe     bool
-	HistoryEpochChanged  bool
-	OriginalMessageCount int
-	Logger               *slog.Logger
-	auxiliaryAuditLogger *slog.Logger
-	entryOnce            sync.Once
-	rawFactsOnce         sync.Once
-	forwardedFactsOnce   sync.Once
-	pressureFactsOnce    sync.Once
-	pressureSummaryOnce  sync.Once
-	usageFactsOnce       sync.Once
-	rawBodyOnce          sync.Once
-	forwardedBodyOnce    sync.Once
-	responseBodyOnce     sync.Once
-	SessionHash          string
-	RunID                string
+	ID                      uint64
+	RequestSessionID        string
+	RequestKind             requestKind
+	AgentRole               agentRole
+	AgentReason             agentClassificationReason
+	PressureDecision        pressureDecision
+	BaselineUpdateKind      pressureBaselineUpdateKind
+	BaselineGeneration      uint64
+	HistoryEpoch            uint64
+	HistoryStateKey         string
+	HistoryEpochReason      HistoryEpochReason
+	HistoryReuseSafe        bool
+	HistoryEpochChanged     bool
+	HistoryTransitionFailed bool
+	OriginalMessageCount    int
+	Logger                  *slog.Logger
+	auxiliaryAuditLogger    *slog.Logger
+	entryOnce               sync.Once
+	rawFactsOnce            sync.Once
+	forwardedFactsOnce      sync.Once
+	pressureFactsOnce       sync.Once
+	pressureSummaryOnce     sync.Once
+	usageFactsOnce          sync.Once
+	rawBodyOnce             sync.Once
+	forwardedBodyOnce       sync.Once
+	responseBodyOnce        sync.Once
+	SessionHash             string
+	RunID                   string
 }
 
 // tracksSawtoothState 使用默认安全策略：nil、零值、main 与 unknown 都保持状态跟踪，

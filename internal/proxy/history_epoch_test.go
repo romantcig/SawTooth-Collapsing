@@ -3,7 +3,10 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -520,6 +523,56 @@ func TestHistoryEpochTransitionCarriesOnlyStableState(t *testing.T) {
 	}
 	if len(persisted.RecentMismatchDigests) != 1 {
 		t.Fatalf("unexpected mismatch state=%+v", persisted)
+	}
+}
+
+func TestHandleMessagesTransitionFailureForwardsRawWithoutDerivedReads(t *testing.T) {
+	var forwarded []Message
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []Message `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		forwarded = body.Messages
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	manager := NewHistoryEpochManager()
+	manager.SetPersistFunc(func(string, string) {})
+	manager.SetTransitionFunc(func(HistoryTransition) error { return fmt.Errorf("forced transition failure") })
+	server.HistoryEpoch = manager
+
+	var searchCalls, derivedLoadCalls int
+	server.searchAndExpandFn = func(messages []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, _ *requestMeta) RecallOutcome {
+		searchCalls++
+		return RecallOutcome{Messages: messages}
+	}
+	server.Frozen.SetLoadFunc(func(string) (string, bool) { derivedLoadCalls++; return "", false })
+	server.Sawtooth.SetLoadFunc(func(string) (string, bool) { derivedLoadCalls++; return "", false })
+	server.DecayTracker.SetLoadFunc(func(string) (string, bool) { derivedLoadCalls++; return "", false })
+	server.EagerStub.SetLoadFunc(func(string) (string, bool) { derivedLoadCalls++; return "", false })
+
+	const sessionID = "transition-failure-pipeline"
+	base := historyTextMessages("zero", "one", "two")
+	initial := manager.Begin(sessionID, base)
+	if initial.Epoch != 1 {
+		t.Fatalf("initial=%+v", initial)
+	}
+	branched := deepCopyMessages(base)
+	branched[1].Content = mustMarshal("new branch")
+	servePipelineRequest(t, server, sessionID, branched)
+
+	if searchCalls != 0 || derivedLoadCalls != 0 {
+		t.Fatalf("transition failure touched derived state: search=%d loads=%d", searchCalls, derivedLoadCalls)
+	}
+	if !reflect.DeepEqual(forwarded, branched) {
+		t.Fatalf("forwarded messages did not remain raw history:\ngot=%+v\nwant=%+v", forwarded, branched)
 	}
 }
 

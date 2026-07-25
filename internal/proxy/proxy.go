@@ -687,6 +687,20 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			meta.HistoryEpochChanged = epochDecision.EpochChanged
 			stateKey = epochDecision.StateKey
 			historyReuseSafe = epochDecision.ReuseSafe
+			if epochDecision.TransitionFailed {
+				// SQLite state + Archive visibility 未能原子提交时，当前请求
+				// 不得读取任何旧派生状态；直接以本轮 raw history 继续，
+				// 并让迟到响应因 IsCurrent 闸门保持无副作用。
+				meta.HistoryTransitionFailed = true
+				newBody, err := rebuildBody(historyMessages)
+				if err != nil {
+					meta.Logger.Warn("历史状态切换失败，原始请求体重建失败，回退原样转发", "error", err)
+					newBody = body
+				}
+				r.Body = io.NopCloser(bytes.NewReader(newBody))
+				s.forwardRaw(w, r, meta)
+				return
+			}
 			// epoch 1 是升级后的唯一兼容窗口：先尝试把旧裸 session 状态
 			// 一次性复制到显式 epoch key，再建立只用于旧观察 API 的 alias。
 			// epoch 2+ 永不读取裸 key，避免已放弃分支重新进入当前主管线。
@@ -920,6 +934,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 					// 持久化到 SQLite（graceful degradation：失败不阻断请求）
 					if s.Store != nil {
+						archiveBlock.HistoryEpoch = meta.HistoryEpoch
 						if err := s.Store.SaveArchive(archiveBlock); err != nil {
 							meta.Logger.Error("保存存档失败", "error", err)
 						}

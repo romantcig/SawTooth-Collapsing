@@ -22,13 +22,14 @@ const (
 type HistoryEpochReason string
 
 const (
-	HistoryEpochReasonInitial      HistoryEpochReason = "initial"
-	HistoryEpochReasonUnchanged    HistoryEpochReason = "unchanged"
-	HistoryEpochReasonAppended     HistoryEpochReason = "appended"
-	HistoryEpochReasonReuseChanged HistoryEpochReason = "reuse_changed"
-	HistoryEpochReasonShrunk       HistoryEpochReason = "history_shrunk"
-	HistoryEpochReasonChanged      HistoryEpochReason = "history_changed"
-	HistoryEpochReasonInvalid      HistoryEpochReason = "invalid_history"
+	HistoryEpochReasonInitial          HistoryEpochReason = "initial"
+	HistoryEpochReasonUnchanged        HistoryEpochReason = "unchanged"
+	HistoryEpochReasonAppended         HistoryEpochReason = "appended"
+	HistoryEpochReasonReuseChanged     HistoryEpochReason = "reuse_changed"
+	HistoryEpochReasonShrunk           HistoryEpochReason = "history_shrunk"
+	HistoryEpochReasonChanged          HistoryEpochReason = "history_changed"
+	HistoryEpochReasonInvalid          HistoryEpochReason = "invalid_history"
+	HistoryEpochReasonTransitionFailed HistoryEpochReason = "transition_failed"
 )
 
 // historyFingerprints 分离两个用途不同的历史证明：
@@ -45,14 +46,19 @@ type historyFingerprints struct {
 
 // HistoryEpochDecision 固定一次请求进入有状态管线时的本地 epoch 与状态键。
 type HistoryEpochDecision struct {
-	Epoch         uint64
-	StateKey      string
-	CommonPrefix  int
-	ReuseSafe     bool
-	EpochChanged  bool
-	FirstMismatch bool
-	Reason        HistoryEpochReason
+	Epoch            uint64
+	StateKey         string
+	CommonPrefix     int
+	ReuseSafe        bool
+	EpochChanged     bool
+	TransitionFailed bool
+	FirstMismatch    bool
+	Reason           HistoryEpochReason
 }
+
+// HistoryTransitionFunc 原子提交一次 epoch 状态和 Archive 可见性。
+// 返回错误时 manager 不发布新 epoch，主管线必须走 fail-closed raw-history 路径。
+type HistoryTransitionFunc func(HistoryTransition) error
 
 type historyEpochPersisted struct {
 	Version               int      `json:"version"`
@@ -74,11 +80,12 @@ type historyEpochSession struct {
 // HistoryEpochManager 为每个 session 串行提交一份权威 history 状态。
 // 不同 session 使用独立锁，慢 SQLite 写入不会阻塞其他会话。
 type HistoryEpochManager struct {
-	mu        sync.Mutex
-	sessions  map[string]*historyEpochSession
-	configMu  sync.RWMutex
-	persistFn PersistFunc
-	loadFn    LoadFunc
+	mu           sync.Mutex
+	sessions     map[string]*historyEpochSession
+	configMu     sync.RWMutex
+	persistFn    PersistFunc
+	loadFn       LoadFunc
+	transitionFn HistoryTransitionFunc
 }
 
 func NewHistoryEpochManager() *HistoryEpochManager {
@@ -100,6 +107,16 @@ func (m *HistoryEpochManager) SetLoadFunc(fn LoadFunc) {
 	}
 	m.configMu.Lock()
 	m.loadFn = fn
+	m.configMu.Unlock()
+}
+
+// SetTransitionFunc 配置 SQLite history state + Archive visibility 的事务回调。
+func (m *HistoryEpochManager) SetTransitionFunc(fn HistoryTransitionFunc) {
+	if m == nil {
+		return
+	}
+	m.configMu.Lock()
+	m.transitionFn = fn
 	m.configMu.Unlock()
 }
 
@@ -194,8 +211,43 @@ func (m *HistoryEpochManager) Begin(sessionID string, messages []Message) Histor
 		}
 	}
 
+	transitionRequired := decision.EpochChanged && previous.Epoch != 0
+	if transitionRequired {
+		m.configMu.RLock()
+		transitionFn := m.transitionFn
+		m.configMu.RUnlock()
+		if transitionFn != nil {
+			stateValue, err := json.Marshal(next)
+			if err != nil {
+				decision.TransitionFailed = true
+				decision.ReuseSafe = false
+				decision.Reason = HistoryEpochReasonTransitionFailed
+				return decision
+			}
+			err = transitionFn(HistoryTransition{
+				SessionID:    sessionID,
+				StateKey:     historyEpochPersistenceKey(sessionID),
+				StateValue:   string(stateValue),
+				CommonPrefix: decision.CommonPrefix,
+			})
+			if err != nil {
+				// 不更新 session.state，也不调用普通 persist callback；目标 epoch
+				// 尚未发布，旧派生状态因此不会被当前请求读取。
+				decision.TransitionFailed = true
+				decision.ReuseSafe = false
+				decision.Reason = HistoryEpochReasonTransitionFailed
+				return decision
+			}
+		} else {
+			// 无事务回调的纯内存/旧测试环境仍保留兼容行为；生产 wiring
+			// 必须安装 CommitHistoryTransition，确保 SQLite 路径原子提交。
+			m.persistSessionLocked(sessionID, next)
+		}
+	} else {
+		m.persistSessionLocked(sessionID, next)
+	}
+
 	session.state = next
-	m.persistSessionLocked(sessionID, next)
 	return decision
 }
 

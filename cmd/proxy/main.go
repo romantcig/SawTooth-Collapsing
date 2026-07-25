@@ -78,6 +78,7 @@ func main() {
 		_ = store.PersistState(key, value) // best-effort
 	})
 	srv.HistoryEpoch.SetLoadFunc(store.LoadState)
+	srv.HistoryEpoch.SetTransitionFunc(store.CommitHistoryTransition)
 	slog.Info("history epoch 已初始化")
 
 	// Phase B: DecayTracker 初始化（per-message decay tracking）

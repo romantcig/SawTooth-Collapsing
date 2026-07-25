@@ -189,6 +189,12 @@ func searchAndExpandWithMeta(messages []Message, store *SQLiteStore, tokenThresh
 		outcome.BudgetLimit = budget.ReExpansion
 		outcome.BudgetRemaining = maxBudget
 	}
+	// History transition 未完成时，任何 recovery/deep_search/summary/full
+	// expansion 都必须 fail-closed；主管线通常在此之前直接转发 raw history，
+	// 该 guard 负责阻止测试/未来调用点绕过同一门禁触及 SQLite。
+	if meta != nil && meta.HistoryTransitionFailed {
+		return outcome
+	}
 
 	// Guard 1: store == nil → 不做任何处理
 	if store == nil {
