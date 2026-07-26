@@ -227,6 +227,27 @@ func TestSawtoothPressureBaselinePersistenceRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSawtoothConservativePressureFloorRoundTrip(t *testing.T) {
+	const threadID = "pressure-floor-round-trip"
+	fingerprint := strings.Repeat("a", 64)
+	persisted := make(map[string]string)
+	trigger := NewSawtoothTrigger(0, 150_000, 75_000)
+	trigger.SetPersistFunc(func(key, value string) { persisted[key] = value })
+	if !trigger.UpdatePressureFloorForRequest(threadID, 0, 194_383, 32, fingerprint, fingerprint, fingerprint) {
+		t.Fatal("conservative pressure floor 未写入")
+	}
+
+	restored := NewSawtoothTrigger(0, 150_000, 75_000)
+	restored.SetLoadFunc(func(key string) (string, bool) {
+		value, ok := persisted[key]
+		return value, ok
+	})
+	got := restored.PressureBaseline(threadID)
+	if !got.Available || !got.Conservative || got.ActualTokens != 194_383 || got.MessageCount != 32 {
+		t.Fatalf("恢复 conservative pressure floor=%+v", got)
+	}
+}
+
 func TestSawtoothPressureBaselineLoadsLegacyState(t *testing.T) {
 	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
 	trigger.SetLoadFunc(func(key string) (string, bool) {

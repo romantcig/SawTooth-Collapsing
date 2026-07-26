@@ -386,8 +386,11 @@ func LoadConfig(path string) (Config, error) {
 type pressureSource string
 
 const (
-	pressureSourceLocalFull       pressureSource = "local_full"
-	pressureSourceActualPlusDelta pressureSource = "actual_plus_delta"
+	pressureSourceLocalFull             pressureSource = "local_full"
+	pressureSourceActualPlusDelta       pressureSource = "actual_plus_delta"
+	pressureSourceConservativePlusDelta pressureSource = "conservative_plus_delta"
+	pressureSourceConservativeHighWater pressureSource = "conservative_high_water"
+	pressureSourceLegacyHighWater       pressureSource = "legacy_high_water"
 )
 
 // pressureDecision 保存请求进入有状态管线前的一次性压力决定。
@@ -521,6 +524,16 @@ func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessa
 		validPressureFingerprint(baseline.SystemFingerprint) && validPressureFingerprint(baseline.ToolsFingerprint) &&
 		validPressureFingerprint(baseline.MessagesPrefixFingerprint)
 	if !baselineValid {
+		// 旧版 SQLite 只有 total usage 与消息数，没有后续新增的坐标指纹。
+		// 它不能参与精确 delta，但当历史高水位已经越过阈值且消息未缩短时，
+		// 允许保守触发一次，避免真实 cache/thinking usage 被不精确 local_full 吞掉。
+		if baseline.ActualTokens > threshold && baseline.MessageCount >= 0 && baseline.MessageCount <= len(messages) {
+			if baseline.ActualTokens > decision.SelectedPressure {
+				decision.SelectedPressure = baseline.ActualTokens
+			}
+			decision.Source = pressureSourceLegacyHighWater
+			decision.ResetReason = baselineResetLegacyUnverified
+		}
 		return decision
 	}
 	decision.SystemFingerprintChanged = baseline.SystemFingerprint != system.fingerprint
@@ -539,6 +552,13 @@ func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessa
 	}
 	if fingerprintMessagesPrefix(messages, baseline.MessageCount) != baseline.MessagesPrefixFingerprint {
 		decision.ResetReason = baselineResetMessagesChanged
+		// 撤回、编辑或 Claude Code 的等价 wire 规范化会让严格前缀不再适合
+		// 计算精确 delta，但只要消息未缩短且 system/tools 未变，上一轮真实
+		// usage 仍可作为不得降低的高水位。它只能抬高 pressure，不能证明精确值。
+		if baseline.ActualTokens > threshold && baseline.ActualTokens > decision.SelectedPressure {
+			decision.SelectedPressure = baseline.ActualTokens
+			decision.Source = pressureSourceConservativeHighWater
+		}
 		return decision
 	}
 
@@ -547,8 +567,17 @@ func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessa
 		delta = tc.CountMessagesTokens(messages[baseline.MessageCount:])
 	}
 	decision.NewMessageDelta = delta
-	decision.SelectedPressure = saturatingAdd(baseline.ActualTokens, delta)
+	actualPlusDelta := saturatingAdd(baseline.ActualTokens, delta)
+	decision.SelectedPressure = actualPlusDelta
 	decision.Source = pressureSourceActualPlusDelta
+	if baseline.Conservative {
+		// forwarded 改写后的 actual 只作为 pressure floor；绝不能覆盖更高的
+		// 完整本地估算，从而避免压缩后低 actual 让下一轮 raw 历史漏压缩。
+		if decision.FullLocalEstimate > decision.SelectedPressure {
+			decision.SelectedPressure = decision.FullLocalEstimate
+		}
+		decision.Source = pressureSourceConservativePlusDelta
+	}
 	decision.ResetReason = baselineResetNone
 	return decision
 }

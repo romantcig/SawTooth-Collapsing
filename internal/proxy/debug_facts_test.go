@@ -31,7 +31,7 @@ var allowedDebugFactKeys = map[string]bool{
 	"pressure_threshold_tokens": true, "pressure_source": true, "trigger_reason": true,
 	"baseline_reset_reason": true, "compress_decision": true,
 	"system_fingerprint_changed": true, "tools_fingerprint_changed": true,
-	"baseline_updated": true, "actual_minus_selected_tokens": true,
+	"baseline_updated": true, "baseline_update_kind": true, "actual_minus_selected_tokens": true,
 }
 
 func TestDebugFactsPressureDecisionAndUsageJoin(t *testing.T) {
@@ -99,6 +99,9 @@ func TestDebugFactsPressureDecisionAndUsageJoin(t *testing.T) {
 	}
 	if got := usage["baseline_updated"]; got != true {
 		t.Fatalf("usage baseline_updated=%v, want true", got)
+	}
+	if got := usage["baseline_update_kind"]; got != string(pressureBaselineUpdateExact) {
+		t.Fatalf("usage baseline_update_kind=%v, want exact", got)
 	}
 	if got := usage["actual_minus_selected_tokens"]; got != 3000.0 {
 		t.Fatalf("usage actual_minus_selected=%v, want 3000", got)

@@ -731,12 +731,13 @@ type persistedState struct {
 type baselineResetReason string
 
 const (
-	baselineResetNone            baselineResetReason = "none"
-	baselineResetNoActual        baselineResetReason = "no_actual"
-	baselineResetMessageShrink   baselineResetReason = "message_shrink"
-	baselineResetMessagesChanged baselineResetReason = "messages_changed"
-	baselineResetSystemChanged   baselineResetReason = "system_changed"
-	baselineResetToolsChanged    baselineResetReason = "tools_changed"
+	baselineResetNone             baselineResetReason = "none"
+	baselineResetNoActual         baselineResetReason = "no_actual"
+	baselineResetLegacyUnverified baselineResetReason = "legacy_unverified"
+	baselineResetMessageShrink    baselineResetReason = "message_shrink"
+	baselineResetMessagesChanged  baselineResetReason = "messages_changed"
+	baselineResetSystemChanged    baselineResetReason = "system_changed"
+	baselineResetToolsChanged     baselineResetReason = "tools_changed"
 )
 
 // pressureBaseline 是后续 pressure 决策所需的单次原子快照。

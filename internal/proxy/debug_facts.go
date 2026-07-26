@@ -32,46 +32,47 @@ const maxDebugBase64Chars = 8 * 1024 * 1024
 // debugFact 是唯一允许写入默认 debug 文件的结构。
 // 所有字段均为时间、受限枚举、bool 或数字，不持有 header、正文或 session ID。
 type debugFact struct {
-	Timestamp                 string                    `json:"timestamp"`
-	RequestID                 uint64                    `json:"request_id"`
-	Stage                     debugStage                `json:"stage"`
-	ModelFamily               agentModelFamily          `json:"model_family"`
-	MessageCount              int                       `json:"message_count"`
-	HasClaudeMDContext        bool                      `json:"has_claude_md_context"`
-	ImageCount                int                       `json:"image_count"`
-	DocumentCount             int                       `json:"document_count"`
-	DecodedByteCount          int                       `json:"decoded_byte_count"`
-	EstimatedTokens           int                       `json:"estimated_tokens"`
-	AgentRole                 agentRole                 `json:"agent_role"`
-	AgentReason               agentClassificationReason `json:"agent_reason"`
-	InputTokens               int                       `json:"input_tokens"`
-	CacheCreationInputTokens  int                       `json:"cache_creation_input_tokens"`
-	CacheReadInputTokens      int                       `json:"cache_read_input_tokens"`
-	TotalInputTokens          int                       `json:"total_input_tokens"`
-	HistoryEpoch              *uint64                   `json:"history_epoch,omitempty"`
-	HistoryCommonPrefix       *int                      `json:"history_common_prefix,omitempty"`
-	HistoryTransitionReason   *HistoryEpochReason       `json:"history_transition_reason,omitempty"`
-	HistoryEpochChanged       *bool                     `json:"history_epoch_changed,omitempty"`
-	HistoryMismatchFirst      *bool                     `json:"history_mismatch_first,omitempty"`
-	HistoryTransitionFailed   *bool                     `json:"history_transition_failed,omitempty"`
-	MessagesLocalTokens       *int                      `json:"messages_local_tokens,omitempty"`
-	SystemLocalTokens         *int                      `json:"system_local_tokens,omitempty"`
-	ToolsLocalTokens          *int                      `json:"tools_local_tokens,omitempty"`
-	FullLocalTokens           *int                      `json:"full_local_tokens,omitempty"`
-	PreviousActualTokens      *int                      `json:"previous_actual_tokens,omitempty"`
-	PreviousMessageCount      *int                      `json:"previous_message_count,omitempty"`
-	NewMessageDeltaTokens     *int                      `json:"new_message_delta_tokens,omitempty"`
-	SelectedPressureTokens    *int                      `json:"selected_pressure_tokens,omitempty"`
-	PressureThresholdTokens   *int                      `json:"pressure_threshold_tokens,omitempty"`
-	PressureSource            *pressureSource           `json:"pressure_source,omitempty"`
-	TriggerReason             *TriggerReason            `json:"trigger_reason,omitempty"`
-	BaselineResetReason       *baselineResetReason      `json:"baseline_reset_reason,omitempty"`
-	CompressDecision          *bool                     `json:"compress_decision,omitempty"`
-	SystemFingerprintChanged  *bool                     `json:"system_fingerprint_changed,omitempty"`
-	ToolsFingerprintChanged   *bool                     `json:"tools_fingerprint_changed,omitempty"`
-	BaselineUpdated           *bool                     `json:"baseline_updated,omitempty"`
-	ActualMinusSelectedTokens *int                      `json:"actual_minus_selected_tokens,omitempty"`
-	Error                     debugError                `json:"error"`
+	Timestamp                 string                      `json:"timestamp"`
+	RequestID                 uint64                      `json:"request_id"`
+	Stage                     debugStage                  `json:"stage"`
+	ModelFamily               agentModelFamily            `json:"model_family"`
+	MessageCount              int                         `json:"message_count"`
+	HasClaudeMDContext        bool                        `json:"has_claude_md_context"`
+	ImageCount                int                         `json:"image_count"`
+	DocumentCount             int                         `json:"document_count"`
+	DecodedByteCount          int                         `json:"decoded_byte_count"`
+	EstimatedTokens           int                         `json:"estimated_tokens"`
+	AgentRole                 agentRole                   `json:"agent_role"`
+	AgentReason               agentClassificationReason   `json:"agent_reason"`
+	InputTokens               int                         `json:"input_tokens"`
+	CacheCreationInputTokens  int                         `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens      int                         `json:"cache_read_input_tokens"`
+	TotalInputTokens          int                         `json:"total_input_tokens"`
+	HistoryEpoch              *uint64                     `json:"history_epoch,omitempty"`
+	HistoryCommonPrefix       *int                        `json:"history_common_prefix,omitempty"`
+	HistoryTransitionReason   *HistoryEpochReason         `json:"history_transition_reason,omitempty"`
+	HistoryEpochChanged       *bool                       `json:"history_epoch_changed,omitempty"`
+	HistoryMismatchFirst      *bool                       `json:"history_mismatch_first,omitempty"`
+	HistoryTransitionFailed   *bool                       `json:"history_transition_failed,omitempty"`
+	MessagesLocalTokens       *int                        `json:"messages_local_tokens,omitempty"`
+	SystemLocalTokens         *int                        `json:"system_local_tokens,omitempty"`
+	ToolsLocalTokens          *int                        `json:"tools_local_tokens,omitempty"`
+	FullLocalTokens           *int                        `json:"full_local_tokens,omitempty"`
+	PreviousActualTokens      *int                        `json:"previous_actual_tokens,omitempty"`
+	PreviousMessageCount      *int                        `json:"previous_message_count,omitempty"`
+	NewMessageDeltaTokens     *int                        `json:"new_message_delta_tokens,omitempty"`
+	SelectedPressureTokens    *int                        `json:"selected_pressure_tokens,omitempty"`
+	PressureThresholdTokens   *int                        `json:"pressure_threshold_tokens,omitempty"`
+	PressureSource            *pressureSource             `json:"pressure_source,omitempty"`
+	TriggerReason             *TriggerReason              `json:"trigger_reason,omitempty"`
+	BaselineResetReason       *baselineResetReason        `json:"baseline_reset_reason,omitempty"`
+	CompressDecision          *bool                       `json:"compress_decision,omitempty"`
+	SystemFingerprintChanged  *bool                       `json:"system_fingerprint_changed,omitempty"`
+	ToolsFingerprintChanged   *bool                       `json:"tools_fingerprint_changed,omitempty"`
+	BaselineUpdated           *bool                       `json:"baseline_updated,omitempty"`
+	BaselineUpdateKind        *pressureBaselineUpdateKind `json:"baseline_update_kind,omitempty"`
+	ActualMinusSelectedTokens *int                        `json:"actual_minus_selected_tokens,omitempty"`
+	Error                     debugError                  `json:"error"`
 }
 
 func (s *Server) writeRequestDebugFacts(meta *requestMeta, timestamp time.Time, stage debugStage, body []byte, request *http.Request) {
@@ -179,6 +180,14 @@ func (s *Server) writeUsageDebugFacts(meta *requestMeta, timestamp time.Time, us
 			TotalInputTokens:         actual,
 			BaselineUpdated:          &baselineUpdated,
 		}
+		baselineUpdateKind := meta.BaselineUpdateKind
+		if baselineUpdateKind == "" {
+			baselineUpdateKind = pressureBaselineUpdateNone
+			if baselineUpdated {
+				baselineUpdateKind = pressureBaselineUpdateExact
+			}
+		}
+		fact.BaselineUpdateKind = &baselineUpdateKind
 		if meta.tracksSawtoothState() && meta.PressureDecision.Available {
 			actualMinusSelected := saturatingSubtract(actual, meta.PressureDecision.SelectedPressure)
 			fact.ActualMinusSelectedTokens = &actualMinusSelected

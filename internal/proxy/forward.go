@@ -561,14 +561,16 @@ func markForwardedPressureCoordinates(meta *requestMeta, body []byte) {
 type pressureBaselineUpdateKind string
 
 const (
-	pressureBaselineUpdateNone  pressureBaselineUpdateKind = "none"
-	pressureBaselineUpdateExact pressureBaselineUpdateKind = "exact"
-	pressureBaselineUpdateStale pressureBaselineUpdateKind = "stale_epoch"
+	pressureBaselineUpdateNone         pressureBaselineUpdateKind = "none"
+	pressureBaselineUpdateExact        pressureBaselineUpdateKind = "exact"
+	pressureBaselineUpdateConservative pressureBaselineUpdateKind = "conservative_floor"
+	pressureBaselineUpdateStale        pressureBaselineUpdateKind = "stale_epoch"
 )
 
-// applyPressureBaselineUsage 只在 actual 与原始消息坐标一致时建立可复用 baseline。
-// 返回值表示 actual baseline 是否被请求代际协议真正接受，供 response_usage facts 如实记录。
-// 若本轮改写了历史，则清空旧 baseline，确保下一轮从 local_full 重新校准，但不声称建立了 actual baseline。
+// applyPressureBaselineUsage 在 actual 与原始消息坐标一致时建立精确 baseline。
+// 若 forwarded 历史被改写，则保存 max(本轮原始 pressure, 上游 actual) 作为保守高水位；
+// 该 floor 后续只能抬高 pressure，不能冒充精确 raw actual 或压低 local_full。
+// 返回值仅表示精确 actual baseline 是否被接受，保持 baseline_updated 的既有语义。
 func (s *Server) applyPressureBaselineUsage(meta *requestMeta, actual int) bool {
 	if meta == nil || actual <= 0 || s.Sawtooth == nil || !meta.tracksSawtoothState() || !meta.PressureDecision.Available {
 		return false
@@ -579,12 +581,19 @@ func (s *Server) applyPressureBaselineUsage(meta *requestMeta, actual int) bool 
 	}
 	if s.HistoryEpoch != nil && meta.HistoryEpoch > 0 &&
 		!s.HistoryEpoch.IsCurrent(meta.RequestSessionID, meta.HistoryEpoch) {
+		// 合法的旧响应仍可记录 response_usage facts，但不能污染当前 epoch。
 		meta.BaselineUpdateKind = pressureBaselineUpdateStale
 		return false
 	}
 	decision := meta.PressureDecision
 	if decision.ForwardedCoordinatesChanged {
-		s.Sawtooth.UpdatePressureBaselineForRequest(stateKey, meta.BaselineGeneration, 0, 0, "", "", "")
+		pressureFloor := actual
+		if decision.SelectedPressure > pressureFloor {
+			pressureFloor = decision.SelectedPressure
+		}
+		if s.Sawtooth.UpdatePressureFloorForRequest(stateKey, meta.BaselineGeneration, pressureFloor, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint) {
+			meta.BaselineUpdateKind = pressureBaselineUpdateConservative
+		}
 		return false
 	}
 	updated := s.Sawtooth.UpdatePressureBaselineForRequest(stateKey, meta.BaselineGeneration, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint)

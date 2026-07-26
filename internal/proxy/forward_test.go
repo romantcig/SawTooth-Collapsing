@@ -716,6 +716,70 @@ func TestWriteDebugFileSessionPathCannotEscapeDebugRoot(t *testing.T) {
 	}
 }
 
+func TestForwardedRewritePersistsConservativePressureFloor(t *testing.T) {
+	trigger := NewSawtoothTrigger(time.Hour, 150_000, 75_000)
+	var persisted string
+	trigger.SetPersistFunc(func(_ string, value string) { persisted = value })
+	s := NewServer(Config{})
+	s.Sawtooth = trigger
+	messages := pipelineMessages(32, 8)
+	fingerprint := fingerprintTopLevelJSON(nil)
+	meta := newRequestMeta(1, "conservative-floor")
+	meta.BaselineGeneration = trigger.BeginPressureRequest(meta.RequestSessionID)
+	meta.PressureDecision = pressureDecision{
+		Available:                   true,
+		MessageCount:                len(messages),
+		SelectedPressure:            109_612,
+		SystemFingerprint:           fingerprint,
+		ToolsFingerprint:            fingerprint,
+		MessagesPrefixFingerprint:   fingerprintMessagesPrefix(messages, len(messages)),
+		ForwardedCoordinatesChanged: true,
+	}
+
+	if updated := s.applyPressureBaselineUsage(meta, 189_173); updated {
+		t.Fatal("改写后的 actual 被错误标记为精确 baseline")
+	}
+	if meta.BaselineUpdateKind != pressureBaselineUpdateConservative {
+		t.Fatalf("baseline update kind=%q，want conservative floor", meta.BaselineUpdateKind)
+	}
+	var state persistedState
+	if err := json.Unmarshal([]byte(persisted), &state); err != nil {
+		t.Fatalf("解析 conservative floor: %v raw=%q", err, persisted)
+	}
+	if state.Tokens != 189_173 || !state.Conservative || state.MsgCount != len(messages) || state.MessagesPrefixFingerprint != meta.PressureDecision.MessagesPrefixFingerprint {
+		t.Fatalf("持久化 conservative floor=%+v", state)
+	}
+	baseline := trigger.PressureBaseline(meta.RequestSessionID)
+	if !baseline.Available || !baseline.Conservative || baseline.ActualTokens != 189_173 {
+		t.Fatalf("内存 conservative floor=%+v", baseline)
+	}
+}
+
+func TestSafeDebugSessionDirUsesShortStableHash(t *testing.T) {
+	dataDir := t.TempDir()
+	first, ok := safeDebugSessionDir(dataDir, "session-one")
+	if !ok {
+		t.Fatal("合法 session debug 目录校验失败")
+	}
+	again, ok := safeDebugSessionDir(dataDir, "session-one")
+	if !ok || again != first {
+		t.Fatalf("相同 session 的 debug 目录不稳定: first=%q again=%q", first, again)
+	}
+	other, ok := safeDebugSessionDir(dataDir, "session-two")
+	if !ok || other == first {
+		t.Fatalf("不同 session 未被区分: first=%q other=%q", first, other)
+	}
+	name := filepath.Base(first)
+	if len(name) != 16 {
+		t.Fatalf("debug session hash 长度=%d，want 16: %q", len(name), name)
+	}
+	for _, char := range name {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			t.Fatalf("debug session hash 含非小写 hex 字符: %q", name)
+		}
+	}
+}
+
 func TestWriteDebugFileUsesRequestIDToPreventCollisions(t *testing.T) {
 	dataDir := t.TempDir()
 	s := NewServer(Config{Debug: DebugConfig{Enabled: true, FullBody: true, DataDir: dataDir}})

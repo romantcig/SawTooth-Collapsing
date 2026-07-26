@@ -69,6 +69,25 @@ func TestPressureDecisionLocalFullIncludesTopLevelComponents(t *testing.T) {
 	}
 }
 
+func TestFingerprintMessagesPrefixNormalizesEquivalentTextWireForms(t *testing.T) {
+	var listForm, stringForm []Message
+	if err := json.Unmarshal([]byte(`[{"role":"user","content":[{"type":"text","text":"same text","cache_control":{"type":"ephemeral"}}]}]`), &listForm); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(`[{"role":"user","content":"same text"}]`), &stringForm); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := fingerprintMessagesPrefix(listForm, 1), fingerprintMessagesPrefix(stringForm, 1); got != want {
+		t.Fatalf("等价 text wire form 指纹不同: list=%s string=%s", got, want)
+	}
+
+	thinkingA := []Message{{Role: "assistant", Content: json.RawMessage(`[{"type":"thinking","thinking":"reasoning","signature":"signed-a"}]`)}}
+	thinkingB := []Message{{Role: "assistant", Content: json.RawMessage(`[{"type":"thinking","thinking":"reasoning","signature":"signed-b"}]`)}}
+	if fingerprintMessagesPrefix(thinkingA, 1) == fingerprintMessagesPrefix(thinkingB, 1) {
+		t.Fatal("thinking signature 变化被错误忽略")
+	}
+}
+
 func TestPressureDecisionUsesActualPlusDelta(t *testing.T) {
 	tokenCounter, err := NewTokenCounter()
 	if err != nil {
@@ -101,6 +120,97 @@ func TestPressureDecisionUsesActualPlusDelta(t *testing.T) {
 	}
 	if decision.PreviousActual != baseline.ActualTokens || decision.PreviousMessageCount != baseline.MessageCount {
 		t.Fatalf("previous baseline facts=%d/%d, want %d/%d", decision.PreviousActual, decision.PreviousMessageCount, baseline.ActualTokens, baseline.MessageCount)
+	}
+}
+
+func TestPressureDecisionUsesLegacyHighWaterAboveThreshold(t *testing.T) {
+	tokenCounter, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	messages := pipelineMessages(32, 8)
+	baseline := pressureBaseline{
+		ActualTokens: 194_383,
+		MessageCount: 32,
+		Available:    false,
+		ResetReason:  baselineResetNoActual,
+	}
+	decision := buildPressureDecision(messages, nil, nil, baseline, tokenCounter, 150_000)
+	if decision.FullLocalEstimate >= 150_000 {
+		t.Fatalf("fixture local_full=%d，必须低于阈值", decision.FullLocalEstimate)
+	}
+	if decision.SelectedPressure != 194_383 || decision.Source != pressureSourceLegacyHighWater || decision.ResetReason != baselineResetLegacyUnverified {
+		t.Fatalf("legacy high-water decision=%+v", decision)
+	}
+
+	shrunk := buildPressureDecision(messages[:31], nil, nil, baseline, tokenCounter, 150_000)
+	if shrunk.Source != pressureSourceLocalFull || shrunk.SelectedPressure != shrunk.FullLocalEstimate {
+		t.Fatalf("消息缩短后仍使用未验证 legacy high-water: %+v", shrunk)
+	}
+}
+
+func TestPressureDecisionConservativeFloorNeverLowersLocalFull(t *testing.T) {
+	tokenCounter, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	messages := pipelineMessages(4, 200)
+	system := json.RawMessage(`"stable system"`)
+	tools := json.RawMessage(`[]`)
+	baseline := pressureBaseline{
+		ActualTokens:              1,
+		MessageCount:              2,
+		SystemFingerprint:         fingerprintTopLevelJSON(system),
+		ToolsFingerprint:          fingerprintTopLevelJSON(tools),
+		MessagesPrefixFingerprint: fingerprintMessagesPrefix(messages, 2),
+		Conservative:              true,
+		Available:                 true,
+		ResetReason:               baselineResetNone,
+	}
+	decision := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 16_000)
+	if decision.Source != pressureSourceConservativePlusDelta || decision.SelectedPressure != decision.FullLocalEstimate {
+		t.Fatalf("低 conservative floor 压低了 local_full: %+v", decision)
+	}
+
+	baseline.ActualTokens = 190_000
+	high := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 150_000)
+	want := saturatingAdd(baseline.ActualTokens, tokenCounter.CountMessagesTokens(messages[2:]))
+	if high.Source != pressureSourceConservativePlusDelta || high.SelectedPressure != want || high.SelectedPressure <= high.FullLocalEstimate {
+		t.Fatalf("高 conservative floor 未抬高 pressure: got=%+v want=%d", high, want)
+	}
+}
+
+func TestPressureDecisionMessageEditKeepsObservedHighWater(t *testing.T) {
+	tokenCounter, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	base := pipelineMessages(3, 8)
+	edited := deepCopyMessages(base)
+	edited[1].Content = mustMarshal("edited but still the same growing conversation")
+	system := json.RawMessage(`"stable system"`)
+	tools := json.RawMessage(`[]`)
+	baseline := pressureBaseline{
+		ActualTokens:              189_730,
+		MessageCount:              len(base),
+		SystemFingerprint:         fingerprintTopLevelJSON(system),
+		ToolsFingerprint:          fingerprintTopLevelJSON(tools),
+		MessagesPrefixFingerprint: fingerprintMessagesPrefix(base, len(base)),
+		Conservative:              true,
+		Available:                 true,
+	}
+
+	decision := buildPressureDecision(edited, system, tools, baseline, tokenCounter, 150_000)
+	if decision.ResetReason != baselineResetMessagesChanged || decision.Source != pressureSourceConservativeHighWater || decision.SelectedPressure != baseline.ActualTokens {
+		t.Fatalf("消息编辑后未保留 observed high-water: %+v", decision)
+	}
+	if decision.SelectedPressure <= decision.FullLocalEstimate {
+		t.Fatalf("high-water 未抬高低估的 local_full: %+v", decision)
+	}
+
+	shrunk := buildPressureDecision(edited[:2], system, tools, baseline, tokenCounter, 150_000)
+	if shrunk.Source != pressureSourceLocalFull || shrunk.ResetReason != baselineResetMessageShrink || shrunk.SelectedPressure != shrunk.FullLocalEstimate {
+		t.Fatalf("消息缩短后仍保留旧 high-water: %+v", shrunk)
 	}
 }
 
@@ -965,8 +1075,8 @@ func TestHandleMessagesCollapsedActualDoesNotCalibrateRawHistory(t *testing.T) {
 	}
 
 	servePipelineRequest(t, server, sessionID, raw)
-	if baseline := server.Sawtooth.PressureBaseline(sessionID); baseline.Available {
-		t.Fatalf("压缩响应的低 actual 建立了 raw baseline: %+v", baseline)
+	if baseline := server.Sawtooth.PressureBaseline(sessionID); !baseline.Available || !baseline.Conservative || baseline.ActualTokens <= 100 {
+		t.Fatalf("压缩响应未保留 raw pressure floor: %+v", baseline)
 	}
 
 	nextRaw := append(deepCopyMessages(raw), pipelineMessages(1, 20)...)
@@ -975,8 +1085,8 @@ func TestHandleMessagesCollapsedActualDoesNotCalibrateRawHistory(t *testing.T) {
 	if len(decisions) != 2 {
 		t.Fatalf("pressure decisions=%d, want 2", len(decisions))
 	}
-	if decisions[1].Source != pressureSourceLocalFull || decisions[1].ResetReason != baselineResetNoActual {
-		t.Fatalf("第二轮复用了压缩 actual: %+v", decisions[1])
+	if decisions[1].Source != pressureSourceConservativePlusDelta || decisions[1].ResetReason != baselineResetNone || decisions[1].SelectedPressure < decisions[1].FullLocalEstimate {
+		t.Fatalf("第二轮未以 conservative floor 安全决策: %+v", decisions[1])
 	}
 	if len(forwarded) != 2 || len(forwarded[0]) >= len(raw) || len(forwarded[1]) >= len(nextRaw) {
 		t.Fatalf("两轮均应压缩 raw 历史: forwarded=%v raw=%d/%d", []int{len(forwarded[0]), len(forwarded[1])}, len(raw), len(nextRaw))
