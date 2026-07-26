@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -266,6 +267,53 @@ func TestSaveArchivePersistsHistoryEpoch(t *testing.T) {
 	}
 	if epoch != 7 {
 		t.Fatalf("保存 Archive epoch=%d, want 7", epoch)
+	}
+}
+
+func TestSaveArchiveRejectsStaleEpochAfterTransition(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "stale-epoch.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// 写入 epoch 2 的 Archive
+	epoch2Block := archiveRangeTestBlock("block-epoch2", "stale-session", 1, 5, 2, "epoch two")
+	if err := store.SaveArchive(epoch2Block); err != nil {
+		t.Fatalf("SaveArchive epoch=2 失败: %v", err)
+	}
+
+	// 模拟 epoch 切换到 3（CommitHistoryTransition）
+	transition := HistoryTransition{
+		SessionID:    "stale-session",
+		StateKey:     "history_epoch:stale-session",
+		StateValue:   `{"epoch":3,"valid":true}`,
+		CommonPrefix: 3,
+	}
+	if err := store.CommitHistoryTransition(transition); err != nil {
+		t.Fatalf("CommitHistoryTransition 失败: %v", err)
+	}
+
+	// 尝试写入迟到的 epoch 1 Archive（并发的旧请求）
+	staleBlock := archiveRangeTestBlock("block-stale", "stale-session", 6, 10, 1, "stale")
+	err = store.SaveArchive(staleBlock)
+	if err == nil {
+		t.Fatal("SaveArchive 应拒绝 epoch=1 < current=2 的迟到写入")
+	}
+	if !strings.Contains(err.Error(), "拒绝迟到") && !strings.Contains(err.Error(), "block epoch=1 < current max=2") {
+		t.Fatalf("错误消息不符合预期: %v", err)
+	}
+
+	// 验证 epoch 2 的 Archive 仍可写入（同 epoch 内正常写入）
+	epoch2Block2 := archiveRangeTestBlock("block-epoch2-second", "stale-session", 11, 15, 2, "epoch two again")
+	if err := store.SaveArchive(epoch2Block2); err != nil {
+		t.Fatalf("SaveArchive epoch=2（同 epoch）应成功: %v", err)
+	}
+
+	// 验证 epoch 3 的新 Archive 可写入
+	epoch3Block := archiveRangeTestBlock("block-epoch3", "stale-session", 16, 20, 3, "epoch three")
+	if err := store.SaveArchive(epoch3Block); err != nil {
+		t.Fatalf("SaveArchive epoch=3 应成功: %v", err)
 	}
 }
 

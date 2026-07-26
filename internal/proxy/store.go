@@ -285,6 +285,21 @@ func (s *SQLiteStore) SaveArchive(block ArchiveBlock) error {
 		historyEpoch = 1
 	}
 
+	// 原子查询当前 session 的最大 epoch，防止迟到的旧 epoch Archive 绕过 visibility 门控（CR-01）。
+	var currentMaxEpoch uint64
+	err = tx.QueryRow(
+		`SELECT COALESCE(MAX(history_epoch), 0) FROM archive_blocks WHERE session_id = ?`,
+		block.SessionID,
+	).Scan(&currentMaxEpoch)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("查询当前 epoch 失败: %w", err)
+	}
+	// 拒绝严格早于当前 max epoch 的迟到写入（epoch 切换后的并发请求）。
+	// 允许 historyEpoch == currentMaxEpoch（同 epoch 内的正常写入）。
+	if historyEpoch < currentMaxEpoch {
+		return fmt.Errorf("拒绝迟到 Archive 写入: block epoch=%d < current max=%d", historyEpoch, currentMaxEpoch)
+	}
+
 	result, err := tx.Exec(
 		`INSERT INTO archive_blocks
 		 (id, session_id, block_range_start, block_range_end,
