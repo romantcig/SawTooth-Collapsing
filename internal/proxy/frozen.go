@@ -564,20 +564,26 @@ func (f *FrozenStubs) loadFrozenFromDB(logger *slog.Logger, threadID string) {
 		f.mu.Unlock()
 		return
 	}
-	f.loadedFromDB[stateKey] = true
 	loadFn := f.loadFn
 	f.mu.Unlock()
 
 	if loadFn == nil {
+		f.mu.Lock()
+		f.loadedFromDB[stateKey] = true
+		f.mu.Unlock()
 		return
 	}
 
 	raw, ok := loadFn("frozen:" + stateKey)
 	if !ok || raw == "" {
+		f.mu.Lock()
+		f.loadedFromDB[stateKey] = true
+		f.mu.Unlock()
 		return
 	}
 	f.mu.Lock()
 	f.stateFoundDB[stateKey] = true
+	f.loadedFromDB[stateKey] = true
 	f.mu.Unlock()
 
 	var fp frozenPersisted
