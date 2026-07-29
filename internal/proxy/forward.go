@@ -626,9 +626,11 @@ func (s *Server) applyPressureBaselineUsage(meta *requestMeta, actual int) bool 
 		return false
 	}
 	decision := meta.PressureDecision
-	if decision.ForwardedCoordinatesChanged && !decision.ForwardedCoordinatesBound {
-		// markForwardedPressureCoordinates 无法证明 actual 对应的消息坐标，
-		// 绝不能沿用旧坐标或退回 conservative floor。
+	if !decision.ForwardedCoordinatesBound {
+		// 坐标未经 markForwardedPressureCoordinates 绑定过——可能是 body 不可解析，
+		// 也可能是调用方根本没走绑定。两种情况都无法证明 actual 对应哪份消息坐标，
+		// 绝不能沿用旧坐标或退回 conservative floor。ForwardedCoordinatesChanged
+		// 只保留作诊断字段，不参与门禁。
 		meta.BaselineUpdateKind = pressureBaselineUpdateNone
 		return false
 	}

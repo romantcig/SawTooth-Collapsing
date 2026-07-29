@@ -376,6 +376,16 @@ func TestHistoryEpochStateIsolationAndLateResponse(t *testing.T) {
 		ToolsFingerprint:          currentHistoryFingerprint(base),
 		MessagesPrefixFingerprint: oldFingerprint,
 	}
+	// 先完成真实坐标绑定：stale epoch 门禁必须独立于 binding 生效，
+	// 否则这条测试只能证明"未绑定被拒"，证不出"迟到响应被拒"。
+	lateBody, err := json.Marshal(map[string]any{"messages": base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	markForwardedPressureCoordinates(meta, lateBody)
+	if !meta.PressureDecision.ForwardedCoordinatesBound {
+		t.Fatalf("迟到响应的 forwarded 坐标未绑定: %+v", meta.PressureDecision)
+	}
 	if updated := server.applyPressureBaselineUsage(meta, 99_000); updated {
 		t.Fatal("旧 epoch 的迟到响应被接受为 baseline")
 	}

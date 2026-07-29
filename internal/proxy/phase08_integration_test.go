@@ -3,10 +3,12 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -72,8 +74,11 @@ func TestPhase08CombinedLifecycle(t *testing.T) {
 	if err != nil || !bytes.Contains(lastJSON, []byte("future_phase08")) {
 		t.Fatalf("fresh tail 未知字段丢失: %s err=%v", lastJSON, err)
 	}
+	// Archive 行数不能证明"没有重复 collapse"——SaveArchive 是 ON CONFLICT DO NOTHING，
+	// 相同 Archive 再折叠一次也不会新增行。这里只保留它能真正证明的那一点：
+	// 没有产生一份**不同**的 Archive。是否重复 collapse 由下面的 pressure 状态转换断言。
 	if got := archiveCount(t, server.Store); got != archivesAfterCollapse {
-		t.Fatalf("Frozen hit 后 Archive 行增长: got=%d want=%d", got, archivesAfterCollapse)
+		t.Fatalf("第二轮生成了新的 Archive 行: got=%d want=%d", got, archivesAfterCollapse)
 	}
 	if result := server.Frozen.Get("phase08-combined", StripReminders(secondHistory)); result == nil {
 		t.Fatal("组合场景第二轮未保持 Frozen hit")
@@ -111,6 +116,7 @@ func TestPhase08CombinedLifecycle(t *testing.T) {
 	if len(stageByRequest) != 2 {
 		t.Fatalf("facts request IDs=%d, want 2", len(stageByRequest))
 	}
+	assertPhase08PressureTransition(t, stageByRequest, len(forwarded[0]))
 	for requestID, stages := range stageByRequest {
 		for _, stage := range []debugStage{debugStageRawInbound, debugStagePressureDecision, debugStageForwarded, debugStageResponseUsage} {
 			if _, ok := stages[stage]; !ok {
@@ -131,6 +137,61 @@ func TestPhase08CombinedLifecycle(t *testing.T) {
 			t.Fatalf("request %d forwarded facts=%+v", requestID, forwardedFact)
 		}
 	}
+}
+
+// assertPhase08PressureTransition 直接断言两轮之间的 pressure 状态转换，取代
+// 「Archive 行数没增加 ⇒ 没有重复 collapse」这个恒真推断（REVIEW_GAPS 4.2）。
+//
+// 本场景的第二轮**确实**会重新 collapse，这是 fixture 决定的而非缺陷：
+// 上游 stub 对一份本地估算约 29k 的 body 固定回报 93252 tokens，而阈值只有 16000。
+// 同时 persistent context 从 A 换成 B 使前缀指纹改变，pressure 落到
+// conservative_high_water 分支并沿用 93252 高水位 → emergency。
+//
+// 因此这里断言的是真正有证明力的东西：第一轮冷启动走 local_full，第二轮
+// **消费了第一轮写下的 exact baseline**（previous_actual / previous_message_count
+// 与第一轮 forwarded 坐标一致）。旧的 Archive 行数断言恰恰漏掉的就是这一段。
+// 「不重复 collapse」的正面护栏在 TestEagerPressureTwoRoundLifecycle。
+func assertPhase08PressureTransition(t *testing.T, stageByRequest map[uint64]map[debugStage]debugFact, firstForwardedCount int) {
+	t.Helper()
+	requestIDs := make([]uint64, 0, len(stageByRequest))
+	for requestID := range stageByRequest {
+		requestIDs = append(requestIDs, requestID)
+	}
+	sort.Slice(requestIDs, func(i, j int) bool { return requestIDs[i] < requestIDs[j] })
+
+	first := stageByRequest[requestIDs[0]][debugStagePressureDecision]
+	if first.PressureSource == nil || *first.PressureSource != pressureSourceLocalFull {
+		t.Fatalf("第一轮 pressure_source=%s, want %q", debugFactValue(first.PressureSource), pressureSourceLocalFull)
+	}
+	if first.BaselineResetReason == nil || *first.BaselineResetReason != baselineResetNoActual {
+		t.Fatalf("第一轮 baseline_reset_reason=%s, want %q", debugFactValue(first.BaselineResetReason), baselineResetNoActual)
+	}
+	if first.CompressDecision == nil || !*first.CompressDecision {
+		t.Fatalf("第一轮 compress_decision=%s, want true", debugFactValue(first.CompressDecision))
+	}
+
+	second := stageByRequest[requestIDs[1]][debugStagePressureDecision]
+	if second.PreviousActualTokens == nil || *second.PreviousActualTokens != 93_252 {
+		t.Fatalf("第二轮 previous_actual_tokens=%s, want 93252（第一轮 exact baseline 未被消费）", debugFactValue(second.PreviousActualTokens))
+	}
+	if second.PreviousMessageCount == nil || *second.PreviousMessageCount != firstForwardedCount {
+		t.Fatalf("第二轮 previous_message_count=%s, want %d（baseline 未绑定第一轮 forwarded 坐标）",
+			debugFactValue(second.PreviousMessageCount), firstForwardedCount)
+	}
+	if second.PressureSource == nil || *second.PressureSource != pressureSourceConservativeHighWater {
+		t.Fatalf("第二轮 pressure_source=%s, want %q", debugFactValue(second.PressureSource), pressureSourceConservativeHighWater)
+	}
+	if second.SelectedPressureTokens == nil || *second.SelectedPressureTokens != 93_252 {
+		t.Fatalf("第二轮 selected_pressure=%s, want 93252（高水位未生效）", debugFactValue(second.SelectedPressureTokens))
+	}
+}
+
+// debugFactValue 渲染 debugFact 里的可空字段，避免失败信息打印成指针地址。
+func debugFactValue[T any](p *T) string {
+	if p == nil {
+		return "nil"
+	}
+	return fmt.Sprintf("%v", *p)
 }
 
 func TestPhase08AgentIsolationMatrix(t *testing.T) {

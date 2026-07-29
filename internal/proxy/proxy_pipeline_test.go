@@ -396,6 +396,118 @@ func TestHandleMessagesPressureUsesEagerStubbedShape(t *testing.T) {
 	}
 }
 
+// TestEagerPressureTwoRoundLifecycle 是 actual_plus_delta 路径的唯一护栏。
+//
+// 生产 trace（FIX_PLAN.md 1.3）里这条路径出现 **0 次**：151 次 pressure 决策中
+// 123 次退回 local_full、28 次 conservative_plus_delta。单轮 eager 回归只证明
+// 「raw 很大 → eager 后很小 → 本轮不压缩」，证不出第一轮写下 exact baseline 后，
+// 第二轮追加 tail 会不会被旧 baseline 拉回高 pressure 而重新触发重型 collapse。
+//
+// 两轮都必须 compress=false 且不产生 Archive；第二轮必须落在 actual_plus_delta。
+func TestEagerPressureTwoRoundLifecycle(t *testing.T) {
+	const sessionID = "eager-two-round-lifecycle"
+	var forwarded [][]Message
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []Message `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		forwarded = append(forwarded, deepCopyMessages(body.Messages))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":1200,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	toolUse := Message{Role: "assistant", Content: json.RawMessage(mustMarshalJSON(t, []map[string]any{{
+		"type": "tool_use", "id": "tool-large-read", "name": "Read",
+		"input": map[string]any{"file_path": "large.go"},
+	}}))}
+	toolResult := Message{Role: "user", Content: json.RawMessage(mustMarshalJSON(t, []map[string]any{{
+		"type": "tool_result", "tool_use_id": "tool-large-read",
+		"content": strings.Repeat("large historical tool output ", 30_000),
+	}}))}
+	firstRound := []Message{
+		{Role: "user", Content: mustMarshal("inspect the large file")},
+		toolUse,
+		toolResult,
+		{Role: "assistant", Content: mustMarshal("I processed the file contents")},
+		{Role: "user", Content: mustMarshal("continue with the result")},
+	}
+
+	var decisions []pressureDecision
+	server.searchAndExpandFn = func(current []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, meta *requestMeta) RecallOutcome {
+		decisions = append(decisions, meta.PressureDecision)
+		return RecallOutcome{Messages: current}
+	}
+
+	// ── 第一轮：eager 后很小，不压缩，成功响应写入 exact baseline ──
+	servePipelineRequest(t, server, sessionID, firstRound)
+	if len(decisions) != 1 {
+		t.Fatalf("第一轮 pressure 决策数=%d, want 1", len(decisions))
+	}
+	if decisions[0].Source != pressureSourceLocalFull || decisions[0].CompressDecision {
+		t.Fatalf("第一轮应为冷启动 local_full 且不压缩: %+v", decisions[0])
+	}
+	if got := archiveCount(t, server.Store); got != 0 {
+		t.Fatalf("第一轮 eager 足以降压却产生 collapse archive: %d", got)
+	}
+	baseline := server.Sawtooth.PressureBaseline(sessionID)
+	if !baseline.Available || baseline.Conservative || baseline.ActualTokens != 1200 {
+		t.Fatalf("第一轮未写入 exact baseline: %+v", baseline)
+	}
+	if baseline.MessageCount != len(forwarded[0]) {
+		t.Fatalf("baseline 未绑定第一轮 forwarded 坐标: baseline=%d forwarded=%d",
+			baseline.MessageCount, len(forwarded[0]))
+	}
+
+	// ── 第二轮：仅追加 tail，前缀逐字节不变 ──
+	secondRound := append(deepCopyMessages(firstRound),
+		Message{Role: "assistant", Content: mustMarshal("here is the follow-up analysis of that file")},
+		Message{Role: "user", Content: mustMarshal("now summarize what changed")},
+	)
+	servePipelineRequest(t, server, sessionID, secondRound)
+	if len(decisions) != 2 {
+		t.Fatalf("第二轮 pressure 决策数=%d, want 2", len(decisions))
+	}
+	second := decisions[1]
+
+	// 核心断言：本轮走的是精确 delta，而不是退回 local_full 或高水位。
+	if second.Source != pressureSourceActualPlusDelta {
+		t.Fatalf("第二轮 pressure_source=%q, want %q（reset_reason=%q）",
+			second.Source, pressureSourceActualPlusDelta, second.ResetReason)
+	}
+	if second.ResetReason != baselineResetNone {
+		t.Fatalf("第二轮 baseline_reset_reason=%q, want %q", second.ResetReason, baselineResetNone)
+	}
+	if second.PreviousActual != 1200 {
+		t.Fatalf("第二轮 previous_actual=%d, want 1200", second.PreviousActual)
+	}
+	if second.NewMessageDelta <= 0 {
+		t.Fatalf("第二轮 new_message_delta=%d, want >0（追加的 tail 未计入）", second.NewMessageDelta)
+	}
+	if second.SelectedPressure != second.PreviousActual+second.NewMessageDelta {
+		t.Fatalf("第二轮 selected=%d != previous_actual(%d)+delta(%d)",
+			second.SelectedPressure, second.PreviousActual, second.NewMessageDelta)
+	}
+	// 旧 baseline 不得把 pressure 拉回重型压缩区间。
+	if second.CompressDecision || second.TriggerReason != TriggerNone {
+		t.Fatalf("第二轮被旧 baseline 拉回压缩: %+v", second)
+	}
+	if got := archiveCount(t, server.Store); got != 0 {
+		t.Fatalf("第二轮产生 collapse archive: %d", got)
+	}
+	if server.Frozen.LengthFor(sessionID) != 0 {
+		t.Fatalf("第二轮写入 Frozen prefix: %d", server.Frozen.LengthFor(sessionID))
+	}
+	// actual_plus_delta 的意义在于它远小于 raw 历史；否则等同于 local_full。
+	if rawTokens := server.TokenCounter.CountMessagesTokens(secondRound); second.SelectedPressure >= rawTokens {
+		t.Fatalf("第二轮 pressure=%d 未低于 raw=%d", second.SelectedPressure, rawTokens)
+	}
+}
+
 func TestRequestMetaConcurrentIDsUnique(t *testing.T) {
 	server := NewServer(DefaultConfig())
 	const requestCount = 64

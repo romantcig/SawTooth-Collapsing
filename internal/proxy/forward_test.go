@@ -46,6 +46,22 @@ func TestTotalInputTokens(t *testing.T) {
 	}
 }
 
+// forwardedPressureBody 组装一份真实的上游 wire body，供测试通过
+// markForwardedPressureCoordinates 绑定坐标——而不是手工置位
+// ForwardedCoordinatesBound，那等于在测试里给 invariant 留后门。
+func forwardedPressureBody(t *testing.T, system, tools json.RawMessage, messages []Message) []byte {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"system":   system,
+		"tools":    tools,
+		"messages": messages,
+	})
+	if err != nil {
+		t.Fatalf("marshal forwarded body: %v", err)
+	}
+	return body
+}
+
 func TestHandleSSEPressureBaseline(t *testing.T) {
 	trigger := NewSawtoothTrigger(time.Hour, 50000, 1000)
 	var persisted string
@@ -54,13 +70,12 @@ func TestHandleSSEPressureBaseline(t *testing.T) {
 	s.Sawtooth = trigger
 	system := json.RawMessage(`[{"type":"text","text":"sse system"}]`)
 	tools := json.RawMessage(`[{"name":"sse_tool","input_schema":{"type":"object"}}]`)
+	forwarded := pipelineMessages(37, 6)
 	meta := newRequestMeta(1, "sse-cache")
-	meta.PressureDecision = pressureDecision{
-		Available:                 true,
-		MessageCount:              37,
-		SystemFingerprint:         fingerprintTopLevelJSON(system),
-		ToolsFingerprint:          fingerprintTopLevelJSON(tools),
-		MessagesPrefixFingerprint: strings.Repeat("a", 64),
+	meta.PressureDecision = pressureDecision{Available: true}
+	markForwardedPressureCoordinates(meta, forwardedPressureBody(t, system, tools, forwarded))
+	if !meta.PressureDecision.ForwardedCoordinatesBound {
+		t.Fatalf("forwarded 坐标未绑定: %+v", meta.PressureDecision)
 	}
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
@@ -76,8 +91,11 @@ func TestHandleSSEPressureBaseline(t *testing.T) {
 	if err := json.Unmarshal([]byte(persisted), &state); err != nil {
 		t.Fatalf("解析持久状态: %v; raw=%q", err, persisted)
 	}
-	if state.Tokens != 93252 || state.MsgCount != meta.PressureDecision.MessageCount || state.SystemFingerprint != meta.PressureDecision.SystemFingerprint || state.ToolsFingerprint != meta.PressureDecision.ToolsFingerprint || state.MessagesPrefixFingerprint != meta.PressureDecision.MessagesPrefixFingerprint {
-		t.Fatalf("SSE 持久状态=%+v, want actual=93252 original_count=%d fingerprints=%q/%q", state, meta.PressureDecision.MessageCount, meta.PressureDecision.SystemFingerprint, meta.PressureDecision.ToolsFingerprint)
+	if state.Tokens != 93252 || state.MsgCount != len(forwarded) || state.SystemFingerprint != fingerprintTopLevelJSON(system) || state.ToolsFingerprint != fingerprintTopLevelJSON(tools) || state.MessagesPrefixFingerprint != fingerprintMessagesPrefix(forwarded, len(forwarded)) {
+		t.Fatalf("SSE 持久状态=%+v, want actual=93252 forwarded_count=%d", state, len(forwarded))
+	}
+	if meta.BaselineUpdateKind != pressureBaselineUpdateExact {
+		t.Fatalf("SSE baseline update kind=%q, want exact", meta.BaselineUpdateKind)
 	}
 	if strings.Contains(recorder.Body.String(), `"input_tokens":196`) || !strings.Contains(recorder.Body.String(), `"input_tokens":98`) {
 		t.Fatalf("客户端 deflation 行为变化: %s", recorder.Body.String())
@@ -92,13 +110,12 @@ func TestHandleJSONPressureBaseline(t *testing.T) {
 	s.Sawtooth = trigger
 	system := json.RawMessage(`[{"type":"text","text":"json system"}]`)
 	tools := json.RawMessage(`[{"name":"json_tool","input_schema":{"type":"object"}}]`)
+	forwarded := pipelineMessages(41, 6)
 	meta := newRequestMeta(2, "json-cache")
-	meta.PressureDecision = pressureDecision{
-		Available:                 true,
-		MessageCount:              41,
-		SystemFingerprint:         fingerprintTopLevelJSON(system),
-		ToolsFingerprint:          fingerprintTopLevelJSON(tools),
-		MessagesPrefixFingerprint: strings.Repeat("b", 64),
+	meta.PressureDecision = pressureDecision{Available: true}
+	markForwardedPressureCoordinates(meta, forwardedPressureBody(t, system, tools, forwarded))
+	if !meta.PressureDecision.ForwardedCoordinatesBound {
+		t.Fatalf("forwarded 坐标未绑定: %+v", meta.PressureDecision)
 	}
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
@@ -112,8 +129,11 @@ func TestHandleJSONPressureBaseline(t *testing.T) {
 	if err := json.Unmarshal([]byte(persisted), &state); err != nil {
 		t.Fatalf("解析持久状态: %v; raw=%q", err, persisted)
 	}
-	if state.Tokens != 93252 || state.MsgCount != meta.PressureDecision.MessageCount || state.SystemFingerprint != meta.PressureDecision.SystemFingerprint || state.ToolsFingerprint != meta.PressureDecision.ToolsFingerprint || state.MessagesPrefixFingerprint != meta.PressureDecision.MessagesPrefixFingerprint {
-		t.Fatalf("JSON 持久状态=%+v, want actual=93252 original_count=%d fingerprints=%q/%q", state, meta.PressureDecision.MessageCount, meta.PressureDecision.SystemFingerprint, meta.PressureDecision.ToolsFingerprint)
+	if state.Tokens != 93252 || state.MsgCount != len(forwarded) || state.SystemFingerprint != fingerprintTopLevelJSON(system) || state.ToolsFingerprint != fingerprintTopLevelJSON(tools) || state.MessagesPrefixFingerprint != fingerprintMessagesPrefix(forwarded, len(forwarded)) {
+		t.Fatalf("JSON 持久状态=%+v, want actual=93252 forwarded_count=%d", state, len(forwarded))
+	}
+	if meta.BaselineUpdateKind != pressureBaselineUpdateExact {
+		t.Fatalf("JSON baseline update kind=%q, want exact", meta.BaselineUpdateKind)
 	}
 	if strings.Contains(recorder.Body.String(), `"input_tokens":196`) || !strings.Contains(recorder.Body.String(), `"input_tokens":98`) {
 		t.Fatalf("客户端 deflation 行为变化: %s", recorder.Body.String())
@@ -713,6 +733,118 @@ func TestWriteDebugFileSessionPathCannotEscapeDebugRoot(t *testing.T) {
 				t.Fatalf("debug 文件未写入哈希目录: %v", err)
 			}
 		})
+	}
+}
+
+// TestResponseHandlersRejectUnboundForwardedCoordinates 封闭 W2 的核心 invariant：
+// 调用方**完全没有**调用 markForwardedPressureCoordinates 时，两个坐标字段都是零值。
+// 收紧前的门禁 `Changed && !Bound` 会因为 Changed==false 而放行，把未绑定的坐标
+// 当作 exact baseline 写回；收紧后必须一律拒绝。
+func TestResponseHandlersRejectUnboundForwardedCoordinates(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+		invoke      func(s *Server, resp *http.Response, meta *requestMeta)
+	}{
+		{
+			name:        "json",
+			contentType: "application/json",
+			body:        `{"type":"message","usage":{"input_tokens":196,"cache_read_input_tokens":93056,"output_tokens":20}}`,
+			invoke: func(s *Server, resp *http.Response, meta *requestMeta) {
+				s.handleJSON(httptest.NewRecorder(), resp, meta, time.Now(), "model", 3)
+			},
+		},
+		{
+			name:        "sse",
+			contentType: "text/event-stream",
+			body: "event: message_start\n" +
+				"data: {\"type\":\"message_start\",\"message\":{\"type\":\"message\",\"usage\":{\"input_tokens\":196,\"cache_read_input_tokens\":93056,\"output_tokens\":20}}}\n\n" +
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+			invoke: func(s *Server, resp *http.Response, meta *requestMeta) {
+				s.handleSSE(httptest.NewRecorder(), resp, meta, time.Now(), "model", 4)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trigger := NewSawtoothTrigger(time.Hour, 50000, 1000)
+			var persisted string
+			trigger.SetPersistFunc(func(_ string, value string) { persisted = value })
+			s := NewServer(Config{Proxy: ProxyConfig{Deflation: 0.5}})
+			s.Sawtooth = trigger
+			forwarded := pipelineMessages(12, 6)
+			meta := newRequestMeta(3, "unbound-"+tt.name)
+			// 坐标看起来完全自洽，唯独没有经过绑定。
+			meta.PressureDecision = pressureDecision{
+				Available:                 true,
+				MessageCount:              len(forwarded),
+				SystemFingerprint:         fingerprintTopLevelJSON(nil),
+				ToolsFingerprint:          fingerprintTopLevelJSON(nil),
+				MessagesPrefixFingerprint: fingerprintMessagesPrefix(forwarded, len(forwarded)),
+			}
+			if meta.PressureDecision.ForwardedCoordinatesChanged || meta.PressureDecision.ForwardedCoordinatesBound {
+				t.Fatalf("前置条件错误，坐标字段应为零值: %+v", meta.PressureDecision)
+			}
+
+			tt.invoke(s, &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {tt.contentType}},
+				Body:       io.NopCloser(strings.NewReader(tt.body)),
+			}, meta)
+
+			if persisted != "" {
+				t.Fatalf("未绑定 forwarded 坐标却写入了 baseline: %q", persisted)
+			}
+			if meta.BaselineUpdateKind != pressureBaselineUpdateNone {
+				t.Fatalf("baseline update kind=%q, want none", meta.BaselineUpdateKind)
+			}
+			if baseline := trigger.PressureBaseline("unbound-" + tt.name); baseline.Available {
+				t.Fatalf("未绑定坐标污染了内存 baseline: %+v", baseline)
+			}
+		})
+	}
+}
+
+// TestUnchangedForwardedBodyBindsExactPressureBaseline 覆盖"body 未被改写但已绑定"：
+// ForwardedCoordinatesChanged 保持 false，写回仍必须成立——门禁只看 Bound。
+func TestUnchangedForwardedBodyBindsExactPressureBaseline(t *testing.T) {
+	trigger := NewSawtoothTrigger(time.Hour, 150_000, 75_000)
+	var persisted string
+	trigger.SetPersistFunc(func(_ string, value string) { persisted = value })
+	s := NewServer(Config{})
+	s.Sawtooth = trigger
+	system := json.RawMessage(`"stable system"`)
+	tools := json.RawMessage(`[{"name":"Read"}]`)
+	forwarded := pipelineMessages(9, 4)
+	meta := newRequestMeta(4, "unchanged-forwarded-baseline")
+	meta.BaselineGeneration = trigger.BeginPressureRequest(meta.RequestSessionID)
+	// decision 的坐标与最终 wire body 完全一致——本轮没有压缩、桩化或注入。
+	meta.PressureDecision = pressureDecision{
+		Available:                 true,
+		MessageCount:              len(forwarded),
+		SelectedPressure:          12_000,
+		SystemFingerprint:         fingerprintTopLevelJSON(system),
+		ToolsFingerprint:          fingerprintTopLevelJSON(tools),
+		MessagesPrefixFingerprint: fingerprintMessagesPrefix(forwarded, len(forwarded)),
+	}
+
+	markForwardedPressureCoordinates(meta, forwardedPressureBody(t, system, tools, forwarded))
+	if meta.PressureDecision.ForwardedCoordinatesChanged || !meta.PressureDecision.ForwardedCoordinatesBound {
+		t.Fatalf("未改写的 body 应为 changed=false bound=true: %+v", meta.PressureDecision)
+	}
+	if updated := s.applyPressureBaselineUsage(meta, 31_500); !updated {
+		t.Fatal("未改写但已绑定的 actual 未被接受为 exact baseline")
+	}
+	if meta.BaselineUpdateKind != pressureBaselineUpdateExact {
+		t.Fatalf("baseline update kind=%q, want exact", meta.BaselineUpdateKind)
+	}
+	var state persistedState
+	if err := json.Unmarshal([]byte(persisted), &state); err != nil {
+		t.Fatalf("解析 exact baseline: %v raw=%q", err, persisted)
+	}
+	if state.Tokens != 31_500 || state.Conservative || state.MsgCount != len(forwarded) {
+		t.Fatalf("持久化 exact baseline=%+v", state)
 	}
 }
 
