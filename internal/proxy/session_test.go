@@ -28,7 +28,10 @@ func TestAgentRequestFeatures(t *testing.T) {
 				"system":   json.RawMessage(`"private system prompt"`),
 				"metadata": json.RawMessage(`{"user_id":"secret-user"}`),
 			},
-			headers:  map[string]string{"X-Claude-Code-Session-Id": "secret-session"},
+			headers: map[string]string{
+				"X-Claude-Code-Session-Id": "secret-session",
+				"X-Claude-Code-Agent-Id":   "secret-agent",
+			},
 			messages: []Message{{Role: "user", Content: json.RawMessage(`"private message"`)}},
 			want: agentRequestFeatures{
 				ModelFamily:          agentModelFamilyDeepSeek,
@@ -37,6 +40,7 @@ func TestAgentRequestFeatures(t *testing.T) {
 				SystemShape:          agentSystemShapeString,
 				MetadataPresent:      true,
 				SessionHeaderPresent: true,
+				AgentIDHeaderPresent: true,
 				ParentRelation:       agentParentRelationUnavailable,
 				AgentContextType:     agentContextTypeMissing,
 				MessagesPresent:      true,
@@ -107,6 +111,7 @@ func TestAgentDiagnosticRedaction(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/messages", nil)
 	req.Header.Set("Authorization", secretAuth)
 	req.Header.Set("X-Claude-Code-Session-Id", secretSession)
+	req.Header.Set("X-Claude-Code-Agent-Id", "TOP-SECRET-AGENT")
 	messages := []Message{{Role: "user", Content: json.RawMessage(`"` + secretMessage + `"`)}}
 
 	var output bytes.Buffer
@@ -116,14 +121,14 @@ func TestAgentDiagnosticRedaction(t *testing.T) {
 
 	logAgentRequestFeatures(slog.Default(), extractAgentRequestFeatures(req, bodyMap, messages))
 	got := output.String()
-	for _, secret := range []string{secretSystem, secretMessage, secretAuth, secretSession} {
+	for _, secret := range []string{secretSystem, secretMessage, secretAuth, secretSession, "TOP-SECRET-AGENT"} {
 		if strings.Contains(got, secret) {
 			t.Fatalf("诊断日志泄漏敏感值 %q: %s", secret, got)
 		}
 	}
 	for _, field := range []string{
 		"agent_features", "model_family=deepseek", "thinking_present=true",
-		"system_present=true", "session_header_present=true", "parent_relation=unavailable",
+		"system_present=true", "session_header_present=true", "agent_id_header_present=true", "parent_relation=unavailable",
 		"agent_context_type=missing", "parent_session_present=true",
 	} {
 		if !strings.Contains(got, field) {
@@ -205,6 +210,7 @@ func TestAgentFixtureSchemaRejectsSensitivePayload(t *testing.T) {
 	allowedCase := map[string]bool{"expected_role": true, "features": true}
 	allowedFeatures := map[string]bool{
 		"model_family": true, "thinking_present": true, "sdk_ts_marker_present": true,
+		"agent_id_header_present": true,
 		"billing_subagent_marker": true, "agent_context_type": true,
 		"parent_session_present": true, "messages_present": true,
 	}
@@ -326,6 +332,7 @@ func TestAgentClassificationCompatibilityPrecedence(t *testing.T) {
 
 func TestAgentClassificationStrongFeaturePrecedence(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/messages", nil)
+	req.Header.Set("X-Claude-Code-Agent-Id", "agent-v220")
 	req.Header.Set("x-anthropic-billing-header", "cc_is_subagent=true")
 	bodyMap := map[string]json.RawMessage{
 		"model":        json.RawMessage(`"deepseek-v4-pro"`),
@@ -334,8 +341,24 @@ func TestAgentClassificationStrongFeaturePrecedence(t *testing.T) {
 		"agentContext": json.RawMessage(`{"agentType":"subagent","parentSessionId":"parent-secret"}`),
 	}
 	got := classifyAgentRequest(req, bodyMap, []Message{{Role: "user", Content: json.RawMessage(`"hello"`)}})
-	if got.Role != agentRoleSubagent || got.Reason != agentReasonBillingMarker {
-		t.Fatalf("组合强特征 classification = %#v, want billing marker precedence", got)
+	if got.Role != agentRoleSubagent || got.Reason != agentReasonAgentIDHeader {
+		t.Fatalf("组合强特征 classification = %#v, want agent ID header precedence", got)
+	}
+}
+
+func TestAgentIDHeaderIsStrongSubagentMarker(t *testing.T) {
+	req := httptest.NewRequest("POST", "/v1/messages", nil)
+	req.Header.Set("X-Claude-Code-Session-Id", "shared-main-session")
+	req.Header.Set("X-Claude-Code-Agent-Id", "ae62648d28a17ee1a")
+	bodyMap := map[string]json.RawMessage{
+		"model":    json.RawMessage(`"deepseek-v4-pro"`),
+		"thinking": json.RawMessage(`{"type":"enabled"}`),
+		"system":   json.RawMessage(`[{"type":"text","text":"ordinary system"}]`),
+	}
+
+	got := classifyAgentRequest(req, bodyMap, []Message{{Role: "user", Content: json.RawMessage(`"hello"`)}})
+	if got.Role != agentRoleSubagent || got.Reason != agentReasonAgentIDHeader {
+		t.Fatalf("X-Claude-Code-Agent-Id classification = %#v", got)
 	}
 }
 

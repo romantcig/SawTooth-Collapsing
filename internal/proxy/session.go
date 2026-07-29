@@ -47,6 +47,7 @@ type agentClassificationReason string
 
 const (
 	agentReasonBillingMarker      agentClassificationReason = "billing_marker"
+	agentReasonAgentIDHeader      agentClassificationReason = "agent_id_header"
 	agentReasonAgentContextType   agentClassificationReason = "agent_context_type"
 	agentReasonAgentContextParent agentClassificationReason = "agent_context_parent"
 	agentReasonSystemAttribution  agentClassificationReason = "system_attribution"
@@ -82,6 +83,7 @@ type agentRequestFeatures struct {
 	SDKTSMarkerPresent        bool                `json:"sdk_ts_marker_present"`
 	MetadataPresent           bool                `json:"metadata_present"`
 	SessionHeaderPresent      bool                `json:"session_header_present"`
+	AgentIDHeaderPresent      bool                `json:"agent_id_header_present"`
 	ParentMarkerPresent       bool                `json:"parent_marker_present"`
 	ParentRelation            agentParentRelation `json:"parent_relation"`
 	BillingSubagentMarker     bool                `json:"billing_subagent_marker"`
@@ -104,6 +106,7 @@ func extractAgentRequestFeatures(r *http.Request, bodyMap map[string]json.RawMes
 	if r != nil {
 		sessionID := strings.TrimSpace(r.Header.Get("X-Claude-Code-Session-Id"))
 		features.SessionHeaderPresent = sessionID != ""
+		features.AgentIDHeaderPresent = strings.TrimSpace(r.Header.Get("X-Claude-Code-Agent-Id")) != ""
 		features.BillingSubagentMarker = hasBillingSubagentMarker(r.Header.Values("x-anthropic-billing-header"))
 	}
 	features.AgentContextType, features.ParentSessionPresent = inspectAgentContext(bodyMap["agentContext"])
@@ -120,6 +123,8 @@ func extractAgentRequestFeatures(r *http.Request, bodyMap map[string]json.RawMes
 
 func classifyAgentFeatures(features agentRequestFeatures) agentClassification {
 	switch {
+	case features.AgentIDHeaderPresent:
+		return agentClassification{Role: agentRoleSubagent, Reason: agentReasonAgentIDHeader}
 	case features.BillingSubagentMarker:
 		return agentClassification{Role: agentRoleSubagent, Reason: agentReasonBillingMarker}
 	case features.AgentContextType == agentContextTypeSubagent:
@@ -253,6 +258,7 @@ func logAgentRequestFeatures(logger *slog.Logger, features agentRequestFeatures)
 		"sdk_ts_marker_present", features.SDKTSMarkerPresent,
 		"metadata_present", features.MetadataPresent,
 		"session_header_present", features.SessionHeaderPresent,
+		"agent_id_header_present", features.AgentIDHeaderPresent,
 		"parent_marker_present", features.ParentMarkerPresent,
 		"parent_relation", features.ParentRelation,
 		"billing_subagent_marker", features.BillingSubagentMarker,

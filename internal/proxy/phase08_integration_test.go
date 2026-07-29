@@ -141,6 +141,7 @@ func TestPhase08AgentIsolationMatrix(t *testing.T) {
 		wantSearch  int
 		wantArchive int
 	}{
+		{name: "CC 2.1.220 agent ID header", headers: map[string]string{"X-Claude-Code-Agent-Id": "ae62648d28a17ee1a"}},
 		{name: "billing subagent", headers: map[string]string{"x-anthropic-billing-header": "cch=1, cc_is_subagent=true"}},
 		{name: "agentContext subagent", extra: map[string]any{"agentContext": map[string]any{"agentType": "subagent", "parentSessionId": "parent-secret"}}},
 		{name: "system attribution subagent", extra: map[string]any{"system": []map[string]any{{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.207; cc_is_subagent=true"}}}},

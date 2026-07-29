@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "evidence": "cc_billing_subagent_marker",
+  "evidence": "cc_v2_1_220_agent_id_header",
   "cases": [
     {
       "expected_role": "subagent",
@@ -8,7 +8,8 @@
         "model_family": "deepseek",
         "thinking_present": true,
         "sdk_ts_marker_present": true,
-        "billing_subagent_marker": true,
+        "agent_id_header_present": true,
+        "billing_subagent_marker": false,
         "agent_context_type": "main",
         "parent_session_present": false,
         "messages_present": true

@@ -811,7 +811,7 @@ func testSubagentResponseState(t *testing.T, sse bool) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Claude-Code-Session-Id", sessionID)
-	req.Header.Set("x-anthropic-billing-header", "cc_is_subagent=true")
+	req.Header.Set("X-Claude-Code-Agent-Id", "ae62648d28a17ee1a")
 	recorder := httptest.NewRecorder()
 	server.HandleMessages(recorder, req)
 	if recorder.Code != http.StatusOK {
@@ -891,7 +891,7 @@ func testHandleMessagesDirectAgentBypass(t *testing.T, _ ...string) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Claude-Code-Session-Id", sessionID)
-	req.Header.Set("x-anthropic-billing-header", "cch=12345, cc_is_subagent=true")
+	req.Header.Set("X-Claude-Code-Agent-Id", "ac3d8abb21a98f939")
 	recorder := httptest.NewRecorder()
 	server.HandleMessages(recorder, req)
 
