@@ -149,7 +149,7 @@ func TestPressureDecisionUsesLegacyHighWaterAboveThreshold(t *testing.T) {
 	}
 }
 
-func TestPressureDecisionConservativeFloorNeverLowersLocalFull(t *testing.T) {
+func TestPressureDecisionIgnoresLegacyConservativeBaseline(t *testing.T) {
 	tokenCounter, err := NewTokenCounter()
 	if err != nil {
 		t.Fatalf("NewTokenCounter: %v", err)
@@ -168,15 +168,21 @@ func TestPressureDecisionConservativeFloorNeverLowersLocalFull(t *testing.T) {
 		ResetReason:               baselineResetNone,
 	}
 	decision := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 16_000)
-	if decision.Source != pressureSourceConservativePlusDelta || decision.SelectedPressure != decision.FullLocalEstimate {
-		t.Fatalf("低 conservative floor 压低了 local_full: %+v", decision)
+	if decision.Source != pressureSourceLocalFull || decision.ResetReason != baselineResetLegacyUnverified || decision.SelectedPressure != decision.FullLocalEstimate {
+		t.Fatalf("旧 conservative baseline 未回退到 local_full: %+v", decision)
 	}
 
 	baseline.ActualTokens = 190_000
 	high := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 150_000)
-	want := saturatingAdd(baseline.ActualTokens, tokenCounter.CountMessagesTokens(messages[2:]))
-	if high.Source != pressureSourceConservativePlusDelta || high.SelectedPressure != want || high.SelectedPressure <= high.FullLocalEstimate {
-		t.Fatalf("高 conservative floor 未抬高 pressure: got=%+v want=%d", high, want)
+	if high.Source != pressureSourceLocalFull || high.ResetReason != baselineResetLegacyUnverified || high.SelectedPressure != high.FullLocalEstimate {
+		t.Fatalf("高 conservative baseline 仍抬高 pressure: %+v", high)
+	}
+	baseline.SystemFingerprint = ""
+	baseline.ToolsFingerprint = ""
+	baseline.MessagesPrefixFingerprint = ""
+	invalidCoordinates := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 150_000)
+	if invalidCoordinates.Source != pressureSourceLocalFull || invalidCoordinates.ResetReason != baselineResetLegacyUnverified || invalidCoordinates.SelectedPressure != invalidCoordinates.FullLocalEstimate {
+		t.Fatalf("缺少坐标的旧 conservative baseline 仍进入 legacy high-water: %+v", invalidCoordinates)
 	}
 }
 
@@ -196,8 +202,10 @@ func TestPressureDecisionMessageEditKeepsObservedHighWater(t *testing.T) {
 		SystemFingerprint:         fingerprintTopLevelJSON(system),
 		ToolsFingerprint:          fingerprintTopLevelJSON(tools),
 		MessagesPrefixFingerprint: fingerprintMessagesPrefix(base, len(base)),
-		Conservative:              true,
-		Available:                 true,
+		// 这是精确 baseline 的消息编辑场景；旧 conservative baseline
+		// 的高水位不再参与 pressure（由上一测试覆盖）。
+		Conservative: false,
+		Available:    true,
 	}
 
 	decision := buildPressureDecision(edited, system, tools, baseline, tokenCounter, 150_000)
@@ -320,6 +328,71 @@ func TestPressureDecisionThresholdBehavior(t *testing.T) {
 	}
 	if got := pause.ShouldTrigger("pause", 100); got != TriggerNone {
 		t.Fatalf("选定压力未超过 minimum 却触发 pause: %q", got)
+	}
+}
+
+func TestHandleMessagesPressureUsesEagerStubbedShape(t *testing.T) {
+	var forwarded []Message
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []Message `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		forwarded = deepCopyMessages(body.Messages)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":1200,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	toolUse := Message{Role: "assistant", Content: json.RawMessage(mustMarshalJSON(t, []map[string]any{{
+		"type": "tool_use", "id": "tool-large-read", "name": "Read",
+		"input": map[string]any{"file_path": "large.go"},
+	}}))}
+	toolResult := Message{Role: "user", Content: json.RawMessage(mustMarshalJSON(t, []map[string]any{{
+		"type": "tool_result", "tool_use_id": "tool-large-read",
+		"content": strings.Repeat("large historical tool output ", 30_000),
+	}}))}
+	messages := []Message{
+		{Role: "user", Content: mustMarshal("inspect the large file")},
+		toolUse,
+		toolResult,
+		{Role: "assistant", Content: mustMarshal("I processed the file contents")},
+		{Role: "user", Content: mustMarshal("continue with the result")},
+	}
+	rawTokens := server.TokenCounter.CountMessagesTokens(messages)
+	if rawTokens <= server.Config.Stubify.TokenThreshold {
+		t.Fatalf("fixture raw tokens=%d, want above threshold=%d", rawTokens, server.Config.Stubify.TokenThreshold)
+	}
+
+	var decision pressureDecision
+	server.searchAndExpandFn = func(current []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, meta *requestMeta) RecallOutcome {
+		decision = meta.PressureDecision
+		return RecallOutcome{Messages: current}
+	}
+	servePipelineRequest(t, server, "eager-pressure-shape", messages)
+
+	if decision.MessagesLocalTokens >= server.Config.Stubify.TokenThreshold || decision.SelectedPressure >= server.Config.Stubify.TokenThreshold {
+		t.Fatalf("pressure 仍使用 eager 前 raw 历史: raw=%d decision=%+v", rawTokens, decision)
+	}
+	if decision.TriggerReason != TriggerNone || decision.CompressDecision {
+		t.Fatalf("eager 后有效上下文很小却触发压缩: %+v", decision)
+	}
+	if got := archiveCount(t, server.Store); got != 0 {
+		t.Fatalf("eager 足以降压时仍产生 collapse archive: %d", got)
+	}
+	if len(forwarded) != len(messages) {
+		t.Fatalf("forwarded messages=%d, want transparent count=%d", len(forwarded), len(messages))
+	}
+	blocks, _ := parseContent(forwarded[2].Content)
+	if len(blocks) != 1 {
+		t.Fatalf("forwarded tool_result blocks=%d, want 1", len(blocks))
+	}
+	stub, ok := blocks[0].Content.(string)
+	if !ok || !strings.Contains(stub, "[Read large.go") {
+		t.Fatalf("历史 tool_result 未按 eager 形状发送: %q", blocks[0].Content)
 	}
 }
 
@@ -1075,8 +1148,8 @@ func TestHandleMessagesCollapsedActualDoesNotCalibrateRawHistory(t *testing.T) {
 	}
 
 	servePipelineRequest(t, server, sessionID, raw)
-	if baseline := server.Sawtooth.PressureBaseline(sessionID); !baseline.Available || !baseline.Conservative || baseline.ActualTokens <= 100 {
-		t.Fatalf("压缩响应未保留 raw pressure floor: %+v", baseline)
+	if baseline := server.Sawtooth.PressureBaseline(sessionID); !baseline.Available || baseline.Conservative || baseline.ActualTokens != 100 || baseline.MessageCount != len(forwarded[0]) || baseline.MessagesPrefixFingerprint != fingerprintMessagesPrefix(forwarded[0], len(forwarded[0])) {
+		t.Fatalf("压缩响应未按最终 forwarded 坐标写入 exact baseline: %+v", baseline)
 	}
 
 	nextRaw := append(deepCopyMessages(raw), pipelineMessages(1, 20)...)
@@ -1085,8 +1158,8 @@ func TestHandleMessagesCollapsedActualDoesNotCalibrateRawHistory(t *testing.T) {
 	if len(decisions) != 2 {
 		t.Fatalf("pressure decisions=%d, want 2", len(decisions))
 	}
-	if decisions[1].Source != pressureSourceConservativePlusDelta || decisions[1].ResetReason != baselineResetNone || decisions[1].SelectedPressure < decisions[1].FullLocalEstimate {
-		t.Fatalf("第二轮未以 conservative floor 安全决策: %+v", decisions[1])
+	if decisions[1].Source != pressureSourceActualPlusDelta || decisions[1].ResetReason != baselineResetNone || decisions[1].SelectedPressure >= decisions[1].Threshold || decisions[1].CompressDecision {
+		t.Fatalf("第二轮未按 exact baseline + tail delta 决策: %+v", decisions[1])
 	}
 	if len(forwarded) != 2 || len(forwarded[0]) >= len(raw) || len(forwarded[1]) >= len(nextRaw) {
 		t.Fatalf("两轮均应压缩 raw 历史: forwarded=%v raw=%d/%d", []int{len(forwarded[0]), len(forwarded[1])}, len(raw), len(nextRaw))
@@ -1462,8 +1535,8 @@ func TestHandleMessagesCollapseThenRestore(t *testing.T) {
 			t.Fatalf("fresh tail %d count=%d, want 1", i, got)
 		}
 	}
-	if got := archiveCount(t, server.Store); got != archivesAfterFreeze+1 {
-		t.Fatalf("context 坐标变化重压缩后的 archive rows=%d, want %d", got, archivesAfterFreeze+1)
+	if got := archiveCount(t, server.Store); got != archivesAfterFreeze {
+		t.Fatalf("Frozen 命中且有效压力未超阈值时不应重复 archive: rows=%d, want %d", got, archivesAfterFreeze)
 	}
 	detachedSecond, _ := DetachPersistentUserContext(secondRaw)
 	if result := server.Frozen.Get("thread-restore", StripReminders(detachedSecond)); result == nil {

@@ -542,20 +542,61 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 	writeClassifiedGatewayError(w, decision, "failed to read upstream response", false)
 }
 
-// markForwardedPressureCoordinates 证明上游 actual 对应的消息坐标仍与原始 pressure decision 一致。
-// 任何压缩、桩化或修复只要改变了消息历史，就不能把压缩后 actual 绑定回原始历史前缀。
+// markForwardedPressureCoordinates 将 pressure baseline 的坐标绑定到真正发送给上游的
+// system/tools/messages。压缩、桩化、Archive 注入或 orphan repair 改写消息时，
+// ForwardedCoordinatesChanged 仍记录这一事实，但 actual 现在绑定到改写后的真实坐标，
+// 而不是被 max(actual, selected) 人为抬成 conservative floor。
 func markForwardedPressureCoordinates(meta *requestMeta, body []byte) {
 	if meta == nil || !meta.PressureDecision.Available {
 		return
 	}
-	var payload struct {
-		Messages []Message `json:"messages"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil ||
-		len(payload.Messages) != meta.PressureDecision.MessageCount ||
-		fingerprintMessagesPrefix(payload.Messages, len(payload.Messages)) != meta.PressureDecision.MessagesPrefixFingerprint {
+
+	var payload map[string]json.RawMessage
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	if err := decoder.Decode(&payload); err != nil {
 		meta.PressureDecision.ForwardedCoordinatesChanged = true
+		meta.PressureDecision.ForwardedCoordinatesBound = false
+		return
 	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		meta.PressureDecision.ForwardedCoordinatesChanged = true
+		meta.PressureDecision.ForwardedCoordinatesBound = false
+		return
+	}
+
+	messagesRaw, ok := payload["messages"]
+	if !ok || bytes.Equal(bytes.TrimSpace(messagesRaw), []byte("null")) || len(bytes.TrimSpace(messagesRaw)) == 0 || bytes.TrimSpace(messagesRaw)[0] != '[' {
+		meta.PressureDecision.ForwardedCoordinatesChanged = true
+		meta.PressureDecision.ForwardedCoordinatesBound = false
+		return
+	}
+	var messages []Message
+	if err := json.Unmarshal(messagesRaw, &messages); err != nil {
+		meta.PressureDecision.ForwardedCoordinatesChanged = true
+		meta.PressureDecision.ForwardedCoordinatesBound = false
+		return
+	}
+
+	systemFingerprint := fingerprintTopLevelJSON(payload["system"])
+	toolsFingerprint := fingerprintTopLevelJSON(payload["tools"])
+	messagesPrefixFingerprint := fingerprintMessagesPrefix(messages, len(messages))
+	decision := &meta.PressureDecision
+	coordinatesChanged :=
+		decision.MessageCount != len(messages) ||
+			decision.SystemFingerprint != systemFingerprint ||
+			decision.ToolsFingerprint != toolsFingerprint ||
+			decision.MessagesPrefixFingerprint != messagesPrefixFingerprint
+	// 保留整个请求生命周期内“曾经发生过改写”的事实；即使某个调用方
+	// 意外重复绑定同一份 body，也不能把首次变化抹掉。
+	decision.ForwardedCoordinatesChanged = decision.ForwardedCoordinatesChanged || coordinatesChanged
+	// 从这一刻起，decision 的坐标就是最终 wire 坐标；响应 actual 可安全
+	// 以 exact baseline 形式写回。原始与 forwarded 是否不同仍由上面的
+	// Changed 字段保留给诊断和回归测试。
+	decision.MessageCount = len(messages)
+	decision.SystemFingerprint = systemFingerprint
+	decision.ToolsFingerprint = toolsFingerprint
+	decision.MessagesPrefixFingerprint = messagesPrefixFingerprint
+	decision.ForwardedCoordinatesBound = true
 }
 
 type pressureBaselineUpdateKind string
@@ -567,10 +608,9 @@ const (
 	pressureBaselineUpdateStale        pressureBaselineUpdateKind = "stale_epoch"
 )
 
-// applyPressureBaselineUsage 在 actual 与原始消息坐标一致时建立精确 baseline。
-// 若 forwarded 历史被改写，则保存 max(本轮原始 pressure, 上游 actual) 作为保守高水位；
-// 该 floor 后续只能抬高 pressure，不能冒充精确 raw actual 或压低 local_full。
-// 返回值仅表示精确 actual baseline 是否被接受，保持 baseline_updated 的既有语义。
+// applyPressureBaselineUsage 在 actual 与最终 forwarded 消息坐标绑定后建立精确 baseline。
+// 若 forwarded body 无法解析，则拒绝写回；保留真正的 stale epoch 门禁，避免迟到
+// 响应污染当前分支。返回值表示 exact actual baseline 是否被接受。
 func (s *Server) applyPressureBaselineUsage(meta *requestMeta, actual int) bool {
 	if meta == nil || actual <= 0 || s.Sawtooth == nil || !meta.tracksSawtoothState() || !meta.PressureDecision.Available {
 		return false
@@ -586,14 +626,10 @@ func (s *Server) applyPressureBaselineUsage(meta *requestMeta, actual int) bool 
 		return false
 	}
 	decision := meta.PressureDecision
-	if decision.ForwardedCoordinatesChanged {
-		pressureFloor := actual
-		if decision.SelectedPressure > pressureFloor {
-			pressureFloor = decision.SelectedPressure
-		}
-		if s.Sawtooth.UpdatePressureFloorForRequest(stateKey, meta.BaselineGeneration, pressureFloor, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint) {
-			meta.BaselineUpdateKind = pressureBaselineUpdateConservative
-		}
+	if decision.ForwardedCoordinatesChanged && !decision.ForwardedCoordinatesBound {
+		// markForwardedPressureCoordinates 无法证明 actual 对应的消息坐标，
+		// 绝不能沿用旧坐标或退回 conservative floor。
+		meta.BaselineUpdateKind = pressureBaselineUpdateNone
 		return false
 	}
 	updated := s.Sawtooth.UpdatePressureBaselineForRequest(stateKey, meta.BaselineGeneration, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint)

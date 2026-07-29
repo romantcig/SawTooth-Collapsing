@@ -414,9 +414,13 @@ type pressureDecision struct {
 	ToolsFingerprint            string
 	MessagesPrefixFingerprint   string
 	ForwardedCoordinatesChanged bool
-	SystemFingerprintChanged    bool
-	ToolsFingerprintChanged     bool
-	CompressDecision            bool
+	// ForwardedCoordinatesBound 表示响应 usage 写回前，最终 wire body 的
+	// system/tools/messages 坐标已经成功解析并绑定到本次 decision。
+	// false 且 ForwardedCoordinatesChanged=true 时，禁止把 actual 写回 baseline。
+	ForwardedCoordinatesBound bool
+	SystemFingerprintChanged  bool
+	ToolsFingerprintChanged   bool
+	CompressDecision          bool
 }
 
 type topLevelMeasurement struct {
@@ -519,6 +523,14 @@ func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessa
 		ToolsFingerprint:          tools.fingerprint,
 		MessagesPrefixFingerprint: fingerprintMessagesPrefix(messages, len(messages)),
 	}
+	if baseline.Conservative {
+		// Conservative 是旧版在 forwarded 坐标改变时写入的不可验证高水位。
+		// 无论旧记录是否带有新坐标指纹，都不能先进入 legacy high-water
+		// 分支；必须回退到 eager 后的 local_full，等待本轮 exact 响应重建。
+		decision.Source = pressureSourceLocalFull
+		decision.ResetReason = baselineResetLegacyUnverified
+		return decision
+	}
 
 	baselineValid := baseline.Available && baseline.ActualTokens > 0 && baseline.MessageCount >= 0 &&
 		validPressureFingerprint(baseline.SystemFingerprint) && validPressureFingerprint(baseline.ToolsFingerprint) &&
@@ -561,7 +573,6 @@ func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessa
 		}
 		return decision
 	}
-
 	delta := 0
 	if tc != nil {
 		delta = tc.CountMessagesTokens(messages[baseline.MessageCount:])
@@ -570,16 +581,27 @@ func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessa
 	actualPlusDelta := saturatingAdd(baseline.ActualTokens, delta)
 	decision.SelectedPressure = actualPlusDelta
 	decision.Source = pressureSourceActualPlusDelta
-	if baseline.Conservative {
-		// forwarded 改写后的 actual 只作为 pressure floor；绝不能覆盖更高的
-		// 完整本地估算，从而避免压缩后低 actual 让下一轮 raw 历史漏压缩。
-		if decision.FullLocalEstimate > decision.SelectedPressure {
-			decision.SelectedPressure = decision.FullLocalEstimate
-		}
-		decision.Source = pressureSourceConservativePlusDelta
-	}
 	decision.ResetReason = baselineResetNone
 	return decision
+}
+
+// previewEagerPressureShape 生成“若本轮不做重型压缩，实际上游会看到的消息形状”。
+// 预演不传 EagerStubMemory，因此不会读取或写入 sticky 状态；规则本身是确定性的，
+// 只会压缩已经有后续 assistant 回合的大 tool_result。Frozen prefix 已是上轮真实
+// wire 快照，故只预演 fresh tail，避免用压缩前 raw 历史虚增 pressure。
+func previewEagerPressureShape(messages []Message, frozenBoundary int, tc *TokenCounter) []Message {
+	if len(messages) == 0 || tc == nil {
+		return deepCopyMessages(messages)
+	}
+	if frozenBoundary < 0 || frozenBoundary > len(messages) {
+		frozenBoundary = 0
+	}
+	preview := EagerStubToolResults(
+		messagesToAny(messages),
+		frozenBoundary,
+		func(text string) int { return tc.CountTokens(text) },
+	)
+	return anyToMessages(preview)
 }
 
 // logHistoryMismatch 只记录 manager 已持久去重后的首次 input-history 差异。
@@ -803,25 +825,12 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		if s.Sawtooth != nil && historyReuseSafe {
 			baseline = s.Sawtooth.PressureBaseline(stateKey)
 		}
-		decision := buildPressureDecision(rawMessages, bodyMap["system"], bodyMap["tools"], baseline, s.TokenCounter, threshold)
-		if s.Sawtooth != nil {
-			decision.TriggerReason = s.Sawtooth.ShouldTrigger(stateKey, decision.SelectedPressure)
-		} else if decision.SelectedPressure > threshold {
-			decision.TriggerReason = TriggerTokens
-		}
-		if s.HistoryEpoch != nil && !historyReuseSafe && !meta.HistoryEpochChanged {
-			decision.ResetReason = baselineResetMessagesChanged
-		}
-		decision.CompressDecision = decision.TriggerReason != TriggerNone
-		meta.PressureDecision = decision
-		s.writePressureDecisionDebugFacts(meta, rawTimestamp)
-		logPressureSummary(meta)
 		messages = historyMessages
 
 		// Phase 4 Step 0: 保存原始 token 估算和消息数（SawtoothTrigger + frozen cutoff）
 		// rawCutoff 必须在 reexpand 前保存——reexpand 会注入 archive block 增加消息数
 		// 对标 YesMem: cutoff := len(messages) 使用原始（未修改）消息数
-		rawEstimate := decision.MessagesLocalTokens
+		rawEstimate := s.TokenCounter.CountMessagesTokens(rawMessages)
 		rawCutoff := len(messages)
 		historyEstimate := s.TokenCounter.CountMessagesTokens(messages)
 		contextTokens := rawEstimate - historyEstimate
@@ -870,49 +879,58 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// 先基于 frozen+tail 判定 frozen 是否仍有效，确定本请求唯一的权威基础消息。
-		totalTokens := contextTokens + s.TokenCounter.CountMessagesTokens(messages)
-		pressureTrigger := decision.TriggerReason
-
-		// ── YesMem shouldInvalidateFrozen ──
-		// frozen prefix 存在时，若 frozen+tail 仍在阈值内则跳过压缩管线。
-		// 对标 YesMem proxy.go:1230: shouldInvalidateFrozen(combinedTokens, threshold)
-		needCompress := decision.CompressDecision
-		if frozenPrefixLen > 0 && needCompress {
-			// 用原始消息切片计算 tail tokens——防止 frozen prefix 替换后
-			// len(messages) < raw cutoff 导致切片越界
-			var tailTokens int
-			if frozenRawCutoff <= len(originalMessages) {
-				tailTokens = s.TokenCounter.CountMessagesTokens(originalMessages[frozenRawCutoff:])
+		selectPressure := func(candidate []Message, frozenBoundary int) pressureDecision {
+			pressureMessages := previewEagerPressureShape(candidate, frozenBoundary, s.TokenCounter)
+			pressureMessages = finalizeMessages(pressureMessages)
+			selected := buildPressureDecision(pressureMessages, bodyMap["system"], bodyMap["tools"], baseline, s.TokenCounter, threshold)
+			if s.Sawtooth != nil {
+				selected.TriggerReason = s.Sawtooth.ShouldTrigger(stateKey, selected.SelectedPressure)
+			} else if selected.SelectedPressure > threshold {
+				selected.TriggerReason = TriggerTokens
 			}
-			combinedTokens := contextTokens + frozenTokens + tailTokens
-			if combinedTokens <= threshold && pressureTrigger == TriggerNone {
-				needCompress = false
-				meta.Logger.Info("frozen prefix 仍在阈值内，跳过压缩",
-					"frozen_tokens", frozenTokens,
-					"tail_tokens", tailTokens,
-					"combined_tokens", combinedTokens,
-					"threshold", threshold,
-					LogLightGreen,
-				)
-			} else {
+			if s.HistoryEpoch != nil && !historyReuseSafe && !meta.HistoryEpochChanged {
+				selected.ResetReason = baselineResetMessagesChanged
+			}
+			selected.CompressDecision = selected.TriggerReason != TriggerNone
+			return selected
+		}
+
+		// 先按 Frozen prefix + fresh tail 的实际候选 wire 形状做压力判定。
+		// 只有候选仍超限（或满足 pause 条件）时才丢弃 Frozen 并回到 raw history。
+		decision := selectPressure(messages, frozenPrefixLen)
+		if frozenPrefixLen > 0 {
+			if decision.CompressDecision {
 				meta.Logger.Info("frozen prefix 不足，重新压缩",
+					"raw_cutoff", frozenRawCutoff,
 					"frozen_tokens", frozenTokens,
-					"tail_tokens", tailTokens,
-					"combined_tokens", combinedTokens,
+					"effective_pressure", decision.SelectedPressure,
 					"threshold", threshold,
 					LogGreen,
 				)
-				// frozen prefix 失效——清除并从原始消息重新压缩
-				// 对标 YesMem: frozen=nil 后 runStubCycle(messages) 使用原始未压缩消息
 				s.Frozen.InvalidateWithLogger(meta.Logger, stateKey)
 				messages = originalMessages
 				frozenRawCutoff = 0
 				frozenPrefixLen = 0
-				// 重新计算 totalTokens（基于原始未压缩消息）
-				totalTokens = contextTokens + s.TokenCounter.CountMessagesTokens(messages)
+				frozenTokens = 0
+				decision = selectPressure(messages, 0)
+			} else {
+				meta.Logger.Info("frozen prefix 仍在阈值内，跳过压缩",
+					"raw_cutoff", frozenRawCutoff,
+					"frozen_tokens", frozenTokens,
+					"effective_pressure", decision.SelectedPressure,
+					"threshold", threshold,
+					LogLightGreen,
+				)
 			}
 		}
+		meta.PressureDecision = decision
+		s.writePressureDecisionDebugFacts(meta, rawTimestamp)
+		logPressureSummary(meta)
+
+		// raw 消息仍是重型压缩与 Archive 的权威来源；pressure 只使用 eager 后候选。
+		totalTokens := contextTokens + s.TokenCounter.CountMessagesTokens(messages)
+		pressureTrigger := decision.TriggerReason
+		needCompress := decision.CompressDecision
 
 		// Frozen 最终有效性确定后，每个请求只执行一次 Archive 搜索与注入。
 		// RecallOutcome 保存在请求局部变量中，后续日志可直接复用最终结果。

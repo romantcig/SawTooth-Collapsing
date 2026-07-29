@@ -56,9 +56,10 @@ func TestDebugRequestPathUsesStrictHierarchyAndStageEnum(t *testing.T) {
 			t.Fatalf("非法 stage %q 未失败关闭", stage)
 		}
 	}
-	badMeta := *meta
+	badMeta := newRequestMeta(meta.ID, meta.RequestSessionID)
+	badMeta.RunID = meta.RunID
 	badMeta.SessionHash = "../../escape"
-	if _, err := server.debugLayout.RequestPath(&badMeta, debugArtifactRawBody); err == nil {
+	if _, err := server.debugLayout.RequestPath(badMeta, debugArtifactRawBody); err == nil {
 		t.Fatal("非法 session hash 未失败关闭")
 	}
 }

@@ -1094,9 +1094,10 @@ func (st *SawtoothTrigger) UpdatePressureBaselineForRequest(threadID string, gen
 	return st.updatePressureBaselineForRequest(threadID, generation, totalInputTokens, messageCount, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint, false)
 }
 
-// UpdatePressureFloorForRequest 保存与原始请求坐标绑定的保守压力高水位。
-// 它用于 forwarded 历史被改写、上游 actual 不能冒充精确 raw baseline 的场景；
-// 后续决策只能用它抬高 pressure，绝不能让它压低完整本地估算。
+// UpdatePressureFloorForRequest 保留旧版本 conservative baseline 的兼容入口。
+// 当前生产 response 路径不再调用它：forwarded body 会先绑定真实 wire 坐标，
+// 再通过 UpdatePressureBaselineForRequest 写入 exact baseline。旧数据库中的
+// Conservative=true 记录只用于兼容读取，并会在 pressure 决策中被丢弃。
 func (st *SawtoothTrigger) UpdatePressureFloorForRequest(threadID string, generation uint64, pressureFloor, messageCount int, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint string) bool {
 	return st.updatePressureBaselineForRequest(threadID, generation, pressureFloor, messageCount, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint, true)
 }

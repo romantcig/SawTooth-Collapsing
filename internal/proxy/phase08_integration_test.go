@@ -83,11 +83,11 @@ func TestPhase08CombinedLifecycle(t *testing.T) {
 	if err := json.Unmarshal([]byte(persisted), &state); err != nil {
 		t.Fatalf("parse persisted Sawtooth state: %v raw=%q", err, persisted)
 	}
-	if state.Tokens != 93_252 || state.MsgCount != len(secondRaw) || !state.Conservative || state.SystemFingerprint == "" || state.ToolsFingerprint == "" || state.MessagesPrefixFingerprint == "" {
-		t.Fatalf("forwarded 坐标改变后未保留 conservative pressure floor: %+v", state)
+	if state.Tokens != 93_252 || state.MsgCount != len(forwarded[1]) || state.Conservative || state.SystemFingerprint == "" || state.ToolsFingerprint == "" || state.MessagesPrefixFingerprint != fingerprintMessagesPrefix(forwarded[1], len(forwarded[1])) {
+		t.Fatalf("forwarded 坐标未绑定 exact pressure baseline: %+v", state)
 	}
-	if baseline := server.Sawtooth.PressureBaseline("phase08-combined"); !baseline.Available || !baseline.Conservative || baseline.ActualTokens != 93_252 {
-		t.Fatalf("forwarded 坐标改变后的 pressure floor 不可用: %+v", baseline)
+	if baseline := server.Sawtooth.PressureBaseline("phase08-combined"); !baseline.Available || baseline.Conservative || baseline.ActualTokens != 93_252 || baseline.MessageCount != len(forwarded[1]) || baseline.MessagesPrefixFingerprint != fingerprintMessagesPrefix(forwarded[1], len(forwarded[1])) {
+		t.Fatalf("forwarded 坐标绑定后的 exact baseline 不可用: %+v", baseline)
 	}
 
 	facts := readDebugFactFiles(t, debugDir, "phase08-combined")
@@ -119,10 +119,10 @@ func TestPhase08CombinedLifecycle(t *testing.T) {
 		}
 		if usage := stages[debugStageResponseUsage]; usage.TotalInputTokens != 93252 {
 			t.Fatalf("request %d usage total=%d, want 93252", requestID, usage.TotalInputTokens)
-		} else if usage.BaselineUpdated == nil || *usage.BaselineUpdated {
-			t.Fatalf("request %d baseline_updated=%v, want false", requestID, usage.BaselineUpdated)
-		} else if usage.BaselineUpdateKind == nil || *usage.BaselineUpdateKind != pressureBaselineUpdateConservative {
-			t.Fatalf("request %d baseline_update_kind=%v, want conservative floor", requestID, usage.BaselineUpdateKind)
+		} else if usage.BaselineUpdated == nil || !*usage.BaselineUpdated {
+			t.Fatalf("request %d baseline_updated=%v, want true", requestID, usage.BaselineUpdated)
+		} else if usage.BaselineUpdateKind == nil || *usage.BaselineUpdateKind != pressureBaselineUpdateExact {
+			t.Fatalf("request %d baseline_update_kind=%v, want exact", requestID, usage.BaselineUpdateKind)
 		}
 		if raw := stages[debugStageRawInbound]; raw.ImageCount != 1 || !raw.HasClaudeMDContext {
 			t.Fatalf("request %d raw facts=%+v", requestID, raw)

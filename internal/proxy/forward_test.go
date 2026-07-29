@@ -716,42 +716,93 @@ func TestWriteDebugFileSessionPathCannotEscapeDebugRoot(t *testing.T) {
 	}
 }
 
-func TestForwardedRewritePersistsConservativePressureFloor(t *testing.T) {
+func TestForwardedRewriteBindsExactPressureBaseline(t *testing.T) {
 	trigger := NewSawtoothTrigger(time.Hour, 150_000, 75_000)
 	var persisted string
 	trigger.SetPersistFunc(func(_ string, value string) { persisted = value })
 	s := NewServer(Config{})
 	s.Sawtooth = trigger
-	messages := pipelineMessages(32, 8)
-	fingerprint := fingerprintTopLevelJSON(nil)
-	meta := newRequestMeta(1, "conservative-floor")
+	original := pipelineMessages(32, 8)
+	forwarded := pipelineMessages(4, 2)
+	system := json.RawMessage(`"stable system"`)
+	tools := json.RawMessage(`[{"name":"Read"}]`)
+	meta := newRequestMeta(1, "exact-forwarded-baseline")
 	meta.BaselineGeneration = trigger.BeginPressureRequest(meta.RequestSessionID)
 	meta.PressureDecision = pressureDecision{
-		Available:                   true,
-		MessageCount:                len(messages),
-		SelectedPressure:            109_612,
-		SystemFingerprint:           fingerprint,
-		ToolsFingerprint:            fingerprint,
-		MessagesPrefixFingerprint:   fingerprintMessagesPrefix(messages, len(messages)),
-		ForwardedCoordinatesChanged: true,
+		Available:                 true,
+		MessageCount:              len(original),
+		SelectedPressure:          109_612,
+		SystemFingerprint:         fingerprintTopLevelJSON(system),
+		ToolsFingerprint:          fingerprintTopLevelJSON(tools),
+		MessagesPrefixFingerprint: fingerprintMessagesPrefix(original, len(original)),
 	}
 
-	if updated := s.applyPressureBaselineUsage(meta, 189_173); updated {
-		t.Fatal("改写后的 actual 被错误标记为精确 baseline")
+	body, err := json.Marshal(map[string]any{
+		"system":   system,
+		"tools":    tools,
+		"messages": forwarded,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if meta.BaselineUpdateKind != pressureBaselineUpdateConservative {
-		t.Fatalf("baseline update kind=%q，want conservative floor", meta.BaselineUpdateKind)
+	markForwardedPressureCoordinates(meta, body)
+	if !meta.PressureDecision.ForwardedCoordinatesChanged || !meta.PressureDecision.ForwardedCoordinatesBound {
+		t.Fatalf("forwarded 坐标变化未被绑定: %+v", meta.PressureDecision)
+	}
+	wantMessagesFingerprint := fingerprintMessagesPrefix(forwarded, len(forwarded))
+	if meta.PressureDecision.MessageCount != len(forwarded) || meta.PressureDecision.MessagesPrefixFingerprint != wantMessagesFingerprint {
+		t.Fatalf("decision 未重绑定最终 forwarded 坐标: %+v", meta.PressureDecision)
+	}
+
+	if updated := s.applyPressureBaselineUsage(meta, 27_743); !updated {
+		t.Fatal("改写后的 actual 未被接受为 exact baseline")
+	}
+	if meta.BaselineUpdateKind != pressureBaselineUpdateExact {
+		t.Fatalf("baseline update kind=%q，want exact", meta.BaselineUpdateKind)
 	}
 	var state persistedState
 	if err := json.Unmarshal([]byte(persisted), &state); err != nil {
-		t.Fatalf("解析 conservative floor: %v raw=%q", err, persisted)
+		t.Fatalf("解析 exact baseline: %v raw=%q", err, persisted)
 	}
-	if state.Tokens != 189_173 || !state.Conservative || state.MsgCount != len(messages) || state.MessagesPrefixFingerprint != meta.PressureDecision.MessagesPrefixFingerprint {
-		t.Fatalf("持久化 conservative floor=%+v", state)
+	if state.Tokens != 27_743 || state.Conservative || state.MsgCount != len(forwarded) ||
+		state.SystemFingerprint != fingerprintTopLevelJSON(system) || state.ToolsFingerprint != fingerprintTopLevelJSON(tools) ||
+		state.MessagesPrefixFingerprint != wantMessagesFingerprint {
+		t.Fatalf("持久化 exact baseline=%+v", state)
 	}
 	baseline := trigger.PressureBaseline(meta.RequestSessionID)
-	if !baseline.Available || !baseline.Conservative || baseline.ActualTokens != 189_173 {
-		t.Fatalf("内存 conservative floor=%+v", baseline)
+	if !baseline.Available || baseline.Conservative || baseline.ActualTokens != 27_743 || baseline.MessageCount != len(forwarded) || baseline.MessagesPrefixFingerprint != wantMessagesFingerprint {
+		t.Fatalf("内存 exact baseline=%+v", baseline)
+	}
+}
+
+func TestMalformedForwardedBodyDoesNotWritePressureBaseline(t *testing.T) {
+	trigger := NewSawtoothTrigger(time.Hour, 150_000, 75_000)
+	var persisted string
+	trigger.SetPersistFunc(func(_ string, value string) { persisted = value })
+	s := NewServer(Config{})
+	s.Sawtooth = trigger
+	meta := newRequestMeta(2, "malformed-forwarded-body")
+	meta.BaselineGeneration = trigger.BeginPressureRequest(meta.RequestSessionID)
+	meta.PressureDecision = pressureDecision{
+		Available:                 true,
+		MessageCount:              1,
+		SystemFingerprint:         fingerprintTopLevelJSON(nil),
+		ToolsFingerprint:          fingerprintTopLevelJSON(nil),
+		MessagesPrefixFingerprint: strings.Repeat("a", 64),
+	}
+
+	markForwardedPressureCoordinates(meta, []byte(`{"messages":`))
+	if !meta.PressureDecision.ForwardedCoordinatesChanged || meta.PressureDecision.ForwardedCoordinatesBound {
+		t.Fatalf("malformed body incorrectly bound: %+v", meta.PressureDecision)
+	}
+	if updated := s.applyPressureBaselineUsage(meta, 27_743); updated {
+		t.Fatal("malformed forwarded body unexpectedly updated baseline")
+	}
+	if meta.BaselineUpdateKind != pressureBaselineUpdateNone {
+		t.Fatalf("malformed body baseline kind=%q, want none", meta.BaselineUpdateKind)
+	}
+	if persisted != "" {
+		t.Fatalf("malformed forwarded body wrote persisted state: %q", persisted)
 	}
 }
 
