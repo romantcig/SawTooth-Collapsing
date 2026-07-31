@@ -10,8 +10,12 @@ server:
 proxy:
   # Anthropic API target URL, default: https://api.anthropic.com (optional)
   target: https://api.anthropic.com
-  # Usage deflation coefficient (0.0-1.0), default: 0.7 (optional)
-  deflation: 0.7
+  # Usage deflation coefficient (0.0-1.0), default: 1.0 = off (optional).
+  # Both 0 and 1.0 mean disabled. Sawtooth collapsing already caps the forwarded
+  # context, so Claude Code's auto-compact is structurally out of reach and there
+  # is normally nothing to suppress. Lower it only if your model's context window
+  # sits close to stubify.token_threshold.
+  deflation: 1.0
 
 transport:
   # TCP connection timeout only, default: 15s. Set to 0 to disable this protection.

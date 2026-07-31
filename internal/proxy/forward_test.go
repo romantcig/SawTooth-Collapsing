@@ -46,8 +46,8 @@ func TestTotalInputTokens(t *testing.T) {
 	}
 }
 
-// D-05：四个 token 字段统一打折。cache_* 逃逸衰减会让客户端的
-// input+cache_creation+cache_read 求和混入两套标尺。
+// 只衰减客户端上下文求和的三项；output_tokens 原样透传。
+// cache_* 逃逸衰减会让 input+cache_creation+cache_read 求和混入两套标尺。
 func TestDeflateUsageDeflatesCacheFields(t *testing.T) {
 	usage := map[string]any{
 		"input_tokens":                100,
@@ -62,12 +62,37 @@ func TestDeflateUsageDeflatesCacheFields(t *testing.T) {
 		"input_tokens":                float64(70),
 		"cache_creation_input_tokens": float64(140),
 		"cache_read_input_tokens":     float64(212),
-		"output_tokens":               float64(7),
-		"total_tokens":                float64(429),
+		"output_tokens":               11,           // 未衰减，连类型都不该变
+		"total_tokens":                float64(433), // 70+140+212 + 未衰减的 11
 	}
 	for field, expected := range want {
 		if usage[field] != expected {
 			t.Fatalf("%s=%v, want %v; usage=%+v", field, usage[field], expected, usage)
+		}
+	}
+}
+
+// factor >= 1 表示关闭：usage 必须逐字段原样保留，连 total_tokens 也不重算。
+func TestDeflateUsageDisabledLeavesUsageUntouched(t *testing.T) {
+	for _, factor := range []float64{1.0, 1.5} {
+		usage := map[string]any{
+			"input_tokens":                100,
+			"cache_creation_input_tokens": 201,
+			"cache_read_input_tokens":     303,
+			"output_tokens":               11,
+			"total_tokens":                999, // 故意与各项之和不一致，用来证明没被重算
+		}
+		deflateUsage(usage, factor)
+
+		want := map[string]any{
+			"input_tokens": 100, "cache_creation_input_tokens": 201,
+			"cache_read_input_tokens": 303, "output_tokens": 11, "total_tokens": 999,
+		}
+		for field, expected := range want {
+			if usage[field] != expected {
+				t.Fatalf("factor=%v 时 %s=%v(%T), want %v(%T)；usage 应逐字段原样保留: %+v",
+					factor, field, usage[field], usage[field], expected, expected, usage)
+			}
 		}
 	}
 }
@@ -83,6 +108,57 @@ func TestDeflateUsageKeepsZeroCacheFields(t *testing.T) {
 
 	if usage["cache_creation_input_tokens"] != 0 || usage["cache_read_input_tokens"] != 0 {
 		t.Fatalf("零值 cache 字段被改写: %+v", usage)
+	}
+}
+
+// deflation 默认关闭，且 `deflation: 0` 表示关闭而非"把 usage 全报成 0"。
+func TestDeflationDefaultsOffAndZeroMeansDisabled(t *testing.T) {
+	if got := DefaultConfig().Proxy.Deflation; got != 1.0 {
+		t.Fatalf("默认 deflation=%v, want 1.0（关闭）", got)
+	}
+
+	for name, body := range map[string]string{
+		"显式 0":  "proxy:\n  deflation: 0\n",
+		"越界负值": "proxy:\n  deflation: -1\n",
+		"越界超限": "proxy:\n  deflation: 2\n",
+		"未指定":  "proxy:\n  target: https://api.anthropic.com\n",
+	} {
+		path := filepath.Join(t.TempDir(), "sawtooth.yaml")
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatalf("%s: 写入配置: %v", name, err)
+		}
+		loaded, err := LoadConfig(path)
+		if err != nil {
+			t.Fatalf("%s: LoadConfig: %v", name, err)
+		}
+		if loaded.Proxy.Deflation != 1.0 {
+			t.Fatalf("%s: deflation=%v, want 1.0", name, loaded.Proxy.Deflation)
+		}
+	}
+}
+
+// deflation 关闭时，message_delta 的输入侧剥离仍必须生效——上游中转站
+// 补报的矛盾值一旦透传，客户端计数会跳变，且没有衰减再替它兜底。
+func TestMessageDeltaStrippedEvenWhenDeflationOff(t *testing.T) {
+	s := NewServer(Config{Proxy: ProxyConfig{Deflation: 1.0}})
+	event := []string{
+		"event: message_delta",
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":95944,"cache_read_input_tokens":82432,"output_tokens":246}}`,
+	}
+
+	processed := s.processSSEEvent(event)
+	var data map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(processed[1], "data: ")), &data); err != nil {
+		t.Fatalf("解析转发后的 data: %v; line=%q", err, processed[1])
+	}
+	usage := data["usage"].(map[string]any)
+	for _, field := range []string{"input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"} {
+		if _, present := usage[field]; present {
+			t.Fatalf("deflation 关闭时 %s 未被剥离: %+v", field, usage)
+		}
+	}
+	if usage["output_tokens"] != float64(246) {
+		t.Fatalf("output_tokens=%v, want 246（关闭时不衰减）", usage["output_tokens"])
 	}
 }
 
@@ -113,8 +189,8 @@ func TestProcessSSEEventStripsMessageDeltaInputUsage(t *testing.T) {
 			t.Fatalf("%s 未被剥离: %+v", field, usage)
 		}
 	}
-	if usage["output_tokens"] != float64(123) {
-		t.Fatalf("output_tokens=%v, want 123", usage["output_tokens"])
+	if usage["output_tokens"] != float64(246) {
+		t.Fatalf("output_tokens=%v, want 246（不参与衰减）", usage["output_tokens"])
 	}
 	if delta, _ := data["delta"].(map[string]any); delta["stop_reason"] != "tool_use" {
 		t.Fatalf("delta 未原样保留: %+v", data["delta"])
@@ -140,7 +216,7 @@ func TestProcessSSEEventMessageStartDeflatesCacheFields(t *testing.T) {
 		"input_tokens":                98,
 		"cache_creation_input_tokens": 512,
 		"cache_read_input_tokens":     46528,
-		"output_tokens":               10,
+		"output_tokens":               20, // 不参与衰减
 	}
 	for field, expected := range want {
 		if usage[field] != expected {
@@ -190,7 +266,7 @@ func TestHandleSSEStripsDeltaWhileBaselineKeepsTruth(t *testing.T) {
 			t.Fatalf("message_delta 输入侧 usage 泄漏 %s: %s", forbidden, body)
 		}
 	}
-	for _, required := range []string{`"input_tokens":98`, `"cache_creation_input_tokens":512`, `"cache_read_input_tokens":46528`, `"output_tokens":123`} {
+	for _, required := range []string{`"input_tokens":98`, `"cache_creation_input_tokens":512`, `"cache_read_input_tokens":46528`, `"output_tokens":246`} {
 		if !strings.Contains(body, required) {
 			t.Fatalf("缺少 %s: %s", required, body)
 		}

@@ -31,7 +31,9 @@ type DebugConfig struct {
 type ProxyConfig struct {
 	// Target Anthropic API 目标地址
 	Target string `yaml:"target"`
-	// Deflation usage 衰减系数（0.0-1.0，默认 0.7 表示保留 70%）
+	// Deflation usage 衰减系数（0.0-1.0，默认 1.0 表示不衰减）。
+	// 0 与 1.0 均表示关闭。Sawtooth 折叠已把转发上下文箍在阈值内，
+	// 客户端的 autoCompact 结构性不可达，衰减默认无需开启。
 	Deflation float64 `yaml:"deflation"`
 }
 
@@ -165,7 +167,7 @@ func DefaultConfig() Config {
 		},
 		Proxy: ProxyConfig{
 			Target:    "https://api.anthropic.com",
-			Deflation: 0.7,
+			Deflation: 1.0,
 		},
 		Transport: TransportConfig{
 			DialTimeout:            15 * time.Second,
@@ -278,8 +280,13 @@ func validateConfig(cfg *Config) {
 
 	// deflation 范围校验 (0.0-1.0)
 	if cfg.Proxy.Deflation < 0.0 || cfg.Proxy.Deflation > 1.0 {
-		slog.Warn("非法 deflation 值，回退到默认值", "deflation", cfg.Proxy.Deflation, "default", 0.7)
-		cfg.Proxy.Deflation = 0.7
+		slog.Warn("非法 deflation 值，回退到默认值", "deflation", cfg.Proxy.Deflation, "default", 1.0)
+		cfg.Proxy.Deflation = 1.0
+	} else if cfg.Proxy.Deflation == 0 {
+		// 0 表示关闭衰减，而不是"把 usage 全报成 0"——后者会让客户端
+		// 以为上下文是空的。与 YesMem 的 usage_deflation_factor 语义一致。
+		slog.Info("deflation=0 视为关闭衰减，usage 按原值转发")
+		cfg.Proxy.Deflation = 1.0
 	}
 
 	// target 非空校验

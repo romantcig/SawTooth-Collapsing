@@ -10,8 +10,11 @@ server:
 proxy:
   # Anthropic API 目标地址，默认值: https://api.anthropic.com（可省略）
   target: https://api.anthropic.com
-  # Usage 衰减系数（0.0-1.0），默认值: 0.7（可省略）
-  deflation: 0.7
+  # Usage 衰减系数（0.0-1.0），默认值: 1.0 表示关闭（可省略）
+  # 0 与 1.0 均表示关闭。锯齿折叠已把转发上下文箍在阈值内，Claude Code 的
+  # autoCompact 结构性不可达，通常无需衰减。仅当模型上下文窗口与
+  # stubify.token_threshold 贴得很近时才考虑调低。
+  deflation: 1.0
 
 transport:
   # 仅限制 TCP 建连阶段，默认值: 15s；设为 0 可禁用此项保护

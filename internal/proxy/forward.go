@@ -21,25 +21,27 @@ import (
 	"time"
 )
 
-// deflateUsage 对 Anthropic API usage 字段执行衰减。
-// 遍历 4 个 token 统计字段，每个乘以 factor 后 math.Floor 取整。
-// 值为 0 的字段保持 0（D-06）。
-// 若 usage 含 total_tokens，重新计算为前四项之和（D-05）。
+// deflateUsage 对 Anthropic API usage 的三个输入侧字段执行衰减。
+// 每个乘以 factor 后 math.Floor 取整；值为 0 的字段保持 0（D-06）。
+// factor >= 1 表示关闭，usage 逐字段原样保留。
+// 若 usage 含 total_tokens，重算为三项 deflated 值加未改动的 output_tokens。
 func deflateUsage(usage map[string]any, factor float64) {
-	if usage == nil {
+	if usage == nil || factor >= 1 {
 		return
 	}
 
-	// 四个字段统一 deflate（D-05）。cache_creation_input_tokens 与
+	// 只衰减客户端上下文求和的三项。cache_creation_input_tokens 与
 	// cache_read_input_tokens 不是 input_tokens 的子集——Anthropic 的 input_tokens
 	// 只计未命中缓存的部分，三者互斥、相加才是总输入（见 totalInputTokens）。
-	// 漏掉 cache_* 会让客户端的上下文求和混入 factor 与 1.0 两套标尺，
-	// 缓存命中率越高 deflation 越接近失效。
+	// 漏掉 cache_* 会让该求和混入 factor 与 1.0 两套标尺，缓存命中率越高越失效。
+	//
+	// 有意偏离 D-05 的"四字段"：output_tokens 不进客户端的上下文求和，
+	// 衰减它对抑制 autoCompact 零贡献，只会让输出计数与成本显示失真。
+	// 与 YesMem internal/proxy/usage.go:136 的字段集合一致。
 	tokenFields := []string{
 		"input_tokens",
 		"cache_creation_input_tokens",
 		"cache_read_input_tokens",
-		"output_tokens",
 	}
 
 	var sum float64
@@ -58,9 +60,9 @@ func deflateUsage(usage map[string]any, factor float64) {
 		// num == 0: 保持 0，不加入 sum（D-06）
 	}
 
-	// total_tokens = 前四项 deflated 值之和（D-05）
+	// total_tokens = 三项 deflated 值 + 未衰减的 output_tokens
 	if _, ok := usage["total_tokens"]; ok {
-		usage["total_tokens"] = sum
+		usage["total_tokens"] = sum + toFloat64(usage["output_tokens"])
 	}
 }
 
