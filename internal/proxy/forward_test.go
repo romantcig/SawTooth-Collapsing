@@ -46,6 +46,157 @@ func TestTotalInputTokens(t *testing.T) {
 	}
 }
 
+// D-05：四个 token 字段统一打折。cache_* 逃逸衰减会让客户端的
+// input+cache_creation+cache_read 求和混入两套标尺。
+func TestDeflateUsageDeflatesCacheFields(t *testing.T) {
+	usage := map[string]any{
+		"input_tokens":                100,
+		"cache_creation_input_tokens": 201,
+		"cache_read_input_tokens":     303,
+		"output_tokens":               11,
+		"total_tokens":                999,
+	}
+	deflateUsage(usage, 0.7)
+
+	want := map[string]any{
+		"input_tokens":                float64(70),
+		"cache_creation_input_tokens": float64(140),
+		"cache_read_input_tokens":     float64(212),
+		"output_tokens":               float64(7),
+		"total_tokens":                float64(429),
+	}
+	for field, expected := range want {
+		if usage[field] != expected {
+			t.Fatalf("%s=%v, want %v; usage=%+v", field, usage[field], expected, usage)
+		}
+	}
+}
+
+// 值为 0 的 cache 字段保持 0（D-06），不因纳入 tokenFields 而改变。
+func TestDeflateUsageKeepsZeroCacheFields(t *testing.T) {
+	usage := map[string]any{
+		"input_tokens":                100,
+		"cache_creation_input_tokens": 0,
+		"cache_read_input_tokens":     0,
+	}
+	deflateUsage(usage, 0.7)
+
+	if usage["cache_creation_input_tokens"] != 0 || usage["cache_read_input_tokens"] != 0 {
+		t.Fatalf("零值 cache 字段被改写: %+v", usage)
+	}
+}
+
+// message_delta 的输入侧字段必须被剥离——客户端对这三个字段是「非 null 即覆盖」，
+// 上游若在此补报与 message_start 矛盾的值，就会造成上下文计数跳变。
+func TestProcessSSEEventStripsMessageDeltaInputUsage(t *testing.T) {
+	s := NewServer(Config{Proxy: ProxyConfig{Deflation: 0.5}})
+	event := []string{
+		"event: message_delta",
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":90000,"cache_creation_input_tokens":1024,"cache_read_input_tokens":22016,"output_tokens":246}}`,
+	}
+
+	processed := s.processSSEEvent(event)
+	if len(processed) != 2 || processed[0] != "event: message_delta" {
+		t.Fatalf("事件结构被破坏: %#v", processed)
+	}
+
+	var data map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(processed[1], "data: ")), &data); err != nil {
+		t.Fatalf("解析转发后的 data: %v; line=%q", err, processed[1])
+	}
+	usage, ok := data["usage"].(map[string]any)
+	if !ok {
+		t.Fatalf("usage 丢失: %+v", data)
+	}
+	for _, field := range []string{"input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"} {
+		if _, present := usage[field]; present {
+			t.Fatalf("%s 未被剥离: %+v", field, usage)
+		}
+	}
+	if usage["output_tokens"] != float64(123) {
+		t.Fatalf("output_tokens=%v, want 123", usage["output_tokens"])
+	}
+	if delta, _ := data["delta"].(map[string]any); delta["stop_reason"] != "tool_use" {
+		t.Fatalf("delta 未原样保留: %+v", data["delta"])
+	}
+}
+
+// message_start 是客户端唯一的输入侧 usage 来源，四个字段都必须打折。
+func TestProcessSSEEventMessageStartDeflatesCacheFields(t *testing.T) {
+	s := NewServer(Config{Proxy: ProxyConfig{Deflation: 0.5}})
+	event := []string{
+		"event: message_start",
+		`data: {"type":"message_start","message":{"type":"message","usage":{"input_tokens":196,"cache_creation_input_tokens":1024,"cache_read_input_tokens":93056,"output_tokens":20}}}`,
+	}
+
+	processed := s.processSSEEvent(event)
+	var data map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(processed[1], "data: ")), &data); err != nil {
+		t.Fatalf("解析转发后的 data: %v; line=%q", err, processed[1])
+	}
+	usage := data["message"].(map[string]any)["usage"].(map[string]any)
+
+	want := map[string]float64{
+		"input_tokens":                98,
+		"cache_creation_input_tokens": 512,
+		"cache_read_input_tokens":     46528,
+		"output_tokens":               10,
+	}
+	for field, expected := range want {
+		if usage[field] != expected {
+			t.Fatalf("%s=%v, want %v; usage=%+v", field, usage[field], expected, usage)
+		}
+	}
+}
+
+// 端到端：ST 的 pressure baseline 取 deflation 之前的真值（observe 早于
+// processSSEEvent），而转发给客户端的流已完成四字段衰减与 message_delta 剥离。
+func TestHandleSSEStripsDeltaWhileBaselineKeepsTruth(t *testing.T) {
+	trigger := NewSawtoothTrigger(time.Hour, 50000, 1000)
+	var persisted string
+	trigger.SetPersistFunc(func(_ string, value string) { persisted = value })
+	s := NewServer(Config{Proxy: ProxyConfig{Deflation: 0.5}})
+	s.Sawtooth = trigger
+	system := json.RawMessage(`[{"type":"text","text":"delta system"}]`)
+	tools := json.RawMessage(`[{"name":"delta_tool","input_schema":{"type":"object"}}]`)
+	forwarded := pipelineMessages(29, 6)
+	meta := newRequestMeta(3, "sse-delta-strip")
+	meta.PressureDecision = pressureDecision{Available: true}
+	markForwardedPressureCoordinates(meta, forwardedPressureBody(t, system, tools, forwarded))
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader("event: message_start\n" +
+			`data: {"type":"message_start","message":{"type":"message","usage":{"input_tokens":196,"cache_creation_input_tokens":1024,"cache_read_input_tokens":93056,"output_tokens":20}}}` + "\n\n" +
+			"event: message_delta\n" +
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":90000,"cache_read_input_tokens":22016,"output_tokens":246}}` + "\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")),
+	}
+	recorder := httptest.NewRecorder()
+	s.handleSSE(recorder, resp, meta, time.Now(), "model", 4)
+
+	var state persistedState
+	if err := json.Unmarshal([]byte(persisted), &state); err != nil {
+		t.Fatalf("解析持久状态: %v; raw=%q", err, persisted)
+	}
+	if state.Tokens != 94276 {
+		t.Fatalf("baseline tokens=%d, want 94276（message_start 的未衰减三字段之和）", state.Tokens)
+	}
+
+	body := recorder.Body.String()
+	for _, forbidden := range []string{`"input_tokens":90000`, `"input_tokens":45000`, `"cache_read_input_tokens":22016`, `"cache_read_input_tokens":11008`} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("message_delta 输入侧 usage 泄漏 %s: %s", forbidden, body)
+		}
+	}
+	for _, required := range []string{`"input_tokens":98`, `"cache_creation_input_tokens":512`, `"cache_read_input_tokens":46528`, `"output_tokens":123`} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("缺少 %s: %s", required, body)
+		}
+	}
+}
+
 // forwardedPressureBody 组装一份真实的上游 wire body，供测试通过
 // markForwardedPressureCoordinates 绑定坐标——而不是手工置位
 // ForwardedCoordinatesBound，那等于在测试里给 invariant 留后门。

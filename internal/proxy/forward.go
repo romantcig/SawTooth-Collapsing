@@ -30,11 +30,15 @@ func deflateUsage(usage map[string]any, factor float64) {
 		return
 	}
 
-	// 仅 deflate input_tokens 和 output_tokens。
-	// cache_creation_input_tokens 和 cache_read_input_tokens 是 input_tokens 的子集，
-	// 重复计算会违反 total_tokens = input_tokens + output_tokens 的 API 语义。
+	// 四个字段统一 deflate（D-05）。cache_creation_input_tokens 与
+	// cache_read_input_tokens 不是 input_tokens 的子集——Anthropic 的 input_tokens
+	// 只计未命中缓存的部分，三者互斥、相加才是总输入（见 totalInputTokens）。
+	// 漏掉 cache_* 会让客户端的上下文求和混入 factor 与 1.0 两套标尺，
+	// 缓存命中率越高 deflation 越接近失效。
 	tokenFields := []string{
 		"input_tokens",
+		"cache_creation_input_tokens",
+		"cache_read_input_tokens",
 		"output_tokens",
 	}
 
@@ -54,8 +58,7 @@ func deflateUsage(usage map[string]any, factor float64) {
 		// num == 0: 保持 0，不加入 sum（D-06）
 	}
 
-	// total_tokens = input_tokens + output_tokens（API 标准定义）
-	// 不包含 cache 子字段以避免重复计数
+	// total_tokens = 前四项 deflated 值之和（D-05）
 	if _, ok := usage["total_tokens"]; ok {
 		usage["total_tokens"] = sum
 	}
@@ -960,7 +963,8 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 }
 
 // processSSEEvent 处理单个 SSE 事件。
-// 识别 message_start 和 message_delta 事件中的 usage 并执行 deflation。
+// 识别 message_start 和 message_delta 事件中的 usage 并执行 deflation；
+// message_delta 的输入侧字段在 deflate 前被剥离，只保留 output_tokens。
 // 其他事件类型原样返回。JSON 解析失败时原样转发（T-02-05 graceful degradation）。
 func (s *Server) processSSEEvent(event []string) []string {
 	factor := s.Config.Proxy.Deflation
@@ -998,6 +1002,14 @@ func (s *Server) processSSEEvent(event []string) []string {
 		}
 	case "message_delta":
 		if usage, ok := data["usage"].(map[string]any); ok {
+			// message_delta.usage 的输入侧字段是整个请求的累计量，与 message_start
+			// 重复。客户端对这三个字段是「非 null 即覆盖」，一旦上游两处报值不一致
+			// （部分中转站如此），客户端的上下文计数就会在相邻请求间剧烈跳变。
+			// 剥离后客户端只消费 message_start 那份自洽 usage；官方端点两处取值
+			// 相同，剥离无损。
+			delete(usage, "input_tokens")
+			delete(usage, "cache_creation_input_tokens")
+			delete(usage, "cache_read_input_tokens")
 			deflateUsage(usage, factor)
 		}
 	}
