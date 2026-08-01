@@ -266,9 +266,11 @@ func extractTimeline(blocks []ContentBlock, msgIdx int, role string) []string {
 	var events []string
 
 	// 用户消息作为时间线条目（对话的方向信号）
+	// 以 "[" 开头的是 CC 每轮注入的 system-reminder / task-notification 之类合成文本，
+	// 不是方向信号，跳过（对齐 YesMem collapse.go:277-279）。
 	if role == "user" {
 		text := extractTextFromBlocks(blocks)
-		if text != "" {
+		if text != "" && !strings.HasPrefix(text, "[") {
 			summary := truncateRunes(text, 120)
 			events = append(events, fmt.Sprintf("- [%d] U: %s", msgIdx, summary))
 		}
