@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"image/png"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -465,6 +467,90 @@ func TestExtractTimelineSkipsBracketPrefixedUserText(t *testing.T) {
 			t.Fatalf("普通 user 文本条目缺少 U: 标记: %q", events[0])
 		}
 	})
+}
+
+// collapsePlaceholderRe 抓取 blankFirstMessage 占位符里的两个数字。
+var collapsePlaceholderRe = regexp.MustCompile(`(\d+) messages, ~(\d+) tokens`)
+
+// archiveSummaryRangeRe / archiveSummaryCountRe 分别抓取归档摘要首行的区间与条数。
+// 区间分隔符用 \D 匹配，避免测试依赖模板里的具体破折号字面量。
+var (
+	archiveSummaryRangeRe = regexp.MustCompile(`Archived messages (\d+)\D(\d+)`)
+	archiveSummaryCountRe = regexp.MustCompile(`共 (\d+) 条`)
+)
+
+func parseCollapsePlaceholder(t *testing.T, content json.RawMessage) (msgCount, tokens int) {
+	t.Helper()
+	var placeholder string
+	if err := json.Unmarshal(content, &placeholder); err != nil {
+		t.Fatalf("decode 占位符失败: %v", err)
+	}
+	m := collapsePlaceholderRe.FindStringSubmatch(placeholder)
+	if m == nil {
+		t.Fatalf("占位符格式不可解析: %q", placeholder)
+	}
+	msgCount, _ = strconv.Atoi(m[1])
+	tokens, _ = strconv.Atoi(m[2])
+	return msgCount, tokens
+}
+
+func TestCollapseOldMessagesPlaceholderCountsArchivedRangeOnly(t *testing.T) {
+	tc := mustTokenCounter(t)
+	const cutoff = 6
+	messages := collapseTextMessages(20, 20)
+
+	result, _ := CollapseOldMessages(messages, messages, cutoff, tc, "session")
+	gotCount, gotTokens := parseCollapsePlaceholder(t, result[0].Content)
+	if gotCount != cutoff-1 {
+		t.Fatalf("占位符消息数 = %d, want %d（只统计归档区间 [1,%d)）", gotCount, cutoff-1, cutoff)
+	}
+	wantTokens := 0
+	for i := 1; i < cutoff; i++ {
+		wantTokens += tc.CountMessageTokens(messages[i])
+	}
+	if gotTokens != wantTokens {
+		t.Fatalf("占位符 token 数 = %d, want %d", gotTokens, wantTokens)
+	}
+
+	// 保留的 recent tail 换成超大消息后，占位符两个数字必须纹丝不动。
+	fattened := deepCopyMessages(messages)
+	for i := cutoff; i < len(fattened); i++ {
+		fattened[i].Content = mustMarshal(strings.Repeat("huge tail content ", 500))
+	}
+	fatResult, _ := CollapseOldMessages(fattened, fattened, cutoff, tc, "session")
+	fatCount, fatTokens := parseCollapsePlaceholder(t, fatResult[0].Content)
+	if fatCount != gotCount || fatTokens != gotTokens {
+		t.Fatalf("保留的 tail 被计入占位符: count %d→%d, tokens %d→%d", gotCount, fatCount, gotTokens, fatTokens)
+	}
+}
+
+func TestBuildArchiveBlockSummaryRangeMatchesMessageCount(t *testing.T) {
+	tc := mustTokenCounter(t)
+	const cutoff = 6
+	messages := collapseTextMessages(20, 20)
+
+	block := buildArchiveBlock(messages[:cutoff], cutoff, tc, "session")
+	firstLine := strings.SplitN(block.SummaryText, "\n", 2)[0]
+
+	rangeMatch := archiveSummaryRangeRe.FindStringSubmatch(firstLine)
+	countMatch := archiveSummaryCountRe.FindStringSubmatch(firstLine)
+	if rangeMatch == nil || countMatch == nil {
+		t.Fatalf("摘要首行不可解析: %q", firstLine)
+	}
+	start, _ := strconv.Atoi(rangeMatch[1])
+	end, _ := strconv.Atoi(rangeMatch[2])
+	count, _ := strconv.Atoi(countMatch[1])
+	if start != 0 || end != cutoff-1 || count != cutoff {
+		t.Fatalf("摘要首行数字 = [%d,%d] 共 %d 条, want [0,%d] 共 %d 条: %q", start, end, count, cutoff-1, cutoff, firstLine)
+	}
+	if end-start+1 != count {
+		t.Fatalf("摘要首行范围与条数不自洽: [%d,%d] 共 %d 条", start, end, count)
+	}
+
+	// 显示层坐标改动不得外溢到 DB 幂等边界 idx_archive_blocks_content_identity。
+	if block.BlockRangeStart != 1 || block.BlockRangeEnd != cutoff-1 || block.MessageCount != cutoff {
+		t.Fatalf("archive 字段层坐标被改动: start=%d end=%d count=%d", block.BlockRangeStart, block.BlockRangeEnd, block.MessageCount)
+	}
 }
 
 func mustTokenCounter(t *testing.T) *TokenCounter {
