@@ -113,7 +113,7 @@ func CollapseOldMessages(modified, original []Message, cutoffIdx int, tc *TokenC
 	}
 
 	// 步骤 1: blankFirstMessage——将第一条消息的 content 替换为占位文本（用 modified，ABLOCK-01）
-	blanked := blankFirstMessage(modified, tc)
+	blanked := blankFirstMessage(modified, cutoffIdx, tc)
 
 	// ABLOCK-01: 从原始消息提取摘要，确保 Tools/Files/Commits/Timeline/Gotchas 不因桩化丢失
 	block := buildArchiveBlock(original[:cutoffIdx], cutoffIdx, tc, sessionID)
@@ -160,8 +160,10 @@ func buildArchiveBlock(messages []Message, cutoffIdx int, tc *TokenCounter, sess
 	estimatedTokens := tc.CountMessagesTokens(messages)
 	contentHash, _ := archiveContentHash(messages)
 
+	// 显示层区间以 0 起算，使「首号–末号」与「共 N 条」自洽。
+	// ArchiveBlock.BlockRangeStart 仍为 1——那是 DB 幂等唯一索引的坐标，不能跟着改。
 	summaryText := formatArchiveBlockText(
-		1, cutoffIdx-1,
+		0, cutoffIdx-1,
 		cutoffIdx, estimatedTokens,
 		allTools, allFiles, allCommits, allTimeline, allGotchas, conclusionText,
 	)
@@ -201,9 +203,10 @@ func archiveContentHash(messages []Message) (string, error) {
 }
 
 // blankFirstMessage 创建 messages 的 shallow copy，将第一条消息的 content
-// 替换为占位文本字符串。
+// 替换为占位文本字符串。占位符里的 N 和 X 只统计实际归档区间 [1, cutoffIdx)，
+// cutoffIdx 及之后的消息原样保留在 recent tail 里，不属于"已归档"。
 // D-05
-func blankFirstMessage(messages []Message, tc *TokenCounter) []Message {
+func blankFirstMessage(messages []Message, cutoffIdx int, tc *TokenCounter) []Message {
 	result := make([]Message, len(messages))
 	copy(result, messages)
 
@@ -217,9 +220,9 @@ func blankFirstMessage(messages []Message, tc *TokenCounter) []Message {
 	}
 
 	// 计算折叠消息的 N 和 X
-	archivedCount := len(messages) - 1
+	archivedCount := cutoffIdx - 1
 	archivedTokens := 0
-	for i := 1; i < len(messages); i++ {
+	for i := 1; i < cutoffIdx; i++ {
 		archivedTokens += tc.CountMessageTokens(messages[i])
 	}
 

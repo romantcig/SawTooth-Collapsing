@@ -169,7 +169,7 @@ func TestPersistentUserContextCollapseBlankGuard(t *testing.T) {
 	context := persistentContextMessage("claudeMd", "FICTIONAL_BLANK_GUARD")
 	messages := append([]Message{context}, collapseTextMessages(3, 20)...)
 
-	blanked := blankFirstMessage(messages, tc)
+	blanked := blankFirstMessage(messages, len(messages)-1, tc)
 	assertJSONEquivalent(t, mustMarshalJSON(t, blanked[0]), mustMarshalJSON(t, context))
 }
 
