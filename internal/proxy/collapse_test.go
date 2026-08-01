@@ -423,6 +423,50 @@ func TestArchiveContentHashIncludesMessageUnknownFieldStates(t *testing.T) {
 	}
 }
 
+func TestExtractTimelineSkipsBracketPrefixedUserText(t *testing.T) {
+	// CC 每轮注入的 system-reminder / task-notification 都以方括号开头，
+	// 它们不是对话方向信号，不应写进归档 Timeline。对齐 YesMem collapse.go:277-279。
+	const noiseText = "[Request interrupted by user]"
+
+	t.Run("括号开头的合成文本不产生 U 条目", func(t *testing.T) {
+		events := extractTimeline([]ContentBlock{{Type: "text", Text: noiseText}}, 3, "user")
+		if len(events) != 0 {
+			t.Fatalf("events = %v, want 0 条", events)
+		}
+	})
+
+	t.Run("空文本仍不产生条目", func(t *testing.T) {
+		events := extractTimeline([]ContentBlock{{Type: "text", Text: ""}}, 3, "user")
+		if len(events) != 0 {
+			t.Fatalf("events = %v, want 0 条", events)
+		}
+	})
+
+	t.Run("被过滤的 user 消息里 tool 事件照常提取", func(t *testing.T) {
+		blocks := []ContentBlock{
+			{Type: "text", Text: noiseText},
+			{Type: "tool_use", ID: "edit-1", Name: "Edit", Input: map[string]any{"file_path": "a/b.go"}},
+		}
+		events := extractTimeline(blocks, 3, "user")
+		if len(events) != 1 {
+			t.Fatalf("events = %v, want 仅 1 条 tool 事件", events)
+		}
+		if !strings.HasPrefix(events[0], "- [") || !strings.Contains(events[0], "Edit:") {
+			t.Fatalf("tool 事件格式异常: %q", events[0])
+		}
+	})
+
+	t.Run("普通 user 文本照旧产生条目", func(t *testing.T) {
+		events := extractTimeline([]ContentBlock{{Type: "text", Text: "把折叠阈值调到 80%"}}, 3, "user")
+		if len(events) != 1 {
+			t.Fatalf("events = %v, want 1 条", events)
+		}
+		if !strings.Contains(events[0], "U: ") {
+			t.Fatalf("普通 user 文本条目缺少 U: 标记: %q", events[0])
+		}
+	})
+}
+
 func mustTokenCounter(t *testing.T) *TokenCounter {
 	t.Helper()
 	tc, err := NewTokenCounter()
