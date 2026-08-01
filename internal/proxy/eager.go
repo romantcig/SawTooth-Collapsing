@@ -226,9 +226,9 @@ func buildEagerStub(toolName string, input map[string]any, content string) strin
 		cmd, _ := input["command"].(string)
 		head, tail := eagerHeadTail(lines, 3, 3)
 		if tail != "" {
-			return fmt.Sprintf("[Bash: %s — %d lines]\n%s\n[...]\n%s", truncateStr(cmd, 80), lineCount, head, tail)
+			return fmt.Sprintf("[Bash: %s — %d lines]\n%s\n[...]\n%s", truncateRunes(cmd, 80), lineCount, head, tail)
 		}
-		return fmt.Sprintf("[Bash: %s — %d lines]\n%s", truncateStr(cmd, 80), lineCount, head)
+		return fmt.Sprintf("[Bash: %s — %d lines]\n%s", truncateRunes(cmd, 80), lineCount, head)
 
 	case "Glob":
 		pattern, _ := input["pattern"].(string)
@@ -237,7 +237,7 @@ func buildEagerStub(toolName string, input map[string]any, content string) strin
 
 	case "Agent":
 		desc, _ := input["description"].(string)
-		return fmt.Sprintf("[Agent: %s — %s]", desc, truncateStr(content, 200))
+		return fmt.Sprintf("[Agent: %s — %s]", desc, truncateRunes(content, 200))
 
 	default:
 		return fmt.Sprintf("[%s result — %d lines archived]", toolName, lineCount)
@@ -544,16 +544,4 @@ func anyToMessages(items []any) []Message {
 		}
 	}
 	return result
-}
-
-// ─────────────────────────────────────────────────────────────
-// Utilities
-// ─────────────────────────────────────────────────────────────
-
-// truncateStr truncates a string to maxLen characters, appending "..." if truncated.
-func truncateStr(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
 }
