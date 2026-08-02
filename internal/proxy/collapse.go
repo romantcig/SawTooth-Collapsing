@@ -410,33 +410,16 @@ func findFlagValue(cmd, flag string) int {
 	return idx + len(flag)
 }
 
-// formatToolStub 将单个 tool_use block 格式化为 stub 文本。
-// 对标 stubify.go:stubToolUses。Phase D: 追加 deep_search 提示。
-func formatToolStub(name string, input map[string]any) string {
-	annotation := extractAnnotation(input)
-	block := ContentBlock{Type: "tool_use", Name: name, Input: input}
-	keywords := extractToolKeywords(block)
-	var text string
-	if annotation != "" {
-		text = fmt.Sprintf("[→] %s %s — %s", name, formatArgsSummary(input), annotation)
-	} else {
-		text = fmt.Sprintf("[→] %s %s", name, formatArgsSummary(input))
-	}
-	if keywords != "" {
-		text += " → deep_search('" + keywords + "')"
-	}
-	return text
-}
-
-// extractToolEvents 从 content blocks 提取 tool 名 + args 摘要。
+// extractToolEvents 从 content blocks 提取每个 tool_use 的工具名（空名跳过）。
+// 归档摘要的 Tools Used 段对这些名字做聚合计数，不再逐个展开完整 stub——
+// 逐个展开会让归档随折叠量线性膨胀，与折叠目的对冲。
 func extractToolEvents(blocks []ContentBlock) []string {
 	var events []string
 	for _, b := range blocks {
-		if b.Type != "tool_use" {
+		if b.Type != "tool_use" || b.Name == "" {
 			continue
 		}
-		stub := formatToolStub(b.Name, b.Input)
-		events = append(events, "- "+stub)
+		events = append(events, b.Name)
 	}
 	return events
 }
@@ -653,7 +636,12 @@ func basePath(fp string) string {
 
 // ── Archive block 文本格式化 ──
 
+// maxArchiveFileLines 限制归档摘要 Files 段的条数，超出部分以一行省略标注收尾。
+const maxArchiveFileLines = 40
+
 // formatArchiveBlockText 生成 7 部分 archive block 的格式化文本。
+// 段标题（"### Tools Used" 等）与其前置换行是 reexpand.go:truncateSummaryText
+// 的解析锚点，只可改段内容，不可改标题形态。
 func formatArchiveBlockText(
 	rangeStart, rangeEnd, msgCount, tokens int,
 	tools []string,
@@ -667,11 +655,15 @@ func formatArchiveBlockText(
 	fmt.Fprintf(&sb, "Archived messages %d–%d（共 %d 条，约 %d tokens）",
 		rangeStart, rangeEnd, msgCount, tokens)
 
-	// 第 2 部分: Tool 摘要
+	// 第 2 部分: Tool 摘要——聚合计数（Top-5 + "+N more"），恒为一行
 	if len(tools) > 0 {
-		sb.WriteString("\n\n### Tools Used\n")
+		counts := make(map[string]int, len(tools))
 		for _, t := range tools {
-			fmt.Fprintf(&sb, "%s\n", t)
+			counts[t]++
+		}
+		if line := formatCompactionCounts(counts); line != "" {
+			sb.WriteString("\n\n### Tools Used\n")
+			fmt.Fprintf(&sb, "%s\n", line)
 		}
 	}
 
@@ -684,8 +676,17 @@ func formatArchiveBlockText(
 			sorted = append(sorted, f)
 		}
 		sortStrings(sorted)
+		// 预算控制：最多 maxArchiveFileLines 条（字母序在前的）
+		omitted := 0
+		if len(sorted) > maxArchiveFileLines {
+			omitted = len(sorted) - maxArchiveFileLines
+			sorted = sorted[:maxArchiveFileLines]
+		}
 		for _, f := range sorted {
 			fmt.Fprintf(&sb, "- %s\n", f)
+		}
+		if omitted > 0 {
+			fmt.Fprintf(&sb, "- [...%d more files omitted...]\n", omitted)
 		}
 	}
 
