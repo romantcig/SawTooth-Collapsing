@@ -553,6 +553,122 @@ func TestBuildArchiveBlockSummaryRangeMatchesMessageCount(t *testing.T) {
 	}
 }
 
+// archiveSectionBodyLines 返回归档摘要中指定段标题之后、下一个段标题之前的非空行。
+// 段定位方式与 reexpand.go 的 truncateSummaryText 一致（"\n### <title>\n"）。
+func archiveSectionBodyLines(t *testing.T, text, title string) []string {
+	t.Helper()
+	token := "\n### " + title + "\n"
+	idx := strings.Index(text, token)
+	if idx < 0 {
+		t.Fatalf("摘要缺少段标题 %q:\n%s", token, text)
+	}
+	body := text[idx+len(token):]
+	if next := strings.Index(body, "\n### "); next >= 0 {
+		body = body[:next]
+	}
+	var lines []string
+	for _, line := range strings.Split(body, "\n") {
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// W2-1：Tools Used 段聚合成一行计数，不再逐个列 tool stub。
+func TestFormatArchiveBlockTextAggregatesTools(t *testing.T) {
+	tools := []string{"Read", "Bash", "Read", "Edit", "Bash", "Read"}
+	text := formatArchiveBlockText(0, 5, 6, 400, tools, nil, nil, nil, nil, "")
+
+	// 段标题字面量是 truncateSummaryText 的解析锚点，必须原样保留。
+	if !strings.Contains(text, "### Tools Used") {
+		t.Fatalf("Tools Used 段标题丢失:\n%s", text)
+	}
+	lines := archiveSectionBodyLines(t, text, "Tools Used")
+	if len(lines) != 1 {
+		t.Fatalf("Tools Used 段正文 = %d 行, want 1 行:\n%v", len(lines), lines)
+	}
+	// 计数降序、同计数按 key 字母序（formatCompactionCounts 的既有语义）。
+	if want := "Read(3), Bash(2), Edit(1)"; lines[0] != want {
+		t.Fatalf("Tools Used 聚合行 = %q, want %q", lines[0], want)
+	}
+}
+
+// W2-2：Files 段有条数上限，超出部分以一行省略标注收尾。
+func TestFormatArchiveBlockTextCapsFileLines(t *testing.T) {
+	buildFiles := func(n int) map[string]bool {
+		files := make(map[string]bool, n)
+		for i := 0; i < n; i++ {
+			files[fmt.Sprintf("src/pkg/f%03d.go", i)] = true
+		}
+		return files
+	}
+
+	// 45 > maxArchiveFileLines(40)：40 条正文 + 1 行省略标注。
+	over := formatArchiveBlockText(0, 5, 6, 400, nil, buildFiles(45), nil, nil, nil, "")
+	overLines := archiveSectionBodyLines(t, over, "Files")
+	if len(overLines) != 41 {
+		t.Fatalf("45 个文件的 Files 段 = %d 行, want 41 行", len(overLines))
+	}
+	last := overLines[len(overLines)-1]
+	if !strings.Contains(last, "5 more files omitted") {
+		t.Fatalf("Files 段末行未标注省略数量: %q", last)
+	}
+	for _, line := range overLines[:40] {
+		if strings.Contains(line, "omitted") {
+			t.Fatalf("省略标注出现在正文区: %q", line)
+		}
+	}
+
+	// 恰好 40 条：与改动前行为完全一致，不得多出任何行。
+	exact := formatArchiveBlockText(0, 5, 6, 400, nil, buildFiles(40), nil, nil, nil, "")
+	exactLines := archiveSectionBodyLines(t, exact, "Files")
+	if len(exactLines) != 40 {
+		t.Fatalf("40 个文件的 Files 段 = %d 行, want 40 行", len(exactLines))
+	}
+	if strings.Contains(exact, "files omitted") {
+		t.Fatalf("未超限时不应出现省略标注:\n%s", exact)
+	}
+}
+
+// W2-1 + W2-2：归档体积不随折叠量线性膨胀。
+func TestBuildArchiveBlockVolumeBoundedForManyToolUses(t *testing.T) {
+	tc := mustTokenCounter(t)
+	const toolUseCount = 300
+	const blocksPerMessage = 30
+
+	var messages []Message
+	for start := 0; start < toolUseCount; start += blocksPerMessage {
+		blocks := make([]ContentBlock, 0, blocksPerMessage)
+		for i := start; i < start+blocksPerMessage; i++ {
+			blocks = append(blocks, ContentBlock{
+				Type:  "tool_use",
+				ID:    fmt.Sprintf("edit-%03d", i),
+				Name:  "Edit",
+				Input: map[string]any{"file_path": fmt.Sprintf("src/f%03d.go", i)},
+			})
+		}
+		messages = append(messages, Message{Role: "assistant", Content: rebuildContent(blocks, true)})
+	}
+
+	block := buildArchiveBlock(messages, len(messages), tc, "session-volume")
+
+	if !strings.Contains(block.SummaryText, "### Tools Used") {
+		t.Fatalf("Tools Used 段标题丢失:\n%s", block.SummaryText)
+	}
+	toolLines := archiveSectionBodyLines(t, block.SummaryText, "Tools Used")
+	if len(toolLines) != 1 {
+		t.Fatalf("300 个 tool_use 的 Tools Used 段 = %d 行, want 1 行", len(toolLines))
+	}
+	fileLines := archiveSectionBodyLines(t, block.SummaryText, "Files")
+	if len(fileLines) > 41 {
+		t.Fatalf("300 个文件的 Files 段 = %d 行, want ≤ 41 行", len(fileLines))
+	}
+	if got := countRunes(block.SummaryText); got >= 8000 {
+		t.Fatalf("300 个 tool_use 的归档 = %d runes, want < 8000", got)
+	}
+}
+
 func mustTokenCounter(t *testing.T) *TokenCounter {
 	t.Helper()
 	tc, err := NewTokenCounter()
