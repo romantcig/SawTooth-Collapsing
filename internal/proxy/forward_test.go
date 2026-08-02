@@ -118,7 +118,7 @@ func TestDeflationDefaultsOffAndZeroMeansDisabled(t *testing.T) {
 	}
 
 	for name, body := range map[string]string{
-		"显式 0":  "proxy:\n  deflation: 0\n",
+		"显式 0": "proxy:\n  deflation: 0\n",
 		"越界负值": "proxy:\n  deflation: -1\n",
 		"越界超限": "proxy:\n  deflation: 2\n",
 		"未指定":  "proxy:\n  target: https://api.anthropic.com\n",
