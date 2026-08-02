@@ -40,12 +40,13 @@ type FrozenStubs struct {
 	tokens        map[string]int // threadID → frozen stubs 的 token 估算
 	rawTokens     map[string]int // threadID → Store 时原始 token 估算（压缩前）
 	lastAccess    map[string]time.Time
-	persistFn     PersistFunc       // 可选：持久化 frozen 状态到 DB
-	loadFn        LoadFunc          // 可选：冷启动时从 DB 加载 frozen 状态
-	deleteFn      DeleteFunc        // 可选：失效时删除 DB 中的 frozen 状态
-	loadedFromDB  map[string]bool   // threadID → 已尝试从 DB 加载
-	stateFoundDB  map[string]bool   // threadID → DB 中曾存在显式状态（即使内容无效）
-	currentAlias  map[string]string // legacy session key → 当前 epoch state key
+	persistFn     PersistFunc              // 可选：持久化 frozen 状态到 DB
+	loadFn        LoadFunc                 // 可选：冷启动时从 DB 加载 frozen 状态
+	deleteFn      DeleteFunc               // 可选：失效时删除 DB 中的 frozen 状态
+	loadedFromDB  map[string]bool          // threadID → 已尝试从 DB 加载
+	loadingFromDB map[string]chan struct{} // stateKey → 正在进行的 DB 加载完成信号
+	stateFoundDB  map[string]bool          // threadID → DB 中曾存在显式状态（即使内容无效）
+	currentAlias  map[string]string        // legacy session key → 当前 epoch state key
 }
 
 // frozenPersisted 是 frozen 桩化状态的可 JSON 序列化形式。
@@ -88,6 +89,7 @@ func NewFrozenStubsWithTTL(ttl time.Duration) *FrozenStubs {
 		rawTokens:     make(map[string]int),
 		lastAccess:    make(map[string]time.Time),
 		loadedFromDB:  make(map[string]bool),
+		loadingFromDB: make(map[string]chan struct{}),
 		stateFoundDB:  make(map[string]bool),
 		currentAlias:  make(map[string]string),
 	}
@@ -556,7 +558,8 @@ func (f *FrozenStubs) Evict() int {
 }
 
 // loadFrozenFromDB 尝试从 DB 恢复指定 thread 的 frozen stubs。
-// 每个 thread 在冷启动时仅调用一次（由 Get 触发 lazy-load）。
+// 每个 thread 在冷启动时仅调用一次（由 Get 触发 lazy-load）：并发调用方等待
+// 已在进行的加载，不重复查询。比照同文件 loadSawtoothFromDB。
 func (f *FrozenStubs) loadFrozenFromDB(logger *slog.Logger, threadID string) {
 	f.mu.Lock()
 	stateKey := f.resolveStateKeyLocked(threadID)
@@ -564,8 +567,26 @@ func (f *FrozenStubs) loadFrozenFromDB(logger *slog.Logger, threadID string) {
 		f.mu.Unlock()
 		return
 	}
+	if loading := f.loadingFromDB[stateKey]; loading != nil {
+		f.mu.Unlock()
+		<-loading
+		return
+	}
+	loading := make(chan struct{})
+	f.loadingFromDB[stateKey] = loading
 	loadFn := f.loadFn
 	f.mu.Unlock()
+
+	// 本函数有 6 个出口（含三处 InvalidateWithLogger 分支），清理只能用 defer。
+	// 只碰 loadingFromDB：loadedFromDB 由各分支在 loadFn 结果已知之后自行置位
+	// （WR-03 特意后移的），InvalidateWithLogger 还会刻意把它置 true，
+	// 在这里覆盖会推翻那条设计。
+	defer func() {
+		f.mu.Lock()
+		delete(f.loadingFromDB, stateKey)
+		f.mu.Unlock()
+		close(loading)
+	}()
 
 	if loadFn == nil {
 		f.mu.Lock()
