@@ -66,7 +66,7 @@ func TestSessionLogHashIsStableShortLowerHex(t *testing.T) {
 }
 
 func TestSessionLogAppendAndConcurrentLines(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	secret := "concurrent-session"
 	first := slog.New(NewSessionLogHandler(dataDir, slog.LevelInfo, nil))
 	second := slog.New(NewSessionLogHandler(dataDir, slog.LevelInfo, nil))
