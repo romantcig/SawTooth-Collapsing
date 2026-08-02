@@ -669,6 +669,131 @@ func TestBuildArchiveBlockVolumeBoundedForManyToolUses(t *testing.T) {
 	}
 }
 
+// W3-2：classifyEvent 的 key 推导矩阵。"" 表示该条目永不折叠。
+func TestClassifyEventKeys(t *testing.T) {
+	cases := []struct {
+		event string
+		want  string
+	}{
+		{"- [3] U: 改一下折叠阈值", ""},
+		{"- [4] git commit", ""},
+		{"- [5] Bash: rm -rf x", ""},
+		{"- [6] build", "build"},
+		{"- [7] test", "test"},
+		{"- [8] Edit: a/b.go", "edit:a/b.go"},
+		{"- [9] Skill: web-research", "skill:web-research"},
+		{"- [10] TodoWrite", "todowrite"},
+		{"event without index prefix", ""},
+	}
+	for _, tt := range cases {
+		if got := classifyEvent(tt.event); got != tt.want {
+			t.Errorf("classifyEvent(%q) = %q, want %q", tt.event, got, tt.want)
+		}
+	}
+}
+
+// W3-2：连续同 key 的条目 ≥3 折成一条，≤2 逐条保留，非连续互不影响。
+func TestDeduplicateEventsCollapsesConsecutiveSameType(t *testing.T) {
+	t.Run("连续 3 条折成一条", func(t *testing.T) {
+		got := deduplicateEvents([]string{"- [1] test", "- [2] test", "- [3] test"})
+		if len(got) != 1 {
+			t.Fatalf("got = %v, want 1 条", got)
+		}
+		if !strings.Contains(got[0], "(3x)") {
+			t.Fatalf("折叠行缺少计数标注: %q", got[0])
+		}
+	})
+
+	t.Run("连续 2 条原样保留", func(t *testing.T) {
+		in := []string{"- [1] test", "- [2] test"}
+		got := deduplicateEvents(in)
+		if len(got) != 2 || got[0] != in[0] || got[1] != in[1] {
+			t.Fatalf("got = %v, want %v", got, in)
+		}
+	})
+
+	t.Run("非连续同类不折叠", func(t *testing.T) {
+		in := []string{"- [1] test", "- [2] build", "- [3] test"}
+		got := deduplicateEvents(in)
+		if len(got) != 3 {
+			t.Fatalf("got = %v, want 3 条", got)
+		}
+	})
+
+	t.Run("user steering 条目永不折叠", func(t *testing.T) {
+		in := []string{"- [1] U: 继续", "- [2] U: 继续", "- [3] U: 继续"}
+		got := deduplicateEvents(in)
+		if len(got) != 3 {
+			t.Fatalf("got = %v, want 3 条", got)
+		}
+	})
+
+	t.Run("连续 3 条 git commit 永不折叠", func(t *testing.T) {
+		in := []string{"- [1] git commit", "- [2] git commit", "- [3] git commit"}
+		got := deduplicateEvents(in)
+		if len(got) != 3 {
+			t.Fatalf("got = %v, want 3 条", got)
+		}
+	})
+}
+
+// W3-2：连续同类事件在进入 120 条预算之前就被折成 "(Nx)"。
+func TestBuildArchiveBlockTimelineCollapsesRepeatedEvents(t *testing.T) {
+	tc := mustTokenCounter(t)
+	const eventCount = 300
+	const blocksPerMessage = 30
+
+	var messages []Message
+	for start := 0; start < eventCount; start += blocksPerMessage {
+		blocks := make([]ContentBlock, 0, blocksPerMessage)
+		for i := start; i < start+blocksPerMessage; i++ {
+			blocks = append(blocks, ContentBlock{
+				Type:  "tool_use",
+				ID:    fmt.Sprintf("bash-%03d", i),
+				Name:  "Bash",
+				Input: map[string]any{"command": "go test ./..."},
+			})
+		}
+		messages = append(messages, Message{Role: "assistant", Content: rebuildContent(blocks, true)})
+	}
+
+	block := buildArchiveBlock(messages, len(messages), tc, "session-timeline")
+	lines := archiveSectionBodyLines(t, block.SummaryText, "Timeline")
+	if len(lines) != 1 {
+		t.Fatalf("300 条同类事件的 Timeline 段 = %d 行, want 1 行:\n%v", len(lines), lines)
+	}
+	if !strings.Contains(lines[0], "(300x)") {
+		t.Fatalf("Timeline 折叠行缺少计数标注: %q", lines[0])
+	}
+	// 折叠必须发生在 120 条预算之前，否则会先被截断再折叠出 "events omitted"。
+	if strings.Contains(block.SummaryText, "events omitted") {
+		t.Fatalf("折叠发生在 120 条预算之后:\n%s", block.SummaryText)
+	}
+}
+
+// W3-3：Gotchas 只收录 tool_result 且 IsError 的条目。
+func TestExtractGotchasOnlyToolResultErrors(t *testing.T) {
+	// CC 的工具提示文本含 "fail" 字样，是提示而非经验教训，不得写进归档。
+	noise := []ContentBlock{{
+		Type: "text",
+		Text: "Calling this tool without the required parameter will fail with InputValidationError.",
+	}}
+	if got := extractGotchas(noise); len(got) != 0 {
+		t.Fatalf("文本关键词仍被当成 gotcha: %v", got)
+	}
+
+	toolError := []ContentBlock{{Type: "tool_result", ToolUseID: "t1", IsError: true}}
+	got := extractGotchas(toolError)
+	if len(got) != 1 || got[0] != "[tool error]" {
+		t.Fatalf("tool_result 错误未被收录: %v", got)
+	}
+
+	mixed := append(append([]ContentBlock{}, noise...), toolError...)
+	if got := extractGotchas(mixed); len(got) != 1 {
+		t.Fatalf("混合输入的 gotcha 数 = %d, want 1: %v", len(got), got)
+	}
+}
+
 func mustTokenCounter(t *testing.T) *TokenCounter {
 	t.Helper()
 	tc, err := NewTokenCounter()
