@@ -157,6 +157,10 @@ func buildArchiveBlock(messages []Message, cutoffIdx int, tc *TokenCounter, sess
 		}
 	}
 
+	// 连续同类事件先折叠再进 formatArchiveBlockText 的 120 条预算，被省略的
+	// 事件数随之下降。YesMem 是先截断再折叠，顺序相反，本项目不对齐它。
+	allTimeline = deduplicateEvents(allTimeline)
+
 	estimatedTokens := tc.CountMessagesTokens(messages)
 	contentHash, _ := archiveContentHash(messages)
 
@@ -356,6 +360,68 @@ func formatBashTimelineEvent(cmd string, msgIdx int) string {
 	return fmt.Sprintf("- [%d] Bash: %s", msgIdx, short)
 }
 
+// deduplicateEvents 将连续同 key 的 Timeline 条目折成一行 "<首条> (Nx)"。
+// key 为 "" 的条目（user steering / git commit / Bash 命令）原样逐条保留。
+// 对标 YesMem collapse.go:313-346 的双指针计数写法。
+func deduplicateEvents(events []string) []string {
+	if len(events) <= 1 {
+		return events
+	}
+
+	var result []string
+	i := 0
+	for i < len(events) {
+		eventType := classifyEvent(events[i])
+		if eventType == "" {
+			result = append(result, events[i])
+			i++
+			continue
+		}
+
+		// 统计连续同类事件数
+		count := 1
+		for i+count < len(events) && classifyEvent(events[i+count]) == eventType {
+			count++
+		}
+
+		if count <= 2 {
+			for j := 0; j < count; j++ {
+				result = append(result, events[i+j])
+			}
+		} else {
+			result = append(result, fmt.Sprintf("%s (%dx)", events[i], count))
+		}
+		i += count
+	}
+	return result
+}
+
+// classifyEvent 返回 Timeline 条目的折叠 key，"" 表示该条目永不折叠。
+// 条目形态由 extractTimeline / formatTimelineEvent 决定，一律为 "- [N] <remainder>"；
+// 前缀不匹配一律返回 ""。
+func classifyEvent(event string) string {
+	if !strings.HasPrefix(event, "- [") {
+		return ""
+	}
+	idxEnd := strings.Index(event, "] ")
+	if idxEnd < 0 {
+		return ""
+	}
+	remainder := event[idxEnd+2:]
+
+	// user steering 是对话方向信号、git commit 是里程碑、Bash 后跟任意命令文本，
+	// 三者各条都携带独立信息，折叠会丢内容。
+	if strings.HasPrefix(remainder, "U: ") || remainder == "git commit" || strings.HasPrefix(remainder, "Bash: ") {
+		return ""
+	}
+
+	// "Edit: a/b.go" → "edit:a/b.go"；同一文件的连续编辑才折叠，不同文件互不影响。
+	if sep := strings.Index(remainder, ": "); sep >= 0 {
+		return strings.ToLower(remainder[:sep]) + ":" + remainder[sep+2:]
+	}
+	return strings.ToLower(remainder)
+}
+
 // extractGitCommits 从 content blocks 提取 git commit 信息。
 func extractGitCommits(blocks []ContentBlock) []string {
 	var commits []string
@@ -448,24 +514,14 @@ func extractFileList(blocks []ContentBlock) []string {
 	return files
 }
 
-// extractGotchas 从 content blocks 提取错误和警告信息。
+// extractGotchas 从 content blocks 提取真实的工具执行错误。
+// 只认 tool_result 且 IsError——文本关键词（error / fail）匹配会把 CC 的工具
+// 提示文本当成经验教训永久写进归档，实测第一条 gotcha 就是这类噪音。
 func extractGotchas(blocks []ContentBlock) []string {
 	var gotchas []string
 	for _, b := range blocks {
 		if b.Type == "tool_result" && b.IsError {
-			// tool_result 标记为 error
 			gotchas = append(gotchas, "[tool error]")
-			continue
-		}
-
-		// 检查文本块中的错误关键词
-		if b.Type == "text" {
-			lower := strings.ToLower(b.Text)
-			if strings.Contains(lower, "error") || strings.Contains(lower, "fail") {
-				// 截取上下文
-				short := truncateRunes(strings.TrimSpace(b.Text), 200)
-				gotchas = append(gotchas, short)
-			}
 		}
 	}
 	return gotchas
