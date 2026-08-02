@@ -151,30 +151,90 @@ func formatCompactionCounts(counts map[string]int) string {
 	return strings.Join(parts, ", ")
 }
 
-// CompactMessages 将连续 50+ 条 Stage-3（DecayCompacted）消息合并为摘要消息，
-// 严格保持 user/assistant 角色交替。
+// compactedRolesForNeighbors 依据 run 两侧邻居的实际角色，决定该 run 应替换成
+// 几条合并消息、各是什么角色。
 //
-// Role Alternation 保护协议（Phase C 关键修复，经探索验证）：
+// 非 user/assistant 的邻居不参与交替约束，规范化为 "" 表示无约束——实测
+// role:"system" 占 14.7% 且是 CC 原生就发在 messages 数组里的，任何
+// 「严格 user/assistant 交替」的推断都不成立。
+//
+//	lc == "" 且 rc == "" → ["user"]
+//	lc == ""             → [opposite(rc)]
+//	rc == ""             → [opposite(lc)]
+//	lc == rc             → [opposite(lc)]
+//	lc != rc             → [opposite(lc), opposite(rc)]
+//
+// 返回前自检序列合法性（内部无相邻同角色、首元素 ≠ lc、末元素 ≠ rc）。
+// 任一不满足返回 nil，调用方据此放弃合并该 run——宁可少合并一次，
+// 也不向上游发出非法角色序列。
+func compactedRolesForNeighbors(leftRole, rightRole string) []string {
+	normalize := func(r string) string {
+		if r == "user" || r == "assistant" {
+			return r
+		}
+		return ""
+	}
+	opposite := func(r string) string {
+		if r == "user" {
+			return "assistant"
+		}
+		return "user"
+	}
+
+	lc := normalize(leftRole)
+	rc := normalize(rightRole)
+
+	var roles []string
+	switch {
+	case lc == "" && rc == "":
+		roles = []string{"user"}
+	case lc == "":
+		roles = []string{opposite(rc)}
+	case rc == "":
+		roles = []string{opposite(lc)}
+	case lc == rc:
+		roles = []string{opposite(lc)}
+	default:
+		roles = []string{opposite(lc), opposite(rc)}
+	}
+
+	for i := 1; i < len(roles); i++ {
+		if roles[i] == roles[i-1] {
+			return nil
+		}
+	}
+	if lc != "" && roles[0] == lc {
+		return nil
+	}
+	if rc != "" && roles[len(roles)-1] == rc {
+		return nil
+	}
+	return roles
+}
+
+// CompactMessages 将连续 50+ 条 Stage-3（DecayCompacted）消息合并为摘要消息，
+// 并保持发往上游的 user/assistant 交替。
+//
+// Role Alternation 保护协议：
 //
 // 核心约束：合并后的消息序列必须满足：
-//   - 第一条合并消息的角色 ≠ 左邻居（msg[run.start-1]）的角色
-//   - 最后一条合并消息的角色 ≠ 右邻居（msg[run.end+1]）的角色
+//   - 第一条合并消息的角色 ≠ 左邻居（decayed[run.start-1]）的角色
+//   - 最后一条合并消息的角色 ≠ 右邻居（decayed[run.end+1]）的角色
 //
-// Run 长度 L 的奇偶性决定邻居关系：
-//   - L 为偶数：左邻居 ≠ 右邻居 → 可放置 2 条合并消息 [rightRole, leftRole]
-//   - L 为奇数：左邻居 == 右邻居 → 只能放 1 条合并消息 [opposite(leftRole)]
+// 合并策略由两侧邻居的实际角色决定（判定表见 compactedRolesForNeighbors）：
 //
-// 计数阈值决定合并策略：
+//   - 两侧规范化后的角色不同 → 2 条合并消息，分别覆盖前半区间
+//     [run.start, mid] 与后半区间 [mid+1, run.end]，因此两条摘要的
+//     区间标题与统计内容都不同
 //
-//   - 两个角色都 ≥ 50（必然 L ≥ 100 偶数）：
-//     生成 [rightRole, leftRole] 共 2 条合并消息
-//     例（左=user, 右=assistant）：[assistant, user] → user→asst→user→asst ✓
+//   - 其余情形 → 1 条合并消息，覆盖整个 [run.start, run.end]
 //
-//   - 仅一个角色 ≥ 50（必然 L=99 奇数）：
-//     生成 1 条合并消息，角色 = opposite(左邻居)
-//     例（左右都是 user）：[assistant] → user→asst→user ✓
+//   - 非 user/assistant 的邻居视为无交替约束；算出的序列若仍与任一邻居冲突，
+//     放弃合并该 run（原样保留已衰减消息）
 //
-//   - 两个角色都 < 50：不合并该区间（保留原始消息）
+// run 的长度门槛只有一道，位于 findCompactableRuns（run 总长 ≥ minCompactableRun）。
+// 这里不做第二道设限——decay.go 的 `case DecayCompacted: return ""` 已把内容清空，
+// 任何「不合并」都意味着内容已空、摘要从未建立的信息净损失。
 //
 // 参数:
 //   - decayed: 已桩化+衰减的消息（用于确定角色和当前状态）
@@ -208,69 +268,36 @@ func CompactMessages(decayed, original []Message, dt *DecayTracker, sessionID st
 		// 复制 run 之前的未受影响消息
 		result = append(result, decayed[lastEnd:run.start]...)
 
-		userCount := countRoleInRange(decayed, run.start, run.end, "user")
-		asstCount := countRoleInRange(decayed, run.start, run.end, "assistant")
-		runLen := run.end - run.start + 1
-
-		// 确定邻居角色，用于保证交替
+		// 邻居的实际角色；右邻居越界时按无交替约束处理
 		leftRole := decayed[run.start-1].Role
-		rightRole := "user" // 默认
+		rightRole := ""
 		if run.end+1 < len(decayed) {
 			rightRole = decayed[run.end+1].Role
 		}
 
-		// oppositeRole 辅助
-		oppositeRole := func(r string) string {
-			if r == "user" {
-				return "assistant"
-			}
-			return "user"
-		}
-
-		switch {
-		case userCount >= minCompactableRun && asstCount >= minCompactableRun:
-			// 情况 A：两个角色都满足阈值（L ≥ 100）
-			if runLen%2 == 0 {
-				// L 为偶数 → leftRole ≠ rightRole → 2 条合并消息 [rightRole, leftRole]
-				cm1 := buildCompactedMessage(original, run.start, run.end, rightRole)
-				cm2 := buildCompactedMessage(original, run.start, run.end, leftRole)
-				result = append(result, cm1, cm2)
-				blocks = append(blocks,
-					CompactedBlock{StartIdx: run.start, EndIdx: run.end, Content: extractTextFromContent(cm1.Content), Role: rightRole},
-					CompactedBlock{StartIdx: run.start, EndIdx: run.end, Content: extractTextFromContent(cm2.Content), Role: leftRole},
-				)
-			} else {
-				// L 为奇数 → leftRole == rightRole → 1 条合并消息 [opposite(leftRole)]
-				role := oppositeRole(leftRole)
-				cm := buildCompactedMessage(original, run.start, run.end, role)
-				result = append(result, cm)
-				blocks = append(blocks,
-					CompactedBlock{StartIdx: run.start, EndIdx: run.end, Content: extractTextFromContent(cm.Content), Role: role},
-				)
-			}
-
-		case userCount >= minCompactableRun:
-			// 情况 B：仅 user 满足阈值（必然 L=99 奇数，leftRole == rightRole）
-			// → 1 条合并消息，角色 = opposite(leftRole)
-			role := oppositeRole(leftRole)
-			cm := buildCompactedMessage(original, run.start, run.end, role)
+		roles := compactedRolesForNeighbors(leftRole, rightRole)
+		switch len(roles) {
+		case 1:
+			// 只能放一条 → 覆盖整个 run 区间
+			cm := buildCompactedMessage(original, run.start, run.end, roles[0])
 			result = append(result, cm)
 			blocks = append(blocks,
-				CompactedBlock{StartIdx: run.start, EndIdx: run.end, Content: extractTextFromContent(cm.Content), Role: role},
+				CompactedBlock{StartIdx: run.start, EndIdx: run.end, Content: extractTextFromContent(cm.Content), Role: roles[0]},
 			)
 
-		case asstCount >= minCompactableRun:
-			// 情况 C：仅 assistant 满足阈值（必然 L=99 奇数，leftRole == rightRole）
-			// → 1 条合并消息，角色 = opposite(leftRole)
-			role := oppositeRole(leftRole)
-			cm := buildCompactedMessage(original, run.start, run.end, role)
-			result = append(result, cm)
+		case 2:
+			// 两条各覆盖半个区间 → 坐标不相交、文本不重复
+			mid := run.start + (run.end-run.start)/2
+			cm1 := buildCompactedMessage(original, run.start, mid, roles[0])
+			cm2 := buildCompactedMessage(original, mid+1, run.end, roles[1])
+			result = append(result, cm1, cm2)
 			blocks = append(blocks,
-				CompactedBlock{StartIdx: run.start, EndIdx: run.end, Content: extractTextFromContent(cm.Content), Role: role},
+				CompactedBlock{StartIdx: run.start, EndIdx: mid, Content: extractTextFromContent(cm1.Content), Role: roles[0]},
+				CompactedBlock{StartIdx: mid + 1, EndIdx: run.end, Content: extractTextFromContent(cm2.Content), Role: roles[1]},
 			)
 
 		default:
-			// 情况 D：两个角色都不满足阈值 → 保留原始消息（已衰减的）
+			// fail-safe：算不出合法序列 → 放弃合并，原样保留已衰减消息
 			result = append(result, decayed[run.start:run.end+1]...)
 		}
 
