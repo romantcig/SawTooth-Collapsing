@@ -1909,7 +1909,7 @@ func newPipelineTestServer(t *testing.T, upstreamURL string) *Server {
 	if err != nil {
 		t.Fatalf("NewTokenCounter: %v", err)
 	}
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "pipeline.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "pipeline.db"))
 	if err != nil {
 		t.Fatalf("NewSQLiteStore: %v", err)
 	}
