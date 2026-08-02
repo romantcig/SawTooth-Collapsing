@@ -277,6 +277,80 @@ func TestFormatCompactionCountsEmpty(t *testing.T) {
 	}
 }
 
+// ---- compactedRolesForNeighbors tests ----
+
+// TestCompactedRolesForNeighborsMatrix 遍历 {user, assistant, system, "", tool}
+// 的全部 25 组有序对，断言角色决策只产出合法的 user/assistant 序列，
+// 且首/末元素不与对应的 user/assistant 邻居冲突。
+// 非 user/assistant 的邻居（真实录制里 system 占 14.7%）按无交替约束处理。
+func TestCompactedRolesForNeighborsMatrix(t *testing.T) {
+	candidates := []string{"user", "assistant", "system", "", "tool"}
+
+	// 五组显式期望值，覆盖判定表的每一个分支。
+	explicit := map[[2]string][]string{
+		{"user", "user"}:        {"assistant"},         // lc == rc
+		{"user", "assistant"}:   {"assistant", "user"}, // lc != rc
+		{"system", "assistant"}: {"user"},              // 左侧无约束
+		{"user", "system"}:      {"assistant"},         // 右侧无约束
+		{"system", "system"}:    {"user"},              // 双侧无约束
+	}
+
+	// 与生产实现同构的规范化，用于独立复算约束（不调用被测函数的内部逻辑）。
+	normalize := func(r string) string {
+		if r == "user" || r == "assistant" {
+			return r
+		}
+		return ""
+	}
+
+	pairs := 0
+	for _, left := range candidates {
+		for _, right := range candidates {
+			pairs++
+			got := compactedRolesForNeighbors(left, right)
+
+			if len(got) < 1 || len(got) > 2 {
+				t.Errorf("(%q,%q): 返回长度 = %d, want 1 或 2 (got=%v)", left, right, len(got), got)
+				continue
+			}
+			for i, r := range got {
+				if r != "user" && r != "assistant" {
+					t.Errorf("(%q,%q): got[%d] = %q, 只允许 user/assistant", left, right, i, r)
+				}
+			}
+			for i := 1; i < len(got); i++ {
+				if got[i] == got[i-1] {
+					t.Errorf("(%q,%q): 序列内部相邻同角色 %v", left, right, got)
+				}
+			}
+			if lc := normalize(left); lc != "" && got[0] == lc {
+				t.Errorf("(%q,%q): 首元素 %q 与左邻居冲突 (got=%v)", left, right, got[0], got)
+			}
+			if rc := normalize(right); rc != "" && got[len(got)-1] == rc {
+				t.Errorf("(%q,%q): 末元素 %q 与右邻居冲突 (got=%v)", left, right, got[len(got)-1], got)
+			}
+
+			want, ok := explicit[[2]string{left, right}]
+			if !ok {
+				continue
+			}
+			if len(got) != len(want) {
+				t.Errorf("(%q,%q): got %v, want %v", left, right, got, want)
+				continue
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Errorf("(%q,%q): got %v, want %v", left, right, got, want)
+					break
+				}
+			}
+		}
+	}
+	if pairs != 25 {
+		t.Errorf("覆盖的有序对 = %d, want 25", pairs)
+	}
+}
+
 // ---- CompactMessages tests ----
 
 func TestCompactMessagesBothRolesEnough(t *testing.T) {
