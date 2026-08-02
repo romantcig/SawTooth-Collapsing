@@ -969,7 +969,7 @@ func seedFullExpandStore(t *testing.T) (*SQLiteStore, []Message, *TokenCounter) 
 	if err != nil {
 		t.Fatalf("NewTokenCounter: %v", err)
 	}
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "test.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "test.db"))
 	if err != nil {
 		t.Fatalf("NewSQLiteStore failed: %v", err)
 	}
@@ -1091,7 +1091,7 @@ func TestSearchAndExpandFullExpansionSameSessionOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTokenCounter: %v", err)
 	}
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "test.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "test.db"))
 	if err != nil {
 		t.Fatalf("NewSQLiteStore failed: %v", err)
 	}
