@@ -56,6 +56,12 @@ collapse:
   # collapse 由 CalcCollapseCutoff 的 token 预算逻辑直接决定，不再使用 threshold * multiplier。
   # 保留此 key 以避免旧配置文件报错，但不影响行为。
   threshold_multiplier: 1.5
+  # 是否把连续的 Stage-3 桩消息合并为归档摘要块，默认值: true（可省略）
+  # 警告：不要设为 false。decay 会无条件清空所有 Stage-3 消息的正文，
+  # 而 compaction 正是把这些内容以摘要块形式补回去的那一步。
+  # 关掉之后消息照样被清空、却没有任何东西覆盖它们，
+  # 结果不是"归档变小"而是静默的信息净损失。
+  compact_enabled: true
 
 frozen:
   # 是否启用 frozen prefix（默认 true）

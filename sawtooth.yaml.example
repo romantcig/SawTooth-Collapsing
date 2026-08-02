@@ -57,6 +57,13 @@ collapse:
   # Collapse is directly determined by the token budget logic in CalcCollapseCutoff, threshold * multiplier is no longer used.
   # This key is kept to prevent errors with old config files, but does not affect behavior.
   threshold_multiplier: 1.5
+  # Whether to merge consecutive Stage-3 stub messages into compacted summary blocks,
+  # default: true (optional).
+  # WARNING: do not set this to false. Decay blanks the body of every Stage-3 message
+  # unconditionally, and compaction is what puts that content back as a summary block.
+  # Turning compaction off blanks the messages anyway with nothing to cover them,
+  # which is silent information loss rather than a smaller archive.
+  compact_enabled: true
 
 frozen:
   # Whether to enable frozen prefix, default: true (optional)
