@@ -355,52 +355,69 @@ func TestCompactedRolesForNeighborsMatrix(t *testing.T) {
 
 // ---- CompactMessages tests ----
 
-func TestCompactMessagesBothRolesEnough(t *testing.T) {
+// TestCompactMessagesNeighborsDifferSplitsIntoHalves 验证：run 两侧邻居的实际角色
+// 不同时（左 roles[0]="user" / 右 roles[107]="assistant"），run 被拆成前后半区间的
+// 两条摘要。合并策略只看这两个邻居值，与 run 长度奇偶、与任何单角色计数都无关。
+// 111 条消息全部标记为已桩化 → run [1,106]。
+func TestCompactMessagesNeighborsDifferSplitsIntoHalves(t *testing.T) {
 	dt := NewDecayTracker()
-	// 111 messages: run [1, 106] (L=106 even), assistant=53 user=53, both ≥ 50
-	// leftRole=user(0), rightRole=asst(107) → 2 compacted [asst, user]
-	// Alternation: user→asst→user→asst ✓
 	original, decayed := buildTestThread(111, dt)
+
+	runs := findCompactableRuns(dt, "test", len(decayed), 1, len(decayed)-5, 200, 3.0)
+	if len(runs) != 1 {
+		t.Fatalf("期望 1 个 run, got %d", len(runs))
+	}
+	run := runs[0]
+	if decayed[run.start-1].Role == decayed[run.end+1].Role {
+		t.Fatalf("前提不成立：左右邻居同为 %q", decayed[run.start-1].Role)
+	}
 
 	result, blocks := CompactMessages(decayed, original, dt, "test", 200, 3.0)
 
-	if len(blocks) == 0 {
-		t.Fatalf("expected at least 1 block, got 0 (user=%d asst=%d in run [1,106])",
-			countRoleInRange(decayed, 1, 106, "user"),
-			countRoleInRange(decayed, 1, 106, "assistant"))
+	if len(blocks) != 2 {
+		t.Fatalf("邻居不同 → 期望 2 条 block, got %d", len(blocks))
 	}
-	// Verify role alternation in result
-	roles := make([]string, 0, len(result))
-	for _, msg := range result {
-		roles = append(roles, msg.Role)
+	// W1-3：两条摘要覆盖不相交的前后半区间，并集恰好等于 run
+	if blocks[0].EndIdx >= blocks[1].StartIdx {
+		t.Errorf("两条 block 区间相交: [%d,%d] 与 [%d,%d]",
+			blocks[0].StartIdx, blocks[0].EndIdx, blocks[1].StartIdx, blocks[1].EndIdx)
 	}
-	for i := 1; i < len(roles); i++ {
-		if roles[i] == roles[i-1] {
-			t.Errorf("role violation at index %d: %s → %s", i, roles[i-1], roles[i])
+	if blocks[1].StartIdx != blocks[0].EndIdx+1 {
+		t.Errorf("两条 block 之间有空洞: %d → %d", blocks[0].EndIdx, blocks[1].StartIdx)
+	}
+	if blocks[0].StartIdx != run.start || blocks[1].EndIdx != run.end {
+		t.Errorf("并集 [%d,%d] 不等于 run [%d,%d]",
+			blocks[0].StartIdx, blocks[1].EndIdx, run.start, run.end)
+	}
+	if blocks[0].Content == blocks[1].Content {
+		t.Errorf("两条摘要文本相同（W1-3 回归）: %q", blocks[0].Content)
+	}
+	if blocks[0].Role == blocks[1].Role {
+		t.Errorf("两条摘要角色相同: %q", blocks[0].Role)
+	}
+
+	// 结果整体无相邻同角色，且消息数变少
+	for i := 1; i < len(result); i++ {
+		if result[i].Role == result[i-1].Role {
+			t.Errorf("相邻同角色 at %d: %s → %s", i, result[i-1].Role, result[i].Role)
 		}
 	}
-	// Verify fewer messages
 	if len(result) >= len(decayed) {
-		t.Errorf("expected fewer messages after compaction: %d → %d", len(decayed), len(result))
-	}
-	// With 111 msgs and even run → should produce exactly 2 blocks
-	if len(blocks) != 2 {
-		t.Errorf("got %d blocks (expected 2 for even-length run)", len(blocks))
+		t.Errorf("合并后消息数 = %d, 应少于输入的 %d", len(result), len(decayed))
 	}
 }
 
-func TestCompactMessagesSingleRoleEnough(t *testing.T) {
+// TestCompactMessagesNeighborsEqualProducesSingleBlock 验证：run 左右邻居的实际角色
+// 相同（这里同为 user）时，中间只能放一条 opposite(user)=assistant 的摘要，
+// 覆盖整个 run 区间——放两条必然让其中一条与某侧邻居撞角色。
+// 106 条消息、标记 [0,99] 为已桩化 → run [1,99]，roles[0] 与 roles[100] 都是 user。
+func TestCompactMessagesNeighborsEqualProducesSingleBlock(t *testing.T) {
 	dt := NewDecayTracker()
-	// 106 messages, mark [0, 99] as stubbed → run [1, 99] = 99 msgs
-	// assistant at 1,3,...,99 = 50; user at 2,4,...,98 = 49
-	// Only assistant reaches 50 → 1 compacted message (absorb entire range)
 	n := 106
-	// Mark stubs only — message construction happens below
 	for i := 0; i <= 99; i++ {
 		dt.MarkStubbed("test", i, 1, 0.0)
 	}
 
-	// Build original and decayed slices
 	original := make([]Message, n)
 	decayed := make([]Message, n)
 	for i := 0; i < n; i++ {
@@ -412,26 +429,31 @@ func TestCompactMessagesSingleRoleEnough(t *testing.T) {
 		decayed[i] = Message{Role: role, Content: json.RawMessage(fmt.Sprintf(`"msg %d"`, i))}
 	}
 
+	runs := findCompactableRuns(dt, "test", n, 1, n-5, 200, 3.0)
+	if len(runs) != 1 {
+		t.Fatalf("期望 1 个 run, got %d", len(runs))
+	}
+	run := runs[0]
+	if decayed[run.start-1].Role != decayed[run.end+1].Role {
+		t.Fatalf("前提不成立：左邻居 %q ≠ 右邻居 %q",
+			decayed[run.start-1].Role, decayed[run.end+1].Role)
+	}
+
 	result, blocks := CompactMessages(decayed, original, dt, "test", 200, 3.0)
 
-	if len(blocks) == 0 {
-		// Debug
-		for i := 1; i <= 100; i++ {
-			stage := dt.GetStage("test", i, 200, n, 3.0)
-			if stage == DecayCompacted {
-				t.Logf("msg[%d]=%s is Stage 3", i, decayed[i].Role)
-			}
-		}
-		t.Fatalf("expected at least 1 block for run with 50 assistant + 49 user")
+	if len(blocks) != 1 {
+		t.Fatalf("邻居相同 → 期望 1 条 block, got %d", len(blocks))
 	}
-	// Verify role alternation preserved
-	roles := make([]string, 0, len(result))
-	for _, msg := range result {
-		roles = append(roles, msg.Role)
+	if blocks[0].StartIdx != run.start || blocks[0].EndIdx != run.end {
+		t.Errorf("block 区间 = [%d,%d], want 整个 run [%d,%d]",
+			blocks[0].StartIdx, blocks[0].EndIdx, run.start, run.end)
 	}
-	for i := 1; i < len(roles); i++ {
-		if roles[i] == roles[i-1] {
-			t.Errorf("role violation at index %d: %s → %s", i, roles[i-1], roles[i])
+	if blocks[0].Role != "assistant" {
+		t.Errorf("block Role = %q, want assistant（= opposite(user)）", blocks[0].Role)
+	}
+	for i := 1; i < len(result); i++ {
+		if result[i].Role == result[i-1].Role {
+			t.Errorf("相邻同角色 at %d: %s → %s", i, result[i-1].Role, result[i].Role)
 		}
 	}
 }
@@ -757,6 +779,59 @@ func TestCompactMessagesEveryRunIndexCoveredByBlock(t *testing.T) {
 					run.start, run.end, idx)
 			}
 		}
+	}
+}
+
+// TestCompactMessagesHalvesAreDisjointAndDistinct 用真实 role 序列钉住 W1-3：
+// stubbedThrough=119 → run [1,119]，左邻居 roles[0]="user"、右邻居
+// roles[120]="assistant"，必然走两条 block 分支。旧代码两条 buildCompactedMessage
+// 都传整个 (run.start, run.end)，两条摘要文本完全相同。
+func TestCompactMessagesHalvesAreDisjointAndDistinct(t *testing.T) {
+	dt := NewDecayTracker()
+	roles := loadRealRoleSequence(t)
+	original, decayed := buildThreadFromRoles(roles, dt, 119)
+
+	runs := findCompactableRuns(dt, "test", len(decayed), 1, len(decayed)-5, 200, 3.0)
+	if len(runs) != 1 {
+		t.Fatalf("期望 1 个 run, got %d", len(runs))
+	}
+	run := runs[0]
+
+	_, blocks := CompactMessages(decayed, original, dt, "test", 200, 3.0)
+	if len(blocks) != 2 {
+		t.Fatalf("期望 2 条 block, got %d", len(blocks))
+	}
+
+	// 坐标：不相交、无空洞、并集恰好等于 run
+	if blocks[0].StartIdx != run.start {
+		t.Errorf("blocks[0].StartIdx = %d, want %d", blocks[0].StartIdx, run.start)
+	}
+	if blocks[1].EndIdx != run.end {
+		t.Errorf("blocks[1].EndIdx = %d, want %d", blocks[1].EndIdx, run.end)
+	}
+	if blocks[1].StartIdx != blocks[0].EndIdx+1 {
+		t.Errorf("前后半区间不衔接: [%d,%d] 与 [%d,%d]",
+			blocks[0].StartIdx, blocks[0].EndIdx, blocks[1].StartIdx, blocks[1].EndIdx)
+	}
+
+	// 文本：两条 [Compacted: Messages X-Y 标题必须不同
+	title := func(content string) string {
+		if i := strings.IndexByte(content, '\n'); i >= 0 {
+			return content[:i]
+		}
+		return content
+	}
+	firstTitle, secondTitle := title(blocks[0].Content), title(blocks[1].Content)
+	if firstTitle == secondTitle {
+		t.Errorf("两条摘要标题相同（W1-3 回归）: %q", firstTitle)
+	}
+	wantFirst := fmt.Sprintf("[Compacted: Messages %d-%d ", blocks[0].StartIdx, blocks[0].EndIdx)
+	if !strings.HasPrefix(firstTitle, wantFirst) {
+		t.Errorf("blocks[0] 标题 = %q, want 前缀 %q", firstTitle, wantFirst)
+	}
+	wantSecond := fmt.Sprintf("[Compacted: Messages %d-%d ", blocks[1].StartIdx, blocks[1].EndIdx)
+	if !strings.HasPrefix(secondTitle, wantSecond) {
+		t.Errorf("blocks[1] 标题 = %q, want 前缀 %q", secondTitle, wantSecond)
 	}
 }
 
