@@ -3,6 +3,8 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -628,6 +630,136 @@ func TestCompactMessagesAdjacentRuns(t *testing.T) {
 	}
 }
 
+// ---- CompactMessages 真实 role 序列回归 ----
+//
+// 以下测试全部由 testdata/compaction/real-role-sequence.json 驱动：
+// 177 条 role（user 78 / assistant 77 / system 22，0 处相邻重复），
+// 取自真实录制的 body.messages[*].role。合成的严格交替数据把
+// 「run 长度奇偶 ⇒ 邻居关系」这个错误前提固化了，正是 W1-1/W1-2
+// 长期测不出来的原因，故角色相关的回归一律改用这份真实序列。
+
+func TestCompactMessagesShortRunWithSystemProducesSummary(t *testing.T) {
+	dt := NewDecayTracker()
+	roles := loadRealRoleSequence(t)
+	// run = [1,60]，L=60，含 10 条 system，右邻居 roles[61]="assistant"。
+	// 旧逻辑 user 25 / assistant 25 两侧计数都 < 50 → 落 default 分支完全不合并，
+	// 而 decay.go 的 `case DecayCompacted: return ""` 已把这 60 条内容清空。
+	original, decayed := buildThreadFromRoles(roles, dt, 60)
+
+	result, blocks := CompactMessages(decayed, original, dt, "test", 200, 3.0)
+
+	if len(blocks) < 1 {
+		t.Fatalf("L=60 的 run 必须产出摘要 block, got %d (run[1,60] 内 user=%d assistant=%d)",
+			len(blocks),
+			countRoleInRange(decayed, 1, 60, "user"),
+			countRoleInRange(decayed, 1, 60, "assistant"))
+	}
+	if len(result) >= len(decayed) {
+		t.Errorf("合并后消息数 = %d, 应少于输入的 %d", len(result), len(decayed))
+	}
+	// run 内的原始消息必须已被摘要替换掉
+	const replaced = `"msg 30"`
+	for i, msg := range result {
+		if string(msg.Content) == replaced {
+			t.Errorf("result[%d] 仍是 run 内的原始消息 %s——未被合并", i, replaced)
+		}
+	}
+}
+
+func TestCompactMessagesRealRoleSequenceNoAdjacentSameRole(t *testing.T) {
+	// 四个切点由实算挑出，是旧逻辑的失效现场：
+	//   118 → 旧代码插入 role="system" 的合并消息
+	//   119 → 旧代码插入的 assistant 与右邻居 roles[120]="assistant" 相邻
+	//   120 → 旧代码插入 ["user","user"]，双违规
+	//   172 → 最长 run（撞上 scanEnd）
+	// 输入序列本身 0 处相邻重复，任何违规都只可能由合并引入。
+	for _, stubbedThrough := range []int{118, 119, 120, 172} {
+		t.Run(fmt.Sprintf("stubbedThrough=%d", stubbedThrough), func(t *testing.T) {
+			dt := NewDecayTracker()
+			roles := loadRealRoleSequence(t)
+			original, decayed := buildThreadFromRoles(roles, dt, stubbedThrough)
+
+			result, blocks := CompactMessages(decayed, original, dt, "test", 200, 3.0)
+
+			if len(blocks) == 0 {
+				t.Fatalf("期望至少 1 个 block, got 0")
+			}
+			for i := 1; i < len(result); i++ {
+				if result[i].Role == result[i-1].Role {
+					t.Errorf("相邻同角色 at %d: %s → %s", i, result[i-1].Role, result[i].Role)
+				}
+			}
+		})
+	}
+}
+
+func TestCompactMessagesRealRoleSequenceNeverInsertsSystemRole(t *testing.T) {
+	for _, stubbedThrough := range []int{118, 119, 120, 172} {
+		t.Run(fmt.Sprintf("stubbedThrough=%d", stubbedThrough), func(t *testing.T) {
+			dt := NewDecayTracker()
+			roles := loadRealRoleSequence(t)
+			original, decayed := buildThreadFromRoles(roles, dt, stubbedThrough)
+
+			result, blocks := CompactMessages(decayed, original, dt, "test", 200, 3.0)
+
+			if len(blocks) == 0 {
+				t.Fatalf("期望至少 1 个 block, got 0")
+			}
+			compactedSeen := 0
+			for i, msg := range result {
+				if !strings.HasPrefix(extractTextFromContent(msg.Content), "[Compacted:") {
+					continue
+				}
+				compactedSeen++
+				if msg.Role != "user" && msg.Role != "assistant" {
+					t.Errorf("合并消息 result[%d] 的 Role = %q, 只允许 user/assistant", i, msg.Role)
+				}
+			}
+			if compactedSeen != len(blocks) {
+				t.Errorf("结果里的合并消息数 = %d, blocks = %d", compactedSeen, len(blocks))
+			}
+			for i, b := range blocks {
+				if b.Role != "user" && b.Role != "assistant" {
+					t.Errorf("blocks[%d].Role = %q, 只允许 user/assistant", i, b.Role)
+				}
+			}
+		})
+	}
+}
+
+func TestCompactMessagesEveryRunIndexCoveredByBlock(t *testing.T) {
+	dt := NewDecayTracker()
+	roles := loadRealRoleSequence(t)
+	original, decayed := buildThreadFromRoles(roles, dt, 172)
+
+	// 与 CompactMessages 内部一致的扫描参数（compaction.go 的 scanStart/scanEnd）
+	scanStart := 1
+	scanEnd := len(decayed) - 5
+	runs := findCompactableRuns(dt, "test", len(decayed), scanStart, scanEnd, 200, 3.0)
+	if len(runs) == 0 {
+		t.Fatal("期望至少 1 个 run")
+	}
+
+	_, blocks := CompactMessages(decayed, original, dt, "test", 200, 3.0)
+
+	for _, run := range runs {
+		for idx := run.start; idx <= run.end; idx++ {
+			covered := false
+			for _, b := range blocks {
+				if idx >= b.StartIdx && idx <= b.EndIdx {
+					covered = true
+					break
+				}
+			}
+			if !covered {
+				t.Fatalf("run [%d,%d] 的索引 %d 未被任何 CompactedBlock 覆盖："+
+					"内容已被 decay 清空而摘要从未建立（或 fail-safe 被静默触发）",
+					run.start, run.end, idx)
+			}
+		}
+	}
+}
+
 // ---- countRoleInRange tests ----
 
 func TestCountRoleInRange(t *testing.T) {
@@ -684,6 +816,36 @@ func TestExtractTextFromContentInvalid(t *testing.T) {
 }
 
 // ---- helpers for building test data ----
+
+// loadRealRoleSequence 加载从真实录制提取的 177 条 role 序列。
+// fixture 只含角色字符串，不含消息正文、session id 或时间戳。
+// 不在测试运行时读原始录制目录（data/ 在 .gitignore 里，干净检出下不存在）。
+func loadRealRoleSequence(t *testing.T) []string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", "compaction", "real-role-sequence.json"))
+	if err != nil {
+		t.Fatalf("读取 real-role-sequence.json 失败: %v", err)
+	}
+	var roles []string
+	if err := json.Unmarshal(data, &roles); err != nil {
+		t.Fatalf("解析 real-role-sequence.json 失败: %v", err)
+	}
+	return roles
+}
+
+// buildThreadFromRoles 按给定 role 序列构造 original/decayed，
+// 并把 [0, stubbedThrough] 标记为已桩化，使 Stage-3 run 恰好终止于 stubbedThrough。
+func buildThreadFromRoles(roles []string, dt *DecayTracker, stubbedThrough int) (original, decayed []Message) {
+	for i, role := range roles {
+		msg := Message{Role: role, Content: json.RawMessage(fmt.Sprintf(`"msg %d"`, i))}
+		original = append(original, msg)
+		decayed = append(decayed, msg)
+		if dt != nil && i <= stubbedThrough {
+			dt.MarkStubbed("test", i, 1, 0.0)
+		}
+	}
+	return
+}
 
 // buildTestThread creates a thread of N messages with alternating roles.
 // All messages are marked as stubbed at request 1.
