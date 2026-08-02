@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -766,6 +767,62 @@ func TestFrozenColdStartRejectsInvalidCutoff(t *testing.T) {
 				t.Fatalf("非法状态进入内存，长度=%d", got)
 			}
 		})
+	}
+}
+
+// W4-1：同一 stateKey 的并发冷启动只触发一次 DB 查询，且等待方在加载完成后
+// 仍能拿到恢复出的 frozen prefix。
+func TestFrozenLoadFromDBConcurrentColdStartLoadsOnce(t *testing.T) {
+	raw := frozenTestMessages(4)
+	var persisted string
+	producer := NewFrozenStubs()
+	producer.SetPersistFunc(func(_ string, value string) { persisted = value })
+	producer.Store("thread", deepCopyMessages(raw[:2]), 3, raw[2], 20, 30)
+	if persisted == "" {
+		t.Fatal("producer 未产出持久化状态")
+	}
+
+	// 先单线程确认这套构造真的能恢复，否则并发断言会退化成两个 nil 的平凡通过。
+	warm := NewFrozenStubs()
+	warm.SetLoadFunc(func(string) (string, bool) { return persisted, true })
+	if got := warm.Get("thread", raw); got == nil {
+		t.Fatal("单线程冷启动未能恢复 frozen prefix，测试构造无效")
+	}
+
+	var loadCalls int64
+	loadStarted := make(chan struct{})
+	releaseLoad := make(chan struct{})
+	restored := NewFrozenStubs()
+	restored.SetLoadFunc(func(string) (string, bool) {
+		if atomic.AddInt64(&loadCalls, 1) == 1 {
+			close(loadStarted)
+			<-releaseLoad
+		}
+		return persisted, true
+	})
+
+	results := make(chan *FrozenResult, 2)
+	go func() { results <- restored.Get("thread", raw) }()
+	<-loadStarted
+	go func() { results <- restored.Get("thread", raw) }()
+	select {
+	case got := <-results:
+		t.Fatalf("并发冷启动在加载完成前返回: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseLoad)
+
+	for i := 0; i < 2; i++ {
+		got := <-results
+		if got == nil {
+			t.Fatal("并发冷启动未能拿到恢复出的 frozen prefix")
+		}
+		if got.Cutoff != 3 || len(got.Messages) != 2 || got.Tokens != 20 || got.RawTokens != 30 {
+			t.Fatalf("恢复出的 frozen prefix 不符: %+v", got)
+		}
+	}
+	if n := atomic.LoadInt64(&loadCalls); n != 1 {
+		t.Fatalf("loadFn 调用次数 = %d, want 1", n)
 	}
 }
 
