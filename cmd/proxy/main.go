@@ -124,15 +124,6 @@ func main() {
 		"pause_threshold", "330s",
 	)
 
-	// Phase 5: EagerStubMemory 初始化 (EAGER-02)
-	eagerStubMem := proxy.NewEagerStubMemory()
-	eagerStubMem.SetPersistFunc(func(key, value string) {
-		_ = store.PersistState(key, value) // best-effort
-	})
-	eagerStubMem.SetLoadFunc(store.LoadState)
-	srv.EagerStub = eagerStubMem
-	slog.Info("EagerStubMemory 已初始化")
-
 	// Phase 4: FrozenStubs 定时 eviction goroutine（每 5 分钟，D-12）
 	// evictCtx/evictCancel 在 if 外部声明——信号处理器需要 evictCancel。
 	evictCtx, evictCancel := context.WithCancel(context.Background())

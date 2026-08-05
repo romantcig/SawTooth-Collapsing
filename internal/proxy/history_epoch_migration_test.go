@@ -29,7 +29,6 @@ func TestHistoryEpochOneMigratesLegacyDerivedStateAndBranchesCleanly(t *testing.
 	server.Sawtooth.SetPersistFunc(persist)
 	server.Frozen.SetPersistFunc(persist)
 	server.DecayTracker.SetPersistFunc(persist)
-	server.EagerStub.SetPersistFunc(persist)
 
 	contextFingerprint := fingerprintTopLevelJSON(nil)
 	server.Sawtooth.UpdatePressureBaseline(
@@ -54,7 +53,6 @@ func TestHistoryEpochOneMigratesLegacyDerivedStateAndBranchesCleanly(t *testing.
 	server.DecayTracker.MarkStubbed(sessionID, 0, 1, 0.25)
 	server.DecayTracker.SetFilePath(sessionID, 0, "legacy.go")
 	server.DecayTracker.Persist(sessionID)
-	server.EagerStub.RecordStubbed(sessionID, "legacy-tool")
 	persistedKeys = nil
 
 	var observedStateKeys []string
@@ -92,21 +90,17 @@ func TestHistoryEpochOneMigratesLegacyDerivedStateAndBranchesCleanly(t *testing.
 	if !decayMigrated || decayRequest != 1 || decayPath != "legacy.go" {
 		t.Fatalf("Decay 未迁移: exists=%v request=%d path=%q", decayMigrated, decayRequest, decayPath)
 	}
-	if !server.EagerStub.WasStubbed(stateKey1, "legacy-tool") || !server.EagerStub.WasStubbed(sessionID, "legacy-tool") {
-		t.Fatal("Eager sticky 状态未迁移或旧观察 alias 未指向当前 epoch")
-	}
 
 	wantPersisted := map[string]bool{
-		"sawtooth:" + stateKey1:  false,
-		"frozen:" + stateKey1:    false,
-		"decay:" + stateKey1:     false,
-		"eagerstub:" + stateKey1: false,
+		"sawtooth:" + stateKey1: false,
+		"frozen:" + stateKey1:   false,
+		"decay:" + stateKey1:    false,
 	}
 	for _, key := range persistedKeys {
 		if _, tracked := wantPersisted[key]; tracked {
 			wantPersisted[key] = true
 		}
-		if key == "sawtooth:"+sessionID || key == "frozen:"+sessionID || key == "decay:"+sessionID || key == "eagerstub:"+sessionID {
+		if key == "sawtooth:"+sessionID || key == "frozen:"+sessionID || key == "decay:"+sessionID {
 			t.Fatalf("主管线继续持久化裸 session key: %q", key)
 		}
 	}
@@ -127,12 +121,6 @@ func TestHistoryEpochOneMigratesLegacyDerivedStateAndBranchesCleanly(t *testing.
 	server.DecayTracker.mu.Lock()
 	server.DecayTracker.stubbedAt[sessionID+":msg_99"] = 900
 	server.DecayTracker.mu.Unlock()
-	server.EagerStub.mu.Lock()
-	if server.EagerStub.stubbed[sessionID] == nil {
-		server.EagerStub.stubbed[sessionID] = make(map[string]bool)
-	}
-	server.EagerStub.stubbed[sessionID]["stale-tool"] = true
-	server.EagerStub.mu.Unlock()
 
 	branched := deepCopyMessages(base)
 	branched[1].Content = mustMarshal("new branch")
@@ -160,11 +148,8 @@ func TestHistoryEpochOneMigratesLegacyDerivedStateAndBranchesCleanly(t *testing.
 	if decayLeaked || server.DecayTracker.GetStage(sessionID, 0, 100, 100, 1) != DecayFresh {
 		t.Fatal("裸 Decay 状态迁入了 epoch 2")
 	}
-	if server.EagerStub.WasStubbed(stateKey2, "stale-tool") || server.EagerStub.WasStubbed(sessionID, "legacy-tool") {
-		t.Fatal("裸 Eager 状态迁入了 epoch 2")
-	}
 	for _, key := range persistedKeys {
-		if key == "frozen:"+stateKey2 || key == "decay:"+stateKey2 || key == "eagerstub:"+stateKey2 {
+		if key == "frozen:"+stateKey2 || key == "decay:"+stateKey2 {
 			t.Fatalf("epoch 2 意外执行 legacy migration: %q", key)
 		}
 		if strings.HasSuffix(key, ":"+sessionID) {
@@ -205,13 +190,5 @@ func TestLegacyDerivedStateMigrationPrefersExistingEpochKey(t *testing.T) {
 	decay.mu.RUnlock()
 	if decayRequest != 9 {
 		t.Fatalf("Decay 显式目标被裸状态覆盖: request=%d", decayRequest)
-	}
-
-	eager := NewEagerStubMemory()
-	eager.RecordStubbed(sessionID, "legacy-tool")
-	eager.RecordStubbed(stateKey, "current-tool")
-	eager.MigrateLegacyState(sessionID, stateKey)
-	if !eager.WasStubbed(stateKey, "current-tool") || eager.WasStubbed(stateKey, "legacy-tool") {
-		t.Fatal("Eager 显式目标被裸状态覆盖")
 	}
 }

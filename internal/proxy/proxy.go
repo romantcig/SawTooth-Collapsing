@@ -216,7 +216,6 @@ type Server struct {
 	Store             *SQLiteStore         // Phase 3: SQLite 持久化 (D-14)
 	Frozen            *FrozenStubs         // Phase 4: frozen prefix 存储 (D-12)
 	Sawtooth          *SawtoothTrigger     // Phase 4: 桩化周期触发 (D-03)
-	EagerStub         *EagerStubMemory     // Phase 5: eager stub memory (EAGER-01)
 	HistoryEpoch      *HistoryEpochManager // Phase 11: raw history epoch/state isolation
 	cacheMu           sync.Mutex           // 保护 cachedTTL 的比较与下游 TTL 更新
 	cachedTTL         string               // 当前生效的 cache TTL（"ephemeral" 或 "1h"），用于检测切换
@@ -533,7 +532,7 @@ func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessa
 	if baseline.Conservative {
 		// Conservative 是旧版在 forwarded 坐标改变时写入的不可验证高水位。
 		// 无论旧记录是否带有新坐标指纹，都不能先进入 legacy high-water
-		// 分支；必须回退到 eager 后的 local_full，等待本轮 exact 响应重建。
+		// 分支；必须回退到 local_full，等待本轮 exact 响应重建。
 		decision.Source = pressureSourceLocalFull
 		decision.ResetReason = baselineResetLegacyUnverified
 		return decision
@@ -592,25 +591,6 @@ func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessa
 	return decision
 }
 
-// previewEagerPressureShape 生成“若本轮不做重型压缩，实际上游会看到的消息形状”。
-// 预演不传 EagerStubMemory，因此不会读取或写入 sticky 状态；规则本身是确定性的，
-// 只会压缩已经有后续 assistant 回合的大 tool_result。Frozen prefix 已是上轮真实
-// wire 快照，故只预演 fresh tail，避免用压缩前 raw 历史虚增 pressure。
-func previewEagerPressureShape(messages []Message, frozenBoundary int, tc *TokenCounter) []Message {
-	if len(messages) == 0 || tc == nil {
-		return deepCopyMessages(messages)
-	}
-	if frozenBoundary < 0 || frozenBoundary > len(messages) {
-		frozenBoundary = 0
-	}
-	preview := EagerStubToolResults(
-		messagesToAny(messages),
-		frozenBoundary,
-		func(text string) int { return tc.CountTokens(text) },
-	)
-	return anyToMessages(preview)
-}
-
 // logHistoryMismatch 只记录 manager 已持久去重后的首次 input-history 差异。
 // 使用 request_id-only logger，避免通用 request logger 预绑定的完整 session ID
 // 进入终端日志；canonical hash、dedup key 与消息正文不进入该接口。
@@ -634,8 +614,8 @@ func logHistoryMismatch(meta *requestMeta, decision HistoryEpochDecision) {
 // HandleMessages 处理 POST /v1/messages 请求。
 // 管线顺序: parse -> FrozenStubs.Get -> Reexpand -> CompressContext -> CalcCollapseCutoff
 //
-//	-> PRIMARY: collapse -> EagerStub -> cache -> orphan -> forwardRaw
-//	-> FALLBACK: stubify -> decay -> compact -> SawtoothTrigger+FrozenStubs.Store -> EagerStub -> cache -> orphan -> forwardRaw
+//	-> PRIMARY: collapse -> cache -> orphan -> forwardRaw
+//	-> FALLBACK: stubify -> decay -> compact -> SawtoothTrigger+FrozenStubs.Store -> cache -> orphan -> forwardRaw
 //
 // (D-01/D-02/D-09/D-10/D-11, Phase F collapse-first)
 func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
@@ -747,7 +727,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// History epoch gate：detach persistent context、清理已知 reminder 后，
-		// 在任何 request sequence、pressure、Frozen、Archive、Decay 或 Eager
+		// 在任何 request sequence、pressure、Frozen、Archive 或 Decay
 		// 状态读取前证明当前 raw history 的连续性。
 		historyMessages = StripReminders(historyMessages)
 		rawHistory := deepCopyMessages(historyMessages)
@@ -796,9 +776,6 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				if s.DecayTracker != nil {
 					s.DecayTracker.MigrateLegacyState(sessionID, stateKey)
 				}
-				if s.EagerStub != nil {
-					s.EagerStub.MigrateLegacyState(sessionID, stateKey)
-				}
 			}
 			if s.Sawtooth != nil {
 				s.Sawtooth.SetCurrentAlias(sessionID, stateKey)
@@ -808,9 +785,6 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			}
 			if s.DecayTracker != nil {
 				s.DecayTracker.SetCurrentAlias(sessionID, stateKey)
-			}
-			if s.EagerStub != nil {
-				s.EagerStub.SetCurrentAlias(sessionID, stateKey)
 			}
 		}
 		if s.HistoryEpoch != nil && !historyReuseSafe && !meta.HistoryEpochChanged {
@@ -886,9 +860,8 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		selectPressure := func(candidate []Message, frozenBoundary int) pressureDecision {
-			pressureMessages := previewEagerPressureShape(candidate, frozenBoundary, s.TokenCounter)
-			pressureMessages = finalizeMessages(pressureMessages)
+		selectPressure := func(candidate []Message) pressureDecision {
+			pressureMessages := finalizeMessages(candidate)
 			selected := buildPressureDecision(pressureMessages, bodyMap["system"], bodyMap["tools"], baseline, s.TokenCounter, threshold)
 			if s.Sawtooth != nil {
 				selected.TriggerReason = s.Sawtooth.ShouldTrigger(stateKey, selected.SelectedPressure)
@@ -904,7 +877,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 		// 先按 Frozen prefix + fresh tail 的实际候选 wire 形状做压力判定。
 		// 只有候选仍超限（或满足 pause 条件）时才丢弃 Frozen 并回到 raw history。
-		decision := selectPressure(messages, frozenPrefixLen)
+		decision := selectPressure(messages)
 		if frozenPrefixLen > 0 {
 			if decision.CompressDecision {
 				meta.Logger.Info("frozen prefix 不足，重新压缩",
@@ -919,7 +892,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				frozenRawCutoff = 0
 				frozenPrefixLen = 0
 				frozenTokens = 0
-				decision = selectPressure(messages, 0)
+				decision = selectPressure(messages)
 			} else {
 				meta.Logger.Info("frozen prefix 仍在阈值内，跳过压缩",
 					"raw_cutoff", frozenRawCutoff,
@@ -934,7 +907,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		s.writePressureDecisionDebugFacts(meta, rawTimestamp)
 		logPressureSummary(meta)
 
-		// raw 消息仍是重型压缩与 Archive 的权威来源；pressure 只使用 eager 后候选。
+		// raw 消息仍是重型压缩与 Archive 的权威来源；pressure 只使用最终 wire 候选。
 		totalTokens := contextTokens + s.TokenCounter.CountMessagesTokens(messages)
 		pressureTrigger := decision.TriggerReason
 		needCompress := decision.CompressDecision
@@ -1036,26 +1009,6 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					// 重建请求体
 					messages = collapsedMessages
 
-					// Phase 5: Eager stubbing（collapse 后 tail 中的大 tool_result 仍需处理）
-					if s.EagerStub != nil {
-						freshStubs := 0
-						stickyHits := 0
-						messagesAny := messagesToAny(messages)
-						messagesAny = EagerStubToolResults(messagesAny, 0,
-							func(text string) int { return s.TokenCounter.CountTokens(text) },
-							WithStubMemory(s.EagerStub, stateKey),
-							WithStubCounters(&stickyHits, &freshStubs),
-						)
-						messages = anyToMessages(messagesAny)
-						if freshStubs > 0 || stickyHits > 0 {
-							meta.Logger.Info("eager stub 完成（collapse 路径）",
-								"fresh_stubs", freshStubs,
-								"sticky_hits", stickyHits,
-								LogGreen,
-							)
-						}
-					}
-
 					// Orphan repair
 					repaired, orphans := validateToolPairs(messages)
 					if orphans > 0 {
@@ -1134,23 +1087,6 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			}
 
 			messages = decayedMessages
-			if s.EagerStub != nil {
-				freshStubs := 0
-				stickyHits := 0
-				messagesAny := messagesToAny(messages)
-				messagesAny = EagerStubToolResults(messagesAny, frozenPrefixLen,
-					func(text string) int { return s.TokenCounter.CountTokens(text) },
-					WithStubMemory(s.EagerStub, stateKey),
-					WithStubCounters(&stickyHits, &freshStubs),
-				)
-				messages = anyToMessages(messagesAny)
-				if freshStubs > 0 || stickyHits > 0 {
-					meta.Logger.Info("eager stub 完成（超阈值无折叠）",
-						"fresh_stubs", freshStubs,
-						"sticky_hits", stickyHits,
-					)
-				}
-			}
 			// Orphan repair
 			repaired, orphans := validateToolPairs(messages)
 			if orphans > 0 {
@@ -1191,25 +1127,6 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			r.Body = io.NopCloser(bytes.NewReader(newBody))
 
 		} else {
-			// Phase 5: 每个主代理请求都主动清理已被后续 assistant 消化的旧 tool_result。
-			if s.EagerStub != nil {
-				freshStubs := 0
-				stickyHits := 0
-				messagesAny := messagesToAny(messages)
-				messagesAny = EagerStubToolResults(messagesAny, frozenPrefixLen,
-					func(text string) int { return s.TokenCounter.CountTokens(text) },
-					WithStubMemory(s.EagerStub, stateKey),
-					WithStubCounters(&stickyHits, &freshStubs),
-				)
-				messages = anyToMessages(messagesAny)
-				if freshStubs > 0 || stickyHits > 0 {
-					meta.Logger.Info("eager stub 完成（低于阈值）",
-						"fresh_stubs", freshStubs,
-						"sticky_hits", stickyHits,
-					)
-				}
-			}
-
 			// Phase 5: Orphan repair (ORPHAN-02)
 			repaired, orphans := validateToolPairs(messages)
 			if orphans > 0 {
@@ -1219,7 +1136,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				messages = repaired
 			}
 
-			// Eager 只改 fresh tail；在它和 pair repair 之后统一处理 frozen boundary。
+			// pair repair 之后统一处理 frozen boundary。
 			s.applyCacheControl(messages, frozenPrefixLen, sessionID)
 			if newBody, err := rebuildBody(messages); err == nil {
 				r.Body = io.NopCloser(bytes.NewReader(newBody))

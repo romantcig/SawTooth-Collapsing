@@ -566,7 +566,6 @@ func TestHandleMessagesTransitionFailureForwardsRawWithoutDerivedReads(t *testin
 	server.Frozen.SetLoadFunc(func(string) (string, bool) { derivedLoadCalls++; return "", false })
 	server.Sawtooth.SetLoadFunc(func(string) (string, bool) { derivedLoadCalls++; return "", false })
 	server.DecayTracker.SetLoadFunc(func(string) (string, bool) { derivedLoadCalls++; return "", false })
-	server.EagerStub.SetLoadFunc(func(string) (string, bool) { derivedLoadCalls++; return "", false })
 
 	const sessionID = "transition-failure-pipeline"
 	base := historyTextMessages("zero", "one", "two")

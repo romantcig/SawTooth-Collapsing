@@ -487,7 +487,7 @@ func stubToolResults(blocks []ContentBlock, toolKWMap map[string]string) []Conte
 }
 
 // stubToolUses 将 tool_use block 替换为格式化的 stub 文本。
-// 按工具类型区分格式（对标 YesMem buildEagerStub），未知类型 fallback 到通用格式。
+// 按工具类型区分格式（对标 YesMem 的工具摘要格式），未知类型 fallback 到通用格式。
 func stubToolUses(blocks []ContentBlock) []ContentBlock {
 	result := make([]ContentBlock, 0, len(blocks))
 	for _, block := range blocks {

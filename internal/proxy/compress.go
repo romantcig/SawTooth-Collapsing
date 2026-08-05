@@ -243,7 +243,6 @@ func countBlockTokens(block ContentBlock, tc *TokenCounter) int {
 
 // extractBlockContent extracts a flat string representation of a
 // tool_result block's Content field, which can be a string or []interface{}.
-// (Sibling of extractToolResultText in eager.go, but for ContentBlock.Content.)
 func extractBlockContent(content interface{}) string {
 	if content == nil {
 		return ""

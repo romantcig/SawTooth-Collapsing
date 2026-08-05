@@ -331,81 +331,23 @@ func TestPressureDecisionThresholdBehavior(t *testing.T) {
 	}
 }
 
-func TestHandleMessagesPressureUsesEagerStubbedShape(t *testing.T) {
-	var forwarded []Message
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Messages []Message `json:"messages"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatalf("decode upstream request: %v", err)
-		}
-		forwarded = deepCopyMessages(body.Messages)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":1200,"output_tokens":1}}`))
-	}))
-	defer upstream.Close()
-
-	server := newPipelineTestServer(t, upstream.URL)
-	toolUse := Message{Role: "assistant", Content: json.RawMessage(mustMarshalJSON(t, []map[string]any{{
-		"type": "tool_use", "id": "tool-large-read", "name": "Read",
-		"input": map[string]any{"file_path": "large.go"},
-	}}))}
-	toolResult := Message{Role: "user", Content: json.RawMessage(mustMarshalJSON(t, []map[string]any{{
-		"type": "tool_result", "tool_use_id": "tool-large-read",
-		"content": strings.Repeat("large historical tool output ", 30_000),
-	}}))}
-	messages := []Message{
-		{Role: "user", Content: mustMarshal("inspect the large file")},
-		toolUse,
-		toolResult,
-		{Role: "assistant", Content: mustMarshal("I processed the file contents")},
-		{Role: "user", Content: mustMarshal("continue with the result")},
-	}
-	rawTokens := server.TokenCounter.CountMessagesTokens(messages)
-	if rawTokens <= server.Config.Stubify.TokenThreshold {
-		t.Fatalf("fixture raw tokens=%d, want above threshold=%d", rawTokens, server.Config.Stubify.TokenThreshold)
-	}
-
-	var decision pressureDecision
-	server.searchAndExpandFn = func(current []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, meta *requestMeta) RecallOutcome {
-		decision = meta.PressureDecision
-		return RecallOutcome{Messages: current}
-	}
-	servePipelineRequest(t, server, "eager-pressure-shape", messages)
-
-	if decision.MessagesLocalTokens >= server.Config.Stubify.TokenThreshold || decision.SelectedPressure >= server.Config.Stubify.TokenThreshold {
-		t.Fatalf("pressure 仍使用 eager 前 raw 历史: raw=%d decision=%+v", rawTokens, decision)
-	}
-	if decision.TriggerReason != TriggerNone || decision.CompressDecision {
-		t.Fatalf("eager 后有效上下文很小却触发压缩: %+v", decision)
-	}
-	if got := archiveCount(t, server.Store); got != 0 {
-		t.Fatalf("eager 足以降压时仍产生 collapse archive: %d", got)
-	}
-	if len(forwarded) != len(messages) {
-		t.Fatalf("forwarded messages=%d, want transparent count=%d", len(forwarded), len(messages))
-	}
-	blocks, _ := parseContent(forwarded[2].Content)
-	if len(blocks) != 1 {
-		t.Fatalf("forwarded tool_result blocks=%d, want 1", len(blocks))
-	}
-	stub, ok := blocks[0].Content.(string)
-	if !ok || !strings.Contains(stub, "[Read large.go") {
-		t.Fatalf("历史 tool_result 未按 eager 形状发送: %q", blocks[0].Content)
-	}
-}
-
-// TestEagerPressureTwoRoundLifecycle 是 actual_plus_delta 路径的唯一护栏。
+// TestPressureActualPlusDeltaLifecycle 是 actual_plus_delta 路径的唯一护栏。
 //
-// 生产 trace（FIX_PLAN.md 1.3）里这条路径出现 **0 次**：151 次 pressure 决策中
-// 123 次退回 local_full、28 次 conservative_plus_delta。单轮 eager 回归只证明
-// 「raw 很大 → eager 后很小 → 本轮不压缩」，证不出第一轮写下 exact baseline 后，
-// 第二轮追加 tail 会不会被旧 baseline 拉回高 pressure 而重新触发重型 collapse。
+// 它取代原先的两条测试：一条断言"主动 tool_result 摘要机制改写后的 wire 形状"，
+// 该机制已随本次改动移除，其覆盖（压力用最终 wire 形状、低于阈值不压缩、透明
+// 转发）由本测试承接；另一条是原两轮 lifecycle 护栏，其全部第二轮断言在此
+// 逐条保留。
 //
-// 两轮都必须 compress=false 且不产生 Archive；第二轮必须落在 actual_plus_delta。
-func TestEagerPressureTwoRoundLifecycle(t *testing.T) {
-	const sessionID = "eager-two-round-lifecycle"
+// 生产 trace（FIX_PLAN.md 1.3）里 actual_plus_delta 出现 **0 次**：151 次 pressure
+// 决策中 123 次退回 local_full、28 次 conservative_plus_delta。根因是主管线每轮
+// 改写已经发送过的历史正文，令 baseline 前缀指纹逐轮失配。改动后主管线不再改写
+// 任何已发送区间，纯追加会话的前缀指纹应连续匹配。
+//
+// 因此轮次从 2 轮扩到 4 轮：第一轮冷启动写下 exact baseline，第 2/3/4 轮必须
+// **全部**落在 actual_plus_delta——这是"指纹不再逐轮失配"的自动化证据。
+// 四轮都必须 compress=false 且不产生 Archive。
+func TestPressureActualPlusDeltaLifecycle(t *testing.T) {
+	const sessionID = "pressure-actual-plus-delta-lifecycle"
 	var forwarded [][]Message
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -422,19 +364,24 @@ func TestEagerPressureTwoRoundLifecycle(t *testing.T) {
 
 	server := newPipelineTestServer(t, upstream.URL)
 	toolUse := Message{Role: "assistant", Content: json.RawMessage(mustMarshalJSON(t, []map[string]any{{
-		"type": "tool_use", "id": "tool-large-read", "name": "Read",
-		"input": map[string]any{"file_path": "large.go"},
+		"type": "tool_use", "id": "tool-history-read", "name": "Read",
+		"input": map[string]any{"file_path": "history.go"},
 	}}))}
 	toolResult := Message{Role: "user", Content: json.RawMessage(mustMarshalJSON(t, []map[string]any{{
-		"type": "tool_result", "tool_use_id": "tool-large-read",
-		"content": strings.Repeat("large historical tool output ", 30_000),
+		"type": "tool_result", "tool_use_id": "tool-history-read",
+		"content": strings.Repeat("historical tool output line\n", 20),
 	}}))}
 	firstRound := []Message{
-		{Role: "user", Content: mustMarshal("inspect the large file")},
+		{Role: "user", Content: mustMarshal("inspect the history file")},
 		toolUse,
 		toolResult,
 		{Role: "assistant", Content: mustMarshal("I processed the file contents")},
 		{Role: "user", Content: mustMarshal("continue with the result")},
+	}
+	// 前提：raw 历史本身就低于阈值。没有任何环节会替测试把正文压小，fixture
+	// 必须自己保证不触发压缩，否则本测试测的是 collapse 而不是精确 delta。
+	if raw := server.TokenCounter.CountMessagesTokens(firstRound); raw >= server.Config.Stubify.TokenThreshold {
+		t.Fatalf("fixture raw tokens=%d, want well below threshold=%d", raw, server.Config.Stubify.TokenThreshold)
 	}
 
 	var decisions []pressureDecision
@@ -443,7 +390,7 @@ func TestEagerPressureTwoRoundLifecycle(t *testing.T) {
 		return RecallOutcome{Messages: current}
 	}
 
-	// ── 第一轮：eager 后很小，不压缩，成功响应写入 exact baseline ──
+	// ── 第一轮：冷启动 local_full，不压缩，成功响应写入 exact baseline ──
 	servePipelineRequest(t, server, sessionID, firstRound)
 	if len(decisions) != 1 {
 		t.Fatalf("第一轮 pressure 决策数=%d, want 1", len(decisions))
@@ -452,7 +399,11 @@ func TestEagerPressureTwoRoundLifecycle(t *testing.T) {
 		t.Fatalf("第一轮应为冷启动 local_full 且不压缩: %+v", decisions[0])
 	}
 	if got := archiveCount(t, server.Store); got != 0 {
-		t.Fatalf("第一轮 eager 足以降压却产生 collapse archive: %d", got)
+		t.Fatalf("第一轮低于阈值却产生 collapse archive: %d", got)
+	}
+	if len(forwarded) != 1 || len(forwarded[0]) != len(firstRound) {
+		t.Fatalf("第一轮未透明转发: rounds=%d count=%d want=%d",
+			len(forwarded), len(forwarded[len(forwarded)-1]), len(firstRound))
 	}
 	baseline := server.Sawtooth.PressureBaseline(sessionID)
 	if !baseline.Available || baseline.Conservative || baseline.ActualTokens != 1200 {
@@ -463,48 +414,50 @@ func TestEagerPressureTwoRoundLifecycle(t *testing.T) {
 			baseline.MessageCount, len(forwarded[0]))
 	}
 
-	// ── 第二轮：仅追加 tail，前缀逐字节不变 ──
-	secondRound := append(deepCopyMessages(firstRound),
-		Message{Role: "assistant", Content: mustMarshal("here is the follow-up analysis of that file")},
-		Message{Role: "user", Content: mustMarshal("now summarize what changed")},
-	)
-	servePipelineRequest(t, server, sessionID, secondRound)
-	if len(decisions) != 2 {
-		t.Fatalf("第二轮 pressure 决策数=%d, want 2", len(decisions))
-	}
-	second := decisions[1]
+	// ── 第 2/3/4 轮：每轮只追加两条短消息，前缀逐字节不变 ──
+	round := deepCopyMessages(firstRound)
+	for n := 2; n <= 4; n++ {
+		round = append(round,
+			Message{Role: "assistant", Content: mustMarshal(fmt.Sprintf("here is the follow-up analysis of round %d", n))},
+			Message{Role: "user", Content: mustMarshal(fmt.Sprintf("now summarize what changed in round %d", n))},
+		)
+		servePipelineRequest(t, server, sessionID, round)
+		if len(decisions) != n {
+			t.Fatalf("第 %d 轮 pressure 决策数=%d, want %d", n, len(decisions), n)
+		}
+		current := decisions[n-1]
 
-	// 核心断言：本轮走的是精确 delta，而不是退回 local_full 或高水位。
-	if second.Source != pressureSourceActualPlusDelta {
-		t.Fatalf("第二轮 pressure_source=%q, want %q（reset_reason=%q）",
-			second.Source, pressureSourceActualPlusDelta, second.ResetReason)
-	}
-	if second.ResetReason != baselineResetNone {
-		t.Fatalf("第二轮 baseline_reset_reason=%q, want %q", second.ResetReason, baselineResetNone)
-	}
-	if second.PreviousActual != 1200 {
-		t.Fatalf("第二轮 previous_actual=%d, want 1200", second.PreviousActual)
-	}
-	if second.NewMessageDelta <= 0 {
-		t.Fatalf("第二轮 new_message_delta=%d, want >0（追加的 tail 未计入）", second.NewMessageDelta)
-	}
-	if second.SelectedPressure != second.PreviousActual+second.NewMessageDelta {
-		t.Fatalf("第二轮 selected=%d != previous_actual(%d)+delta(%d)",
-			second.SelectedPressure, second.PreviousActual, second.NewMessageDelta)
-	}
-	// 旧 baseline 不得把 pressure 拉回重型压缩区间。
-	if second.CompressDecision || second.TriggerReason != TriggerNone {
-		t.Fatalf("第二轮被旧 baseline 拉回压缩: %+v", second)
-	}
-	if got := archiveCount(t, server.Store); got != 0 {
-		t.Fatalf("第二轮产生 collapse archive: %d", got)
-	}
-	if server.Frozen.LengthFor(sessionID) != 0 {
-		t.Fatalf("第二轮写入 Frozen prefix: %d", server.Frozen.LengthFor(sessionID))
-	}
-	// actual_plus_delta 的意义在于它远小于 raw 历史；否则等同于 local_full。
-	if rawTokens := server.TokenCounter.CountMessagesTokens(secondRound); second.SelectedPressure >= rawTokens {
-		t.Fatalf("第二轮 pressure=%d 未低于 raw=%d", second.SelectedPressure, rawTokens)
+		// 核心断言：本轮走的是精确 delta，而不是退回 local_full 或高水位。
+		if current.Source != pressureSourceActualPlusDelta {
+			t.Fatalf("第 %d 轮 pressure_source=%q, want %q（reset_reason=%q）",
+				n, current.Source, pressureSourceActualPlusDelta, current.ResetReason)
+		}
+		if current.ResetReason != baselineResetNone {
+			t.Fatalf("第 %d 轮 baseline_reset_reason=%q, want %q", n, current.ResetReason, baselineResetNone)
+		}
+		if current.PreviousActual != 1200 {
+			t.Fatalf("第 %d 轮 previous_actual=%d, want 1200", n, current.PreviousActual)
+		}
+		if current.NewMessageDelta <= 0 {
+			t.Fatalf("第 %d 轮 new_message_delta=%d, want >0（追加的 tail 未计入）", n, current.NewMessageDelta)
+		}
+		if current.SelectedPressure != current.PreviousActual+current.NewMessageDelta {
+			t.Fatalf("第 %d 轮 selected=%d != previous_actual(%d)+delta(%d)",
+				n, current.SelectedPressure, current.PreviousActual, current.NewMessageDelta)
+		}
+		// 旧 baseline 不得把 pressure 拉回重型压缩区间。
+		if current.CompressDecision || current.TriggerReason != TriggerNone {
+			t.Fatalf("第 %d 轮被旧 baseline 拉回压缩: %+v", n, current)
+		}
+		if got := archiveCount(t, server.Store); got != 0 {
+			t.Fatalf("第 %d 轮产生 collapse archive: %d", n, got)
+		}
+		if server.Frozen.LengthFor(sessionID) != 0 {
+			t.Fatalf("第 %d 轮写入 Frozen prefix: %d", n, server.Frozen.LengthFor(sessionID))
+		}
+		if got := forwarded[n-1]; len(got) != len(round) {
+			t.Fatalf("第 %d 轮未透明转发: forwarded=%d want=%d", n, len(got), len(round))
+		}
 	}
 }
 
@@ -1921,7 +1874,6 @@ func newPipelineTestServer(t *testing.T, upstreamURL string) *Server {
 	server.Store = store
 	server.Frozen = NewFrozenStubs()
 	server.Sawtooth = NewSawtoothTrigger(time.Minute, cfg.Stubify.TokenThreshold, cfg.Stubify.TokenThreshold/2)
-	server.EagerStub = NewEagerStubMemory()
 	return server
 }
 

@@ -58,7 +58,7 @@ func TestMessageUnknownNullRemainsDistinctFromAbsent(t *testing.T) {
 	}
 }
 
-func TestMessageUnknownFieldsSurviveDeepCopyAndAnyRoundTrip(t *testing.T) {
+func TestMessageUnknownFieldsSurviveDeepCopy(t *testing.T) {
 	raw := []byte(`[{"role":"user","content":[{"type":"text","text":"keep"}],"isMeta":true,"agent_id":null,"future":{"items":[1,2,3]}}]`)
 	var messages []Message
 	if err := json.Unmarshal(raw, &messages); err != nil {
@@ -70,9 +70,6 @@ func TestMessageUnknownFieldsSurviveDeepCopyAndAnyRoundTrip(t *testing.T) {
 		t.Fatal("deepCopyMessages returned nil")
 	}
 	assertJSONEquivalent(t, mustMarshalJSON(t, copied), raw)
-
-	roundTripped := anyToMessages(messagesToAny(messages))
-	assertJSONEquivalent(t, mustMarshalJSON(t, roundTripped), raw)
 }
 
 func TestMessageUnknownFieldsFrozenRoundTripAndHashSensitivity(t *testing.T) {

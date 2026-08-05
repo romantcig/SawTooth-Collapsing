@@ -150,7 +150,7 @@ func TestPhase08CombinedLifecycle(t *testing.T) {
 // 因此这里断言的是真正有证明力的东西：第一轮冷启动走 local_full，第二轮
 // **消费了第一轮写下的 exact baseline**（previous_actual / previous_message_count
 // 与第一轮 forwarded 坐标一致）。旧的 Archive 行数断言恰恰漏掉的就是这一段。
-// 「不重复 collapse」的正面护栏在 TestEagerPressureTwoRoundLifecycle。
+// 「不重复 collapse」的正面护栏在 TestPressureActualPlusDeltaLifecycle。
 func assertPhase08PressureTransition(t *testing.T, stageByRequest map[uint64]map[debugStage]debugFact, firstForwardedCount int) {
 	t.Helper()
 	requestIDs := make([]uint64, 0, len(stageByRequest))

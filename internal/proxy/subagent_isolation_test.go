@@ -17,7 +17,6 @@ type mainStateSnapshot struct {
 	RequestSeq   int
 	Baseline     pressureBaseline
 	DecayEntries int
-	EagerEntries int
 }
 
 func snapshotMainState(t *testing.T, server *Server, sessionID string) mainStateSnapshot {
@@ -27,20 +26,12 @@ func snapshotMainState(t *testing.T, server *Server, sessionID string) mainState
 	decayEntries := len(server.DecayTracker.stubbedAt)
 	server.DecayTracker.mu.RUnlock()
 
-	server.EagerStub.mu.RLock()
-	eagerEntries := 0
-	for _, stubbed := range server.EagerStub.stubbed {
-		eagerEntries += len(stubbed)
-	}
-	server.EagerStub.mu.RUnlock()
-
 	return mainStateSnapshot{
 		FrozenLen:    server.Frozen.LengthFor(sessionID),
 		Archives:     archiveCount(t, server.Store),
 		RequestSeq:   server.Sawtooth.GetRequestSeq(sessionID),
 		Baseline:     server.Sawtooth.PressureBaseline(sessionID),
 		DecayEntries: decayEntries,
-		EagerEntries: eagerEntries,
 	}
 }
 
@@ -51,7 +42,7 @@ func snapshotMainState(t *testing.T, server *Server, sessionID string) mainState
 // 生产 trace（FIX_PLAN.md 1.1）中，代理原有的三条 subagent 识别路径全部失效
 // （billing header 被关闭、agentContext 从不进 body、无 stream:false 旁路查询），
 // 152 个请求全部被判成 main，导致 114/152（75%）请求触发 epoch 变更、common_prefix
-// 归零，主线的 baseline / Frozen / Decay / Eager sticky 每轮被冲刷。
+// 归零，主线的 baseline / Frozen / Decay 状态每轮被冲刷。
 //
 // 本测试锁定修复后的不变量：带 X-Claude-Code-Agent-Id 的流量在进入 HistoryEpoch gate
 // 之前透明直通，主线状态不被任何 subagent 请求触碰。
