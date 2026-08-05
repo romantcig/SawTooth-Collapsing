@@ -1,0 +1,2 @@
+# .go 恒用 LF：core.autocrlf=true 会在 checkout 时把 LF 写成 CRLF，而 gofmt 把 CRLF 行尾判为未格式化
+*.go text eol=lf
