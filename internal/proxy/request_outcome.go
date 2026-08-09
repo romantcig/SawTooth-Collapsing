@@ -242,7 +242,7 @@ func (o *requestOutcomeCollector) SetDispatcher(dispatcher outcomeDispatcher) {
 		return
 	}
 	o.mu.Lock()
-	if !o.finalized {
+	if !o.finalized && !o.sealed {
 		o.dispatcher = dispatcher
 	}
 	o.mu.Unlock()
@@ -253,7 +253,7 @@ func (o *requestOutcomeCollector) setIfMutable(fn func(*requestOutcomeSnapshot))
 		return
 	}
 	o.mu.Lock()
-	if !o.finalized {
+	if !o.finalized && !o.sealed {
 		fn(&o.snapshot)
 	}
 	o.mu.Unlock()
@@ -551,7 +551,7 @@ func (o *requestOutcomeCollector) tryFinalize() {
 
 	o.finishOnce.Do(func() {
 		if dispatcher != nil {
-			// Dispatcher 合同明确要求非阻塞；这里不增加 goroutine、channel 或 timeout。
+			// Dispatcher 合同明确要求非阻塞；此处不创建额外并发执行、队列或超时器。
 			_ = dispatcher.TryDispatch(snapshot)
 		}
 	})
