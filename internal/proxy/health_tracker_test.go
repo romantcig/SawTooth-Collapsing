@@ -116,4 +116,3 @@ func TestHealthTransitionReporterFiltersOngoing(t *testing.T) {
 		t.Fatalf("reported=%+v, want entered/recovered", transitions)
 	}
 }
-

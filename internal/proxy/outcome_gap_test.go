@@ -9,12 +9,12 @@ import (
 
 func gapTestEvent(source OutcomeGapSource, requestID uint64, at time.Time, reason string) OutcomeGapEvent {
 	return OutcomeGapEvent{
-		Source:     source,
+		Source:      source,
 		SessionHash: "0123456789abcdef",
-		RequestID:  requestID,
-		From:       at,
-		To:         at,
-		Reason:     reason,
+		RequestID:   requestID,
+		From:        at,
+		To:          at,
+		Reason:      reason,
 	}
 }
 
@@ -115,8 +115,10 @@ func TestOutcomeGapMergePreservesMaxGeneration(t *testing.T) {
 	if sink.Reason != "mixed" {
 		t.Fatalf("merged sink reason=%q, want mixed", sink.Reason)
 	}
-	if result := acc.Commit(acc.Claim()); len(result.RecoverableScopes) != 0 {
-		t.Fatalf("merge must not recover, got %+v", result)
+	// Merge 本身没有 recovery 结果，也不会清空已合并的 current；恢复只能
+	// 由后续成功写入并显式 Commit 新 claim 证明。
+	if !acc.HasCurrent(OutcomeGapSourceSessionQueueFull) || !acc.HasCurrent(OutcomeGapSourceSessionLogSink) {
+		t.Fatal("merge unexpectedly cleared current aggregates")
 	}
 }
 
@@ -139,4 +141,3 @@ func TestOutcomeGapConcurrentBounded(t *testing.T) {
 		t.Fatal("unexpected saturated count")
 	}
 }
-
