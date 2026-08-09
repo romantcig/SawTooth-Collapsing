@@ -743,6 +743,19 @@ const (
 	TriggerEmergency TriggerReason = "emergency" // 原始估算超过紧急阈值
 )
 
+// TriggerEvaluation 是一次 Sawtooth 触发判定使用的不可变事实快照。
+// reason、等待时间与压力阈值均在同一次读锁内取得，后续 TTL 更新不会改写它。
+type TriggerEvaluation struct {
+	Reason             TriggerReason
+	RequiredWait       time.Duration
+	ActualWait         time.Duration
+	ActualWaitKnown    bool
+	SelectedPressure   int
+	EmergencyThreshold int
+	TokenThreshold     int
+	TokenMinimum       int
+}
+
 // persistedState 是持久化到 proxy_state 的 JSON 结构。
 type persistedState struct {
 	Tokens                    int    `json:"tokens"`
@@ -1044,37 +1057,55 @@ func (st *SawtoothTrigger) SetLoadFunc(fn LoadFunc) {
 	st.loadFn = fn
 }
 
-// ShouldTrigger 判断是否应为此 thread 执行桩化周期。
-// selectedPressure 是调用方已经在 local_full 与 actual_plus_delta 中唯一选定的压力值。
-// 历史 actual 不在此处再次参与 token 判定；它只应通过 pressureDecision 进入。
-func (st *SawtoothTrigger) ShouldTrigger(threadID string, selectedPressure int) TriggerReason {
+// Evaluate 返回本次触发判定实际使用的同锁快照。
+// selectedPressure 是调用方已经在 local_full 与 actual_plus_delta 中唯一选定的压力值；
+// 历史 actual 不在此处再次参与 token 判定，它只应通过 pressureDecision 进入。
+func (st *SawtoothTrigger) Evaluate(threadID string, selectedPressure int, now time.Time) TriggerEvaluation {
 	st.mu.RLock()
+	defer st.mu.RUnlock()
+
 	threadID = st.resolveStateKeyLocked(threadID)
 	emergencyThreshold := st.tokenThreshold + 10_000 // 比阈值多 10k 安全边距
-	tokenThreshold := st.tokenThreshold
-	tokenMinimum := st.tokenMinimum
-	pauseThreshold := st.pauseThreshold
 	lastTime, hasTime := st.lastRequestTime[threadID]
-	st.mu.RUnlock()
+	evaluation := TriggerEvaluation{
+		Reason:             TriggerNone,
+		RequiredWait:       st.pauseThreshold,
+		SelectedPressure:   selectedPressure,
+		EmergencyThreshold: emergencyThreshold,
+		TokenThreshold:     st.tokenThreshold,
+		TokenMinimum:       st.tokenMinimum,
+	}
+	if hasTime {
+		evaluation.ActualWait = now.Sub(lastTime)
+		evaluation.ActualWaitKnown = true
+	}
 
 	// 紧急制动 —— 当前选定压力明显过高。
 	if selectedPressure > emergencyThreshold {
-		return TriggerEmergency
+		evaluation.Reason = TriggerEmergency
+		return evaluation
 	}
 
 	// 正常 token 线只使用当前选定压力，不叠加或重读旧 actual。
-	if selectedPressure > tokenThreshold {
-		return TriggerTokens
+	if selectedPressure > evaluation.TokenThreshold {
+		evaluation.Reason = TriggerTokens
+		return evaluation
 	}
 
 	// 暂停检测保留既有时间语义，但最低压力也使用同一 selectedPressure。
-	if hasTime && selectedPressure > tokenMinimum {
-		if time.Since(lastTime) > pauseThreshold {
-			return TriggerPause
-		}
+	if evaluation.ActualWaitKnown &&
+		selectedPressure > evaluation.TokenMinimum &&
+		evaluation.ActualWait > evaluation.RequiredWait {
+		evaluation.Reason = TriggerPause
 	}
 
-	return TriggerNone
+	return evaluation
+}
+
+// ShouldTrigger 判断是否应为此 thread 执行桩化周期。
+// 兼容调用方只读取 reason；需要解释本次决定时应直接保存 Evaluate 返回的快照。
+func (st *SawtoothTrigger) ShouldTrigger(threadID string, selectedPressure int) TriggerReason {
+	return st.Evaluate(threadID, selectedPressure, time.Now()).Reason
 }
 
 // UpdateAfterResponse 是三参数 legacy 兼容入口。
