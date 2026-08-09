@@ -8,6 +8,169 @@ import (
 	"time"
 )
 
+func TestTriggerEvaluation(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name             string
+		selectedPressure int
+		lastRequestAgo   time.Duration
+		wantReason       TriggerReason
+		wantActualKnown  bool
+	}{
+		{
+			name:             "emergency 优先于 token 与 pause",
+			selectedPressure: 11_001,
+			lastRequestAgo:   5 * time.Minute,
+			wantReason:       TriggerEmergency,
+			wantActualKnown:  true,
+		},
+		{
+			name:             "tokens 优先于 pause",
+			selectedPressure: 1_001,
+			lastRequestAgo:   5 * time.Minute,
+			wantReason:       TriggerTokens,
+			wantActualKnown:  true,
+		},
+		{
+			name:             "pause 使用本次等待快照",
+			selectedPressure: 501,
+			lastRequestAgo:   5 * time.Minute,
+			wantReason:       TriggerPause,
+			wantActualKnown:  true,
+		},
+		{
+			name:             "minimum 相等时不触发 pause",
+			selectedPressure: 500,
+			lastRequestAgo:   5 * time.Minute,
+			wantReason:       TriggerNone,
+			wantActualKnown:  true,
+		},
+		{
+			name:             "没有历史时间时 actual wait unavailable",
+			selectedPressure: 501,
+			wantReason:       TriggerNone,
+			wantActualKnown:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trigger := NewSawtoothTrigger(CacheGapForTTL("ephemeral"), 1_000, 500)
+			if tt.lastRequestAgo > 0 {
+				trigger.mu.Lock()
+				trigger.lastRequestTime["thread"] = now.Add(-tt.lastRequestAgo)
+				trigger.mu.Unlock()
+			}
+
+			evaluation := trigger.Evaluate("thread", tt.selectedPressure, now)
+			if evaluation.Reason != tt.wantReason {
+				t.Fatalf("Evaluate reason=%q, want %q", evaluation.Reason, tt.wantReason)
+			}
+			if evaluation.RequiredWait != 4*time.Minute {
+				t.Fatalf("RequiredWait=%s, want 4m", evaluation.RequiredWait)
+			}
+			if evaluation.ActualWaitKnown != tt.wantActualKnown {
+				t.Fatalf("ActualWaitKnown=%v, want %v", evaluation.ActualWaitKnown, tt.wantActualKnown)
+			}
+			if tt.wantActualKnown {
+				if evaluation.ActualWait != tt.lastRequestAgo {
+					t.Fatalf("ActualWait=%s, want %s", evaluation.ActualWait, tt.lastRequestAgo)
+				}
+			} else if evaluation.ActualWait != 0 {
+				t.Fatalf("unknown ActualWait=%s, want zero", evaluation.ActualWait)
+			}
+			if evaluation.SelectedPressure != tt.selectedPressure {
+				t.Fatalf("SelectedPressure=%d, want %d", evaluation.SelectedPressure, tt.selectedPressure)
+			}
+			if evaluation.EmergencyThreshold != 11_000 || evaluation.TokenThreshold != 1_000 || evaluation.TokenMinimum != 500 {
+				t.Fatalf("threshold snapshot=%+v", evaluation)
+			}
+			if got := trigger.ShouldTrigger("thread", tt.selectedPressure); got != tt.wantReason {
+				t.Fatalf("ShouldTrigger=%q, want %q", got, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestTriggerEvaluationStrictPriority(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name             string
+		selectedPressure int
+		lastRequestAgo   time.Duration
+		wantReason       TriggerReason
+	}{
+		{name: "超过 emergency", selectedPressure: 11_001, lastRequestAgo: 5 * time.Minute, wantReason: TriggerEmergency},
+		{name: "等于 emergency 后落到 tokens", selectedPressure: 11_000, lastRequestAgo: 5 * time.Minute, wantReason: TriggerTokens},
+		{name: "超过 tokens", selectedPressure: 1_001, lastRequestAgo: 5 * time.Minute, wantReason: TriggerTokens},
+		{name: "等于 tokens 后落到 pause", selectedPressure: 1_000, lastRequestAgo: 5 * time.Minute, wantReason: TriggerPause},
+		{name: "等于 minimum", selectedPressure: 500, lastRequestAgo: 5 * time.Minute, wantReason: TriggerNone},
+		{name: "等于 required wait", selectedPressure: 501, lastRequestAgo: 4 * time.Minute, wantReason: TriggerNone},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trigger := NewSawtoothTrigger(4*time.Minute, 1_000, 500)
+			trigger.mu.Lock()
+			trigger.lastRequestTime["thread"] = now.Add(-tt.lastRequestAgo)
+			trigger.mu.Unlock()
+
+			if got := trigger.Evaluate("thread", tt.selectedPressure, now).Reason; got != tt.wantReason {
+				t.Fatalf("reason=%q, want %q", got, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestTriggerEvaluationCurrentAndNextTTL(t *testing.T) {
+	now := time.Now()
+	trigger := NewSawtoothTrigger(CacheGapForTTL("ephemeral"), 1_000, 500)
+	trigger.mu.Lock()
+	trigger.lastRequestTime["thread"] = now.Add(-5 * time.Minute)
+	trigger.mu.Unlock()
+
+	current := trigger.Evaluate("thread", 501, now)
+	trigger.SetPauseThreshold(CacheGapForTTL("1h"))
+	next := trigger.Evaluate("thread", 501, now)
+
+	if current.Reason != TriggerPause || current.RequiredWait != 4*time.Minute || current.ActualWait != 5*time.Minute || !current.ActualWaitKnown {
+		t.Fatalf("current evaluation=%+v", current)
+	}
+	if next.Reason != TriggerNone || next.RequiredWait != 61*time.Minute || next.ActualWait != 5*time.Minute || !next.ActualWaitKnown {
+		t.Fatalf("next evaluation=%+v", next)
+	}
+	if current.RequiredWait != 4*time.Minute {
+		t.Fatalf("TTL 更新污染已完成 evaluation: %+v", current)
+	}
+
+	trigger.mu.Lock()
+	trigger.lastRequestTime["thread"] = now.Add(-62 * time.Minute)
+	trigger.mu.Unlock()
+	oneHour := trigger.Evaluate("thread", 501, now)
+	if oneHour.Reason != TriggerPause || oneHour.RequiredWait != 61*time.Minute || oneHour.ActualWait != 62*time.Minute {
+		t.Fatalf("1h evaluation=%+v", oneHour)
+	}
+}
+
+func TestCacheGapForTTL(t *testing.T) {
+	tests := []struct {
+		cacheTTL string
+		want     time.Duration
+	}{
+		{cacheTTL: "ephemeral", want: 4 * time.Minute},
+		{cacheTTL: "1h", want: 61 * time.Minute},
+		{cacheTTL: "", want: 4 * time.Minute},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.cacheTTL, func(t *testing.T) {
+			if got := CacheGapForTTL(tt.cacheTTL); got != tt.want {
+				t.Fatalf("CacheGapForTTL(%q)=%s, want %s", tt.cacheTTL, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestApplyCacheControlConcurrentTTLUpdates(t *testing.T) {
 	s := NewServer(DefaultConfig())
 	s.Frozen = NewFrozenStubs()
