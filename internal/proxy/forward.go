@@ -276,13 +276,15 @@ func parseAnthropicMessageInputUsage(message map[string]any) (map[string]any, in
 // debugEntry debug 落盘 JSON 结构（D-04）。
 // metadata 字段 + body（原始 JSON 解析后的对象）。
 type debugEntry struct {
-	Timestamp    string          `json:"timestamp"`
-	RequestID    uint64          `json:"request_id"`
-	Stage        debugBodyStage  `json:"stage"`
-	Model        string          `json:"model"`
-	MessageCount int             `json:"message_count"`
-	Headers      json.RawMessage `json:"headers,omitempty"`
-	Body         json.RawMessage `json:"body"`
+	Timestamp         string          `json:"timestamp"`
+	RequestID         uint64          `json:"request_id"`
+	Stage             debugBodyStage  `json:"stage"`
+	Model             string          `json:"model"`
+	MessageCount      int             `json:"message_count"`
+	Headers           json.RawMessage `json:"headers,omitempty"`
+	UpstreamHeaders   json.RawMessage `json:"upstream_headers,omitempty"`
+	DownstreamHeaders json.RawMessage `json:"downstream_headers,omitempty"`
+	Body              json.RawMessage `json:"body"`
 }
 
 type debugBodyStage string
@@ -316,6 +318,26 @@ type debugFileOpener func(string, int, os.FileMode) (debugWriteCloser, error)
 // writeDebugFile 将请求/响应写入统一的 run/session/request/stage Debug 树。
 // headers 参数仅在请求方向传入（用于大小写不敏感地脱敏认证凭证）。
 func (s *Server) writeDebugFile(meta *requestMeta, timestamp time.Time, stage debugBodyStage, body []byte, headers http.Header, model string, messageCount int) error {
+	return s.writeDebugFileWithSnapshots(meta, timestamp, stage, body, headers, nil, model, messageCount)
+}
+
+func debugHeadersJSON(headers http.Header) json.RawMessage {
+	if headers == nil {
+		return nil
+	}
+	headersMap := make(map[string]string, len(headers))
+	for key, values := range headers {
+		value := strings.Join(values, ", ")
+		if isSensitiveDebugHeader(key) {
+			value = "[REDACTED]"
+		}
+		headersMap[key] = value
+	}
+	encoded, _ := json.Marshal(headersMap)
+	return encoded
+}
+
+func (s *Server) writeDebugFileWithSnapshots(meta *requestMeta, timestamp time.Time, stage debugBodyStage, body []byte, upstreamHeaders, downstreamHeaders http.Header, model string, messageCount int) error {
 	artifactStage, ok := debugBodyArtifactStage(stage)
 	if !ok {
 		return fmt.Errorf("debug body stage 无效: %q", stage)
@@ -334,28 +356,20 @@ func (s *Server) writeDebugFile(meta *requestMeta, timestamp time.Time, stage de
 		bodyJSON, _ = json.Marshal(string(body))
 	}
 
-	// 构建 headers JSON，认证与会话凭证一律脱敏（T-02-02）。
-	var headersJSON json.RawMessage
-	if headers != nil {
-		headersMap := make(map[string]string)
-		for key, values := range headers {
-			val := strings.Join(values, ", ")
-			if isSensitiveDebugHeader(key) {
-				val = "[REDACTED]"
-			}
-			headersMap[key] = val
-		}
-		headersJSON, _ = json.Marshal(headersMap)
-	}
+	// 上游/下游 header 分离保存，且两侧都复用同一脱敏边界。
+	upstreamJSON := debugHeadersJSON(upstreamHeaders)
+	downstreamJSON := debugHeadersJSON(downstreamHeaders)
 
 	entry := debugEntry{
-		Timestamp:    timestamp.Format(time.RFC3339),
-		RequestID:    meta.ID,
-		Stage:        stage,
-		Model:        model,
-		MessageCount: messageCount,
-		Headers:      headersJSON,
-		Body:         bodyJSON,
+		Timestamp:         timestamp.Format(time.RFC3339),
+		RequestID:         meta.ID,
+		Stage:             stage,
+		Model:             model,
+		MessageCount:      messageCount,
+		Headers:           upstreamJSON,
+		UpstreamHeaders:   upstreamJSON,
+		DownstreamHeaders: downstreamJSON,
+		Body:              bodyJSON,
 	}
 
 	data, err := json.Marshal(entry)
@@ -368,6 +382,10 @@ func (s *Server) writeDebugFile(meta *requestMeta, timestamp time.Time, stage de
 // writeFullBodyDebug 在显式开启 full_body 时，为每个请求阶段最多写入一份完整正文。
 // raw_inbound 与 forwarded 分开落盘，便于直接审计代理在请求管线中的具体改写。
 func (s *Server) writeFullBodyDebug(meta *requestMeta, timestamp time.Time, stage debugBodyStage, body []byte, headers http.Header, model string, messageCount int) {
+	s.writeFullBodyDebugWithSnapshots(meta, timestamp, stage, body, headers, nil, model, messageCount)
+}
+
+func (s *Server) writeFullBodyDebugWithSnapshots(meta *requestMeta, timestamp time.Time, stage debugBodyStage, body []byte, upstreamHeaders, downstreamHeaders http.Header, model string, messageCount int) {
 	if !s.Config.Debug.Enabled || !s.Config.Debug.FullBody || meta == nil {
 		return
 	}
@@ -376,7 +394,7 @@ func (s *Server) writeFullBodyDebug(meta *requestMeta, timestamp time.Time, stag
 		return
 	}
 	once.Do(func() {
-		if err := s.writeDebugFile(meta, timestamp, stage, body, headers, model, messageCount); err != nil {
+		if err := s.writeDebugFileWithSnapshots(meta, timestamp, stage, body, upstreamHeaders, downstreamHeaders, model, messageCount); err != nil {
 			slog.Warn("无法写入 debug 文件", "stage", stage, "request_id", meta.ID, "error", err)
 		}
 	})
@@ -437,9 +455,12 @@ func parseJSON(body []byte) []byte {
 	return data
 }
 
+const downstreamWriteFailureClass = "downstream_write"
+
 type upstreamResponseResult struct {
-	err       error
-	committed bool
+	err          error
+	committed    bool
+	failureClass string
 }
 
 type upstreamFailureDecision struct {
@@ -536,6 +557,16 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 		result = s.handleJSON(w, resp, meta, timestamp, model, messageCount)
 	}
 	if result.err == nil {
+		return
+	}
+	if result.failureClass == downstreamWriteFailureClass {
+		// WriteHeader 已提交后，不能再走“读取上游失败”分类或追加第二份
+		// gateway JSON；下游写入错误是独立、稳定的结果类别。
+		logger.Error("下游响应写入失败",
+			"error", safeUpstreamError(result.err),
+			"failure_class", downstreamWriteFailureClass,
+			"response_committed", result.committed,
+		)
 		return
 	}
 
@@ -753,6 +784,39 @@ func copyResponseHeaders(dst http.Header, src http.Header) {
 	}
 }
 
+var representationBoundHeaderNames = map[string]struct{}{
+	"content-length": {},
+	"etag":           {},
+	"digest":         {},
+	"content-md5":    {},
+	"content-digest": {},
+	"repr-digest":    {},
+	"content-range":  {},
+}
+
+// stripRepresentationHeaders 删除只对旧正文成立的 framing/validator 字段。
+// codingChanged=true 时额外删除旧 Content-Encoding；其它端到端 header（认证、
+// cookie、trace 等）原样保留。
+func stripRepresentationHeaders(header http.Header, codingChanged bool) {
+	for key := range header {
+		lower := strings.ToLower(strings.TrimSpace(key))
+		if _, bound := representationBoundHeaderNames[lower]; bound || (codingChanged && lower == "content-encoding") {
+			delete(header, key)
+		}
+	}
+}
+
+func cloneResponseHeader(header http.Header) http.Header {
+	if header == nil {
+		return nil
+	}
+	clone := make(http.Header, len(header))
+	for key, values := range header {
+		clone[key] = append([]string(nil), values...)
+	}
+	return clone
+}
+
 func (s *Server) handleNon2xx(w http.ResponseWriter, resp *http.Response, meta *requestMeta, timestamp time.Time, model string, messageCount int) upstreamResponseResult {
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -870,15 +934,14 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 
 	// gzip 解压（若上游返回了压缩响应）
 	var bodyReader io.Reader = resp.Body
-	compressed := false
-	if resp.Header.Get("Content-Encoding") == "gzip" {
+	manualGzip := !resp.Uncompressed && strings.EqualFold(strings.TrimSpace(resp.Header.Get("Content-Encoding")), "gzip")
+	if manualGzip {
 		gzReader, err := gzip.NewReader(resp.Body)
 		if err != nil {
 			return upstreamResponseResult{err: fmt.Errorf("SSE gzip 解压失败: %w", err)}
 		}
 		defer gzReader.Close()
 		bodyReader = gzReader
-		compressed = true
 	}
 
 	scanner := bufio.NewScanner(bodyReader)
@@ -890,18 +953,20 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 	var baselineState sseBaselineState
 	var downstreamErr error
 	committed := false
+	var downstreamHeaders http.Header
+	codingChanged := manualGzip || resp.Uncompressed
 	commit := func() {
 		if committed {
 			return
 		}
 		copyResponseHeaders(w.Header(), resp.Header)
-		if compressed {
-			w.Header().Del("Content-Encoding")
-			w.Header().Del("Content-Length")
-		}
+		// SSE processor 会重新 framing/可能重写每个 data 行，无法在首个
+		// event 前知道最终长度；保守地清理全部正文绑定字段。
+		stripRepresentationHeaders(w.Header(), codingChanged)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
+		downstreamHeaders = cloneResponseHeader(w.Header())
 		w.WriteHeader(http.StatusOK)
 		committed = true
 	}
@@ -911,7 +976,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 		}
 		baselineState.observe(event)
 		commit()
-		processed := s.processSSEEvent(event)
+		processed, _ := s.processSSEEventWithChange(event)
 		for _, line := range processed {
 			if _, err := fmt.Fprintf(w, "%s\n", line); err != nil {
 				downstreamErr = err
@@ -947,7 +1012,10 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 		flushEvent(eventBuf)
 	}
 
-	s.writeFullBodyDebug(meta, timestamp, debugBodyStageResponse, []byte(fullResponse.String()), resp.Header, model, messageCount)
+	if downstreamHeaders == nil {
+		downstreamHeaders = cloneResponseHeader(w.Header())
+	}
+	s.writeFullBodyDebugWithSnapshots(meta, timestamp, debugBodyStageResponse, []byte(fullResponse.String()), resp.Header, downstreamHeaders, model, messageCount)
 	if err := scanner.Err(); err != nil {
 		return upstreamResponseResult{err: err, committed: committed}
 	}
@@ -969,6 +1037,11 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 // message_delta 的输入侧字段在 deflate 前被剥离，只保留 output_tokens。
 // 其他事件类型原样返回。JSON 解析失败时原样转发（T-02-05 graceful degradation）。
 func (s *Server) processSSEEvent(event []string) []string {
+	processed, _ := s.processSSEEventWithChange(event)
+	return processed
+}
+
+func (s *Server) processSSEEventWithChange(event []string) ([]string, bool) {
 	factor := s.Config.Proxy.Deflation
 
 	// 找到 data: 行
@@ -983,14 +1056,14 @@ func (s *Server) processSSEEvent(event []string) []string {
 	}
 
 	if dataLine == "" {
-		return event
+		return event, false
 	}
 
 	// 解析 data JSON
 	var data map[string]any
 	if err := json.Unmarshal([]byte(dataLine), &data); err != nil {
 		// 解析失败，原样转发（T-02-05）
-		return event
+		return event, false
 	}
 
 	eventType, _ := data["type"].(string)
@@ -1019,7 +1092,7 @@ func (s *Server) processSSEEvent(event []string) []string {
 	// 重新 marshal data 行
 	newData, err := json.Marshal(data)
 	if err != nil {
-		return event
+		return event, false
 	}
 
 	// 重建事件，替换修改后的 data 行
@@ -1027,30 +1100,33 @@ func (s *Server) processSSEEvent(event []string) []string {
 	copy(result, event)
 	result[dataIdx] = "data: " + string(newData)
 
-	return result
+	changed := strings.Join(result, "\n") != strings.Join(event, "\n")
+	return result, changed
 }
 
 // handleJSON 处理 JSON 非流式响应。
 // 2xx 响应 deflate usage，非 2xx 不修改。
 func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *requestMeta, timestamp time.Time, model string, messageCount int) upstreamResponseResult {
 	logger := meta.Logger
-	// gzip 解压（若上游返回了压缩响应）
+	// 只有 Transport 没有自动解压时才手动处理 gzip。resp.Uncompressed
+	// 表示 Body 已是解压后的 representation，不能再次套 gzip.Reader。
 	var bodyReader io.Reader = resp.Body
-	compressed := false
-	if resp.Header.Get("Content-Encoding") == "gzip" {
+	manualGzip := !resp.Uncompressed && strings.EqualFold(strings.TrimSpace(resp.Header.Get("Content-Encoding")), "gzip")
+	if manualGzip {
 		gzReader, err := gzip.NewReader(resp.Body)
 		if err != nil {
 			return upstreamResponseResult{err: fmt.Errorf("JSON gzip 解压失败: %w", err)}
 		}
 		defer gzReader.Close()
 		bodyReader = gzReader
-		compressed = true
 	}
 
 	respBody, err := io.ReadAll(bodyReader)
 	if err != nil {
 		return upstreamResponseResult{err: err}
 	}
+	codingChanged := manualGzip || resp.Uncompressed
+	representationChanged := codingChanged
 
 	// 2xx: deflate usage
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -1070,19 +1146,30 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *re
 			}
 			if newBody, err := json.Marshal(body); err == nil {
 				respBody = newBody
+				representationChanged = true
 			}
 		}
 	}
 
 	copyResponseHeaders(w.Header(), resp.Header)
-	if compressed {
-		w.Header().Del("Content-Encoding")
-		w.Header().Del("Content-Length")
+	if representationChanged {
+		stripRepresentationHeaders(w.Header(), codingChanged)
 	}
+	downstreamHeaders := cloneResponseHeader(w.Header())
 	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(respBody)
+	n, writeErr := w.Write(respBody)
+	if writeErr == nil && n != len(respBody) {
+		writeErr = io.ErrShortWrite
+	}
 
 	// 步骤 5: Debug 写 JSON 响应
-	s.writeFullBodyDebug(meta, timestamp, debugBodyStageResponse, respBody, resp.Header, model, messageCount)
+	s.writeFullBodyDebugWithSnapshots(meta, timestamp, debugBodyStageResponse, respBody, resp.Header, downstreamHeaders, model, messageCount)
+	if writeErr != nil {
+		return upstreamResponseResult{
+			err:          writeErr,
+			committed:    true,
+			failureClass: downstreamWriteFailureClass,
+		}
+	}
 	return upstreamResponseResult{committed: true}
 }
