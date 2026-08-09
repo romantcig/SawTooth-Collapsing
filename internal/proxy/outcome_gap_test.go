@@ -141,3 +141,37 @@ func TestOutcomeGapConcurrentBounded(t *testing.T) {
 		t.Fatal("unexpected saturated count")
 	}
 }
+
+func TestOutcomeGapCompatibilityAliasesAndImplicitClaim(t *testing.T) {
+	acc := NewOutcomeGapAccumulator()
+	when := time.Unix(42, 123).UTC()
+	acc.Accumulate(OutcomeGapEvent{
+		Source:      OutcomeGapSourceSessionQueueFull,
+		SessionHash: "raw-session-secret",
+		RequestID:   17,
+		From:        when,
+		To:          when.Add(time.Second),
+		Reason:      "queue_full",
+	})
+	current := acc.Current(HealthScopeSessionQueueFull)
+	if current.FirstShortHash != current.First.SessionHash || current.LastShortHash != current.Last.SessionHash {
+		t.Fatalf("short hash aliases diverged: %+v", current)
+	}
+	if !current.FromTime.Equal(current.From) || !current.ToTime.Equal(current.To) {
+		t.Fatalf("time aliases diverged: %+v", current)
+	}
+	if got := acc.Generation(OutcomeGapSourceSessionQueueFull); got != current.Generation {
+		t.Fatalf("generation accessor=%d, snapshot=%d", got, current.Generation)
+	}
+	claim := acc.Claim()
+	if !acc.ClaimInFlight() {
+		t.Fatal("claim should be in flight")
+	}
+	result := acc.Commit()
+	if result.ClaimID != claim.ID || result.RecoverableCount != 1 || !result.IsRecoverable(HealthScopeSessionQueueFull) {
+		t.Fatalf("implicit commit=%+v claim=%+v", result, claim)
+	}
+	if acc.ClaimInFlight() {
+		t.Fatal("commit should consume in-flight claim")
+	}
+}

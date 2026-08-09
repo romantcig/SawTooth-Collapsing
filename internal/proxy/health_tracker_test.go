@@ -116,3 +116,17 @@ func TestHealthTransitionReporterFiltersOngoing(t *testing.T) {
 		t.Fatalf("reported=%+v, want entered/recovered", transitions)
 	}
 }
+
+func TestHealthTrackerFlexibleObservationArguments(t *testing.T) {
+	reporter := &healthTestReporter{}
+	tracker := NewHealthTracker(reporter)
+	if got := tracker.ObserveFailure(HealthScopeSessionQueueFull, uint64(7), "queue_full"); got.Kind != HealthTransitionEntered || got.Generation != 7 {
+		t.Fatalf("reordered failure args=%+v", got)
+	}
+	if got := tracker.ObserveGapCommit(HealthScopeSessionQueueFull, 7); got.Kind != HealthTransitionRecovered {
+		t.Fatalf("matching proof=%+v", got)
+	}
+	if got := tracker.ObserveFailure(HealthScopeSQLiteState, HealthFailureClassUnknown); got.Kind != HealthTransitionUnchanged {
+		t.Fatalf("explicit unknown class accepted: %+v", got)
+	}
+}

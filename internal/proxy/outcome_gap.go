@@ -61,8 +61,12 @@ type OutcomeGapSnapshot struct {
 	FirstRequestID   uint64
 	LastSessionHash  string
 	LastRequestID    uint64
+	FirstShortHash   string
+	LastShortHash    string
 	From             time.Time
 	To               time.Time
+	FromTime         time.Time
+	ToTime           time.Time
 	Reason           string
 	StableReason     string
 	SourceMask       uint8
@@ -89,6 +93,7 @@ type OutcomeGapClaim struct {
 type OutcomeGapCommitResult struct {
 	ClaimID              uint64
 	RecoverableScopes    []HealthScope
+	RecoverableCount     uint8
 	Committed            [2]OutcomeGapCommittedScope
 	CommittedGenerations [2]uint64
 }
@@ -109,6 +114,16 @@ func (r OutcomeGapCommitResult) IsRecoverable(scope HealthScope) bool {
 		}
 	}
 	return false
+}
+
+// RecoverableGeneration 返回某个 scope 在本次 commit 中可安全使用的
+// generation。它把 RecoverableScopes 与 CommittedGenerations 的并行表示
+// 收拢成一个不易误用的查询；未恢复或未知 scope 返回 false。
+func (r OutcomeGapCommitResult) RecoverableGeneration(scope HealthScope) (uint64, bool) {
+	if !r.IsRecoverable(scope) {
+		return 0, false
+	}
+	return r.CommittedGeneration(scope)
 }
 
 type outcomeGapSlot struct {
@@ -205,6 +220,18 @@ func parseOutcomeGapEvent(args ...any) (OutcomeGapEvent, bool) {
 		case *requestOutcomeSnapshot:
 			if typed != nil {
 				event.Snapshot = *typed
+				if event.SessionHash == "" {
+					event.SessionHash = typed.SessionHash
+				}
+				if event.RequestID == 0 {
+					event.RequestID = typed.RequestID
+				}
+				if event.From.IsZero() {
+					event.From = typed.StartedAt
+				}
+				if event.To.IsZero() {
+					event.To = typed.FinishedAt
+				}
 			}
 		case OutcomeGapSource:
 			event.Source = typed
@@ -269,7 +296,14 @@ func parseOutcomeGapEvent(args ...any) (OutcomeGapEvent, bool) {
 		}
 	}
 	if event.From.IsZero() {
-		event.From = event.To
+		if !event.At.IsZero() {
+			event.From = event.At
+		} else {
+			event.From = event.To
+		}
+	}
+	if event.To.IsZero() {
+		event.To = event.From
 	}
 	if event.From.IsZero() {
 		event.From = time.Now().UTC()
@@ -305,27 +339,129 @@ func snapshotFromEvent(event OutcomeGapEvent, source OutcomeGapSource, scope Hea
 	}
 	first := OutcomeGapCorrelation{SessionHash: normalizeOutcomeSessionHash(event.SessionHash), RequestID: event.RequestID}
 	last := first
-	return OutcomeGapSnapshot{
+	snapshot := OutcomeGapSnapshot{
 		Source: source, Scope: scope, Generation: generation, Count: event.Count,
 		First: first, Last: last,
 		FirstSessionHash: first.SessionHash, FirstRequestID: first.RequestID,
 		LastSessionHash: last.SessionHash, LastRequestID: last.RequestID,
-		From: event.From.UTC(), To: event.To.UTC(), Reason: reason, StableReason: reason,
+		FirstShortHash: first.SessionHash, LastShortHash: last.SessionHash,
+		From: event.From.UTC(), To: event.To.UTC(),
+		FromTime: event.From.UTC(), ToTime: event.To.UTC(),
+		Reason: reason, StableReason: reason,
 		SourceMask: uint8(1 << uint(sourceIndexForScope(scope))),
 	}
+	syncOutcomeGapSnapshotAliases(&snapshot)
+	return snapshot
 }
 
 func sourceIndexForScope(scope HealthScope) int {
 	if index, _, ok := outcomeGapSourceIndex(OutcomeGapSource(scope)); ok {
 		return index
 	}
-	return 0
+	return -1
+}
+
+// syncOutcomeGapSnapshotAliases keeps the short/legacy field spellings in
+// lockstep. Snapshots are value types, so normalizing a copy here cannot mutate
+// caller-owned data and also makes claims safe to pass across goroutines.
+func syncOutcomeGapSnapshotAliases(snapshot *OutcomeGapSnapshot) {
+	if snapshot == nil {
+		return
+	}
+	if snapshot.Source == "" && snapshot.Scope != "" {
+		snapshot.Source = OutcomeGapSource(snapshot.Scope)
+	}
+	if snapshot.Scope == "" && snapshot.Source != "" {
+		_, scope, ok := outcomeGapSourceIndex(snapshot.Source)
+		if ok {
+			snapshot.Scope = scope
+		}
+	}
+	if snapshot.First.SessionHash == "" {
+		snapshot.First.SessionHash = snapshot.FirstSessionHash
+	}
+	if snapshot.FirstSessionHash == "" {
+		snapshot.FirstSessionHash = snapshot.First.SessionHash
+	}
+	if snapshot.FirstShortHash == "" {
+		snapshot.FirstShortHash = snapshot.First.SessionHash
+	}
+	if snapshot.First.SessionHash == "" {
+		snapshot.First.SessionHash = snapshot.FirstShortHash
+	}
+	if snapshot.First.SessionHash != "" {
+		snapshot.First.SessionHash = normalizeOutcomeSessionHash(snapshot.First.SessionHash)
+		snapshot.FirstSessionHash = snapshot.First.SessionHash
+		snapshot.FirstShortHash = snapshot.First.SessionHash
+	}
+	if snapshot.FirstRequestID == 0 {
+		snapshot.FirstRequestID = snapshot.First.RequestID
+	}
+	if snapshot.First.RequestID == 0 {
+		snapshot.First.RequestID = snapshot.FirstRequestID
+	}
+	if snapshot.Last.SessionHash == "" {
+		snapshot.Last.SessionHash = snapshot.LastSessionHash
+	}
+	if snapshot.LastSessionHash == "" {
+		snapshot.LastSessionHash = snapshot.Last.SessionHash
+	}
+	if snapshot.LastShortHash == "" {
+		snapshot.LastShortHash = snapshot.Last.SessionHash
+	}
+	if snapshot.Last.SessionHash == "" {
+		snapshot.Last.SessionHash = snapshot.LastShortHash
+	}
+	if snapshot.Last.SessionHash != "" {
+		snapshot.Last.SessionHash = normalizeOutcomeSessionHash(snapshot.Last.SessionHash)
+		snapshot.LastSessionHash = snapshot.Last.SessionHash
+		snapshot.LastShortHash = snapshot.Last.SessionHash
+	}
+	if snapshot.LastRequestID == 0 {
+		snapshot.LastRequestID = snapshot.Last.RequestID
+	}
+	if snapshot.Last.RequestID == 0 {
+		snapshot.Last.RequestID = snapshot.LastRequestID
+	}
+	if snapshot.From.IsZero() {
+		snapshot.From = snapshot.FromTime
+	}
+	if snapshot.FromTime.IsZero() {
+		snapshot.FromTime = snapshot.From
+	}
+	if snapshot.To.IsZero() {
+		snapshot.To = snapshot.ToTime
+	}
+	if snapshot.ToTime.IsZero() {
+		snapshot.ToTime = snapshot.To
+	}
+	if !snapshot.From.IsZero() {
+		snapshot.From = snapshot.From.UTC()
+		snapshot.FromTime = snapshot.From
+	}
+	if !snapshot.To.IsZero() {
+		snapshot.To = snapshot.To.UTC()
+		snapshot.ToTime = snapshot.To
+	}
+	if snapshot.Reason == "" {
+		snapshot.Reason = snapshot.StableReason
+	}
+	if snapshot.StableReason == "" {
+		snapshot.StableReason = snapshot.Reason
+	}
+	if snapshot.SourceMask == 0 && snapshot.Scope != "" {
+		if index := sourceIndexForScope(snapshot.Scope); index >= 0 && index < 8 {
+			snapshot.SourceMask = uint8(1 << uint(index))
+		}
+	}
 }
 
 func mergeOutcomeGapSnapshot(dst *OutcomeGapSnapshot, src OutcomeGapSnapshot) {
 	if dst == nil || src.Count == 0 {
 		return
 	}
+	syncOutcomeGapSnapshotAliases(&src)
+	syncOutcomeGapSnapshotAliases(dst)
 	if dst.Count == 0 {
 		*dst = src
 		return
@@ -333,15 +469,19 @@ func mergeOutcomeGapSnapshot(dst *OutcomeGapSnapshot, src OutcomeGapSnapshot) {
 	dst.Count = gapSaturatingAdd(dst.Count, src.Count)
 	if src.From.Before(dst.From) || (src.From.Equal(dst.From) && src.First.RequestID < dst.First.RequestID) {
 		dst.From = src.From
+		dst.FromTime = src.From
 		dst.First = src.First
 		dst.FirstSessionHash = src.First.SessionHash
 		dst.FirstRequestID = src.First.RequestID
+		dst.FirstShortHash = src.First.SessionHash
 	}
 	if src.To.After(dst.To) || (src.To.Equal(dst.To) && src.Last.RequestID > dst.Last.RequestID) {
 		dst.To = src.To
+		dst.ToTime = src.To
 		dst.Last = src.Last
 		dst.LastSessionHash = src.Last.SessionHash
 		dst.LastRequestID = src.Last.RequestID
+		dst.LastShortHash = src.Last.SessionHash
 	}
 	if dst.Reason == "" {
 		dst.Reason = src.Reason
@@ -350,6 +490,7 @@ func mergeOutcomeGapSnapshot(dst *OutcomeGapSnapshot, src OutcomeGapSnapshot) {
 	}
 	dst.StableReason = dst.Reason
 	dst.SourceMask |= src.SourceMask
+	syncOutcomeGapSnapshotAliases(dst)
 }
 
 // Accumulate 原子累计一个缺口并返回该 source 的最新 generation。
@@ -399,9 +540,18 @@ func (a *OutcomeGapAccumulator) Snapshot(sources ...any) OutcomeGapSnapshot {
 	if source != "" {
 		index, _, ok := outcomeGapSourceIndex(source)
 		if ok && a.slots[index].hasCurrent {
-			return a.slots[index].current
+			current := a.slots[index].current
+			syncOutcomeGapSnapshotAliases(&current)
+			return current
 		}
-		return OutcomeGapSnapshot{Source: source, Scope: HealthScope(source)}
+		if !ok {
+			return OutcomeGapSnapshot{Source: source, Scope: HealthScope(source)}
+		}
+		return OutcomeGapSnapshot{
+			Source:     source,
+			Scope:      HealthScope(source),
+			Generation: a.slots[index].generation,
+		}
 	}
 	var combined OutcomeGapSnapshot
 	for index := range a.slots {
@@ -411,6 +561,7 @@ func (a *OutcomeGapAccumulator) Snapshot(sources ...any) OutcomeGapSnapshot {
 		mergeOutcomeGapSnapshot(&combined, a.slots[index].current)
 		combined.SourceMask |= a.slots[index].current.SourceMask
 	}
+	syncOutcomeGapSnapshotAliases(&combined)
 	return combined
 }
 
@@ -437,6 +588,7 @@ func (a *OutcomeGapAccumulator) Claim() OutcomeGapClaim {
 		if !slot.hasCurrent || slot.current.Count == 0 {
 			continue
 		}
+		syncOutcomeGapSnapshotAliases(&slot.current)
 		claim.Slots[index] = slot.current
 		if index == 0 {
 			claim.Queue, claim.HasQueue = slot.current, true
@@ -457,25 +609,87 @@ func (a *OutcomeGapAccumulator) Claim() OutcomeGapClaim {
 func claimFromAny(value any) (OutcomeGapClaim, bool) {
 	switch typed := value.(type) {
 	case OutcomeGapClaim:
-		return typed, true
+		return normalizeOutcomeGapClaim(typed), true
 	case *OutcomeGapClaim:
 		if typed != nil {
-			return *typed, true
+			return normalizeOutcomeGapClaim(*typed), true
+		}
+	}
+	return OutcomeGapClaim{}, false
+}
+
+func normalizeOutcomeGapClaim(claim OutcomeGapClaim) OutcomeGapClaim {
+	if claim.Queue.Count > 0 {
+		syncOutcomeGapSnapshotAliases(&claim.Queue)
+		claim.HasQueue = true
+		claim.Slots[0] = claim.Queue
+	}
+	if claim.Sink.Count > 0 {
+		syncOutcomeGapSnapshotAliases(&claim.Sink)
+		claim.HasSink = true
+		claim.Slots[1] = claim.Sink
+	}
+	for index := range claim.Slots {
+		if claim.Slots[index].Count == 0 {
+			continue
+		}
+		syncOutcomeGapSnapshotAliases(&claim.Slots[index])
+		if index == 0 && !claim.HasQueue {
+			claim.Queue, claim.HasQueue = claim.Slots[index], true
+		}
+		if index == 1 && !claim.HasSink {
+			claim.Sink, claim.HasSink = claim.Slots[index], true
+		}
+	}
+	return claim
+}
+
+func claimHasSlots(claim OutcomeGapClaim) bool {
+	return claim.HasQueue || claim.HasSink || claim.Slots[0].Count > 0 || claim.Slots[1].Count > 0
+}
+
+func claimFromValues(values []any, fallback OutcomeGapClaim) (OutcomeGapClaim, bool) {
+	if len(values) == 0 {
+		if fallback.ID == 0 {
+			return OutcomeGapClaim{}, false
+		}
+		return fallback, true
+	}
+	for _, value := range values {
+		if claim, ok := claimFromAny(value); ok {
+			return claim, true
+		}
+		// A claim ID is useful to callers that intentionally keep the claim
+		// payload private; the accumulator still validates it against the
+		// unique in-flight claim before doing any state transition.
+		switch typed := value.(type) {
+		case uint64:
+			return OutcomeGapClaim{ID: typed}, typed != 0
+		case uint:
+			return OutcomeGapClaim{ID: uint64(typed)}, typed != 0
+		case int:
+			if typed > 0 {
+				return OutcomeGapClaim{ID: uint64(typed)}, true
+			}
 		}
 	}
 	return OutcomeGapClaim{}, false
 }
 
 // Commit 只恢复 claim 后没有同 scope 新 current 的 slot；结果计算后消费 claim。
-func (a *OutcomeGapAccumulator) Commit(value any) OutcomeGapCommitResult {
-	claim, ok := claimFromAny(value)
-	if a == nil || !ok {
+func (a *OutcomeGapAccumulator) Commit(values ...any) OutcomeGapCommitResult {
+	if a == nil {
 		return OutcomeGapCommitResult{}
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if !a.inFlight || claim.ID == 0 || claim.ID != a.claimed.ID {
+	claim, ok := claimFromValues(values, a.claimed)
+	if !ok || !a.inFlight || claim.ID == 0 || claim.ID != a.claimed.ID {
 		return OutcomeGapCommitResult{}
+	}
+	claim = normalizeOutcomeGapClaim(claim)
+	if !claimHasSlots(claim) {
+		claim = a.claimed
 	}
 	result := OutcomeGapCommitResult{ClaimID: claim.ID}
 	for index := range a.slots {
@@ -494,21 +708,30 @@ func (a *OutcomeGapAccumulator) Commit(value any) OutcomeGapCommitResult {
 			result.CommittedGenerations[index] = claimed.Generation
 		}
 	}
+	if len(result.RecoverableScopes) > math.MaxUint8 {
+		result.RecoverableCount = math.MaxUint8
+	} else {
+		result.RecoverableCount = uint8(len(result.RecoverableScopes))
+	}
 	a.inFlight = false
 	a.claimed = OutcomeGapClaim{}
 	return result
 }
 
 // Merge 在写入失败时把 claim 逐 scope 合并回 current；它不递增 generation。
-func (a *OutcomeGapAccumulator) Merge(value any) {
-	claim, ok := claimFromAny(value)
-	if a == nil || !ok {
+func (a *OutcomeGapAccumulator) Merge(values ...any) {
+	if a == nil {
 		return
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if !a.inFlight || claim.ID == 0 || claim.ID != a.claimed.ID {
+	claim, ok := claimFromValues(values, a.claimed)
+	if !ok || !a.inFlight || claim.ID == 0 || claim.ID != a.claimed.ID {
 		return
+	}
+	claim = normalizeOutcomeGapClaim(claim)
+	if !claimHasSlots(claim) {
+		claim = a.claimed
 	}
 	for index := range a.slots {
 		claimed := claim.Slots[index]
@@ -517,6 +740,7 @@ func (a *OutcomeGapAccumulator) Merge(value any) {
 		}
 		slot := &a.slots[index]
 		if !slot.hasCurrent {
+			syncOutcomeGapSnapshotAliases(&claimed)
 			slot.current = claimed
 			slot.current.Generation = slot.generation
 			if slot.generation < claimed.Generation {
@@ -531,6 +755,7 @@ func (a *OutcomeGapAccumulator) Merge(value any) {
 			slot.generation = claimed.Generation
 		}
 		slot.current.Generation = slot.generation
+		syncOutcomeGapSnapshotAliases(&slot.current)
 	}
 	a.inFlight = false
 	a.claimed = OutcomeGapClaim{}
@@ -548,4 +773,48 @@ func (a *OutcomeGapAccumulator) HasCurrent(source OutcomeGapSource) bool {
 	has := a.slots[index].hasCurrent
 	a.mu.Unlock()
 	return has
+}
+
+// Current 是 Snapshot 的语义别名，保留变参形式以兼容省略 source 的聚合读取。
+func (a *OutcomeGapAccumulator) Current(sources ...any) OutcomeGapSnapshot {
+	return a.Snapshot(sources...)
+}
+
+// Generation 返回指定 source 的最新 generation；省略 source 时返回两个
+// source 中的最大值。它读取的是 monotonic counter，而不是 current 是否非空。
+func (a *OutcomeGapAccumulator) Generation(sources ...any) uint64 {
+	if a == nil {
+		return 0
+	}
+	var source OutcomeGapSource
+	if len(sources) > 0 {
+		source, _ = gapSourceFromAny(sources[0])
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if source != "" {
+		index, _, ok := outcomeGapSourceIndex(source)
+		if !ok {
+			return 0
+		}
+		return a.slots[index].generation
+	}
+	var generation uint64
+	for index := range a.slots {
+		if a.slots[index].generation > generation {
+			generation = a.slots[index].generation
+		}
+	}
+	return generation
+}
+
+// ClaimInFlight reports whether a claim is currently awaiting Commit or Merge.
+func (a *OutcomeGapAccumulator) ClaimInFlight() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	inFlight := a.inFlight
+	a.mu.Unlock()
+	return inFlight
 }

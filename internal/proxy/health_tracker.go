@@ -149,8 +149,11 @@ func normalizeHealthFailureClass(scope HealthScope, class HealthFailureClass) (H
 	if _, ok := healthScopeIndex(scope); !ok {
 		return "", false
 	}
-	if class == "" || class == HealthFailureClassUnknown {
+	if class == "" {
 		return HealthFailureClass(scope), true
+	}
+	if class == HealthFailureClassUnknown {
+		return "", false
 	}
 	canonical := HealthFailureClass(scope)
 	if class == canonical {
@@ -202,7 +205,56 @@ func (t *HealthTracker) emit(transition HealthTransition, reporter HealthTransit
 
 // ObserveFailure 记录一次真实失败。session scope 的 generation 必须来自
 // OutcomeGapAccumulator；SQLite scope 没有 generation 时由 tracker 单调分配。
-func (t *HealthTracker) ObserveFailure(scope HealthScope, class HealthFailureClass, generations ...uint64) HealthTransition {
+func parseHealthObservationArgs(scope HealthScope, args ...any) (HealthFailureClass, uint64) {
+	class := HealthFailureClass(scope)
+	var generation uint64
+	for _, arg := range args {
+		switch typed := arg.(type) {
+		case HealthFailureClass:
+			class = typed
+		case HealthScope:
+			class = HealthFailureClass(typed)
+		case OutcomeGapSource:
+			class = HealthFailureClass(typed)
+		case string:
+			class = HealthFailureClass(typed)
+		case uint64:
+			generation = typed
+		case uint:
+			generation = uint64(typed)
+		case uint32:
+			generation = uint64(typed)
+		case uint16:
+			generation = uint64(typed)
+		case uint8:
+			generation = uint64(typed)
+		case int64:
+			if typed >= 0 {
+				generation = uint64(typed)
+			}
+		case int32:
+			if typed >= 0 {
+				generation = uint64(typed)
+			}
+		case int16:
+			if typed >= 0 {
+				generation = uint64(typed)
+			}
+		case int8:
+			if typed >= 0 {
+				generation = uint64(typed)
+			}
+		case int:
+			if typed >= 0 {
+				generation = uint64(typed)
+			}
+		}
+	}
+	return class, generation
+}
+
+func (t *HealthTracker) ObserveFailure(scope HealthScope, args ...any) HealthTransition {
+	class, generation := parseHealthObservationArgs(scope, args...)
 	if t == nil {
 		return makeHealthTransition(scope, class, HealthTransitionKindUnchanged, 0, 0)
 	}
@@ -210,6 +262,7 @@ func (t *HealthTracker) ObserveFailure(scope HealthScope, class HealthFailureCla
 	if !ok {
 		return makeHealthTransition(scope, class, HealthTransitionKindUnchanged, 0, 0)
 	}
+	class, generation = parseHealthObservationArgs(canonicalScope, args...)
 	canonicalClass, ok := normalizeHealthFailureClass(canonicalScope, class)
 	if !ok {
 		return makeHealthTransition(canonicalScope, class, HealthTransitionKindUnchanged, 0, 0)
@@ -217,10 +270,6 @@ func (t *HealthTracker) ObserveFailure(scope HealthScope, class HealthFailureCla
 	t.mu.Lock()
 	index, _ := healthScopeIndex(canonicalScope)
 	state := &t.states[index]
-	generation := uint64(0)
-	if len(generations) > 0 {
-		generation = generations[0]
-	}
 	if generation == 0 {
 		generation = state.latestGeneration + 1
 	}
@@ -243,7 +292,7 @@ func (t *HealthTracker) ObserveFailure(scope HealthScope, class HealthFailureCla
 
 // ObserveSuccess 只对 SQLite scope 产生恢复；session scope 必须使用
 // ObserveGapCommit 的 generation proof，普通 enqueue/write 成功不能清除退化。
-func (t *HealthTracker) ObserveSuccess(scope HealthScope, classes ...HealthFailureClass) HealthTransition {
+func (t *HealthTracker) ObserveSuccess(scope HealthScope, args ...any) HealthTransition {
 	if t == nil {
 		return makeHealthTransition(scope, "", HealthTransitionKindUnchanged, 0, 0)
 	}
@@ -251,10 +300,7 @@ func (t *HealthTracker) ObserveSuccess(scope HealthScope, classes ...HealthFailu
 	if !ok {
 		return makeHealthTransition(scope, "", HealthTransitionKindUnchanged, 0, 0)
 	}
-	class := HealthFailureClass(canonicalScope)
-	if len(classes) > 0 {
-		class = classes[0]
-	}
+	class, _ := parseHealthObservationArgs(canonicalScope, args...)
 	canonicalClass, ok := normalizeHealthFailureClass(canonicalScope, class)
 	if !ok {
 		return makeHealthTransition(canonicalScope, class, HealthTransitionKindUnchanged, 0, 0)
@@ -297,7 +343,7 @@ func (t *HealthTracker) ObserveGapCommit(scope HealthScope, committedGeneration 
 	}
 	canonicalScope, ok := normalizeHealthScope(scope)
 	if !ok || (canonicalScope != HealthScopeSessionQueueFull && canonicalScope != HealthScopeSessionLogSink) {
-		return makeHealthTransition(canonicalScope, HealthFailureClass(canonicalScope), HealthTransitionKindUnchanged, 0, committedGeneration)
+		return makeHealthTransition(scope, HealthFailureClass(scope), HealthTransitionKindUnchanged, 0, committedGeneration)
 	}
 	t.mu.Lock()
 	index, _ := healthScopeIndex(canonicalScope)
