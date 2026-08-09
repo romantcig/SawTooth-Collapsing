@@ -3,21 +3,35 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 type outcomeDispatchFake struct {
+	mu     sync.Mutex
 	called int
 	last   requestOutcomeSnapshot
 }
 
 func (f *outcomeDispatchFake) TryDispatch(snapshot requestOutcomeSnapshot) outcomeDispatchResult {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.called++
 	f.last = snapshot
 	return outcomeDispatchResult{Accepted: true, TerminalAccepted: true, SessionAccepted: true}
+}
+
+func (f *outcomeDispatchFake) snapshot() (int, requestOutcomeSnapshot) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.called, f.last
 }
 
 func attrsJSON(t *testing.T, attrs []slog.Attr) []byte {
@@ -164,5 +178,189 @@ func TestRequestMetaInitializesOutcome(t *testing.T) {
 	}
 	if metaWithRun.Outcome.Snapshot().SessionHash != stableSessionHash(fullSessionID) {
 		t.Fatal("Outcome 未使用 stableSessionHash")
+	}
+}
+
+func TestRequestOutcomeSealAndComplete(t *testing.T) {
+	t.Run("无异步操作在 seal 时立即提交", func(t *testing.T) {
+		fake := &outcomeDispatchFake{}
+		collector := newRequestOutcomeCollector(1, "seal-now", fake)
+		collector.SetAction(outcomeActionDirect)
+		if err := collector.SealProducers(); err != nil {
+			t.Fatalf("SealProducers 失败: %v", err)
+		}
+		called, snapshot := fake.snapshot()
+		if called != 1 {
+			t.Fatalf("TryDispatch 次数=%d，want 1", called)
+		}
+		if snapshot.Action != outcomeActionDirect || snapshot.FinishedAt.IsZero() {
+			t.Fatalf("终态未复制完整: %+v", snapshot)
+		}
+		before := snapshot
+		_ = collector.SealProducers()
+		called, after := fake.snapshot()
+		if called != 1 || before != after {
+			t.Fatalf("重复 seal 改变 closure: calls=%d before=%+v after=%+v", called, before, after)
+		}
+	})
+
+	t.Run("completion 可在 seal 后完成且重复完成幂等", func(t *testing.T) {
+		fake := &outcomeDispatchFake{}
+		collector := newRequestOutcomeCollector(2, "late-completion", fake)
+		completion, err := collector.BeginAsyncResult(outcomeCompletionKindDisk)
+		if err != nil {
+			t.Fatalf("登记 completion 失败: %v", err)
+		}
+		if err := collector.SealProducers(); err != nil {
+			t.Fatal(err)
+		}
+		if called, _ := fake.snapshot(); called != 0 {
+			t.Fatalf("pending completion 未完成却 dispatch=%d", called)
+		}
+		if err := completion.Complete(outcomeCompletionResult{State: persistenceStateSaved}); err != nil {
+			t.Fatalf("completion 完成失败: %v", err)
+		}
+		if err := completion.Complete(outcomeCompletionResult{State: persistenceStateFailed}); err != nil {
+			t.Fatalf("重复 completion 不应报错: %v", err)
+		}
+		called, snapshot := fake.snapshot()
+		if called != 1 || snapshot.DiskState != persistenceStateSaved {
+			t.Fatalf("completion 未 first-wins exactly once: calls=%d snapshot=%+v", called, snapshot)
+		}
+	})
+}
+
+func TestRequestOutcomeConcurrentFinalize(t *testing.T) {
+	const completionCount = 100
+	fake := &outcomeDispatchFake{}
+	collector := newRequestOutcomeCollector(3, "concurrent-finalize", fake)
+	completions := make([]*outcomeCompletion, 0, completionCount)
+	for i := 0; i < completionCount; i++ {
+		completion, err := collector.BeginAsyncResult(outcomeCompletionKindDisk)
+		if err != nil {
+			t.Fatalf("登记 completion %d 失败: %v", i, err)
+		}
+		completions = append(completions, completion)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := collector.SealProducers(); err != nil {
+			t.Errorf("并发 seal 失败: %v", err)
+		}
+	}()
+	for i, completion := range completions {
+		i, completion := i, completion
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			collector.SetSizes(i+1, i, i*100, i*10)
+			if err := completion.Complete(outcomeCompletionResult{State: persistenceStateSaved}); err != nil && err != ErrOutcomeCompletionAlreadyFinalized {
+				t.Errorf("completion %d 失败: %v", i, err)
+			}
+			_ = completion.Complete(outcomeCompletionResult{State: persistenceStateFailed})
+		}()
+	}
+	wg.Wait()
+
+	called, snapshot := fake.snapshot()
+	if called != 1 {
+		t.Fatalf("并发 finalize dispatch 次数=%d，want 1", called)
+	}
+	if snapshot.FinishedAt.IsZero() || snapshot.DiskState != persistenceStateSaved {
+		t.Fatalf("并发终态不完整: %+v", snapshot)
+	}
+
+	// seal 后仍有 pending 时，普通 setter 不得再改变最终 immutable 事实。
+	fake2 := &outcomeDispatchFake{}
+	collector2 := newRequestOutcomeCollector(4, "sealed-immutable", fake2)
+	completion, err := collector2.BeginAsyncResult(outcomeCompletionKindDisk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := collector2.SealProducers(); err != nil {
+		t.Fatal(err)
+	}
+	before := collector2.Snapshot()
+	collector2.SetAction(outcomeActionCollapse)
+	if err := completion.Complete(outcomeCompletionResult{State: persistenceStateSaved}); err != nil {
+		t.Fatal(err)
+	}
+	_, after := fake2.snapshot()
+	if before.Action != after.Action {
+		t.Fatalf("seal 后 setter 修改了 immutable closure: before=%q after=%q", before.Action, after.Action)
+	}
+}
+
+func TestRequestOutcomeRejectsLateProducer(t *testing.T) {
+	fake := &outcomeDispatchFake{}
+	collector := newRequestOutcomeCollector(5, "late-producer", fake)
+	completion, err := collector.BeginAsyncResult(outcomeCompletionKindDisk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := collector.SealProducers(); err != nil {
+		t.Fatal(err)
+	}
+	before := collector.Snapshot()
+	late, err := collector.BeginAsyncResult(outcomeCompletionKindDisk)
+	if late != nil || !errorsIsOutcomeSealed(err) {
+		t.Fatalf("seal 后登记未返回稳定 lifecycle error: completion=%v err=%v", late, err)
+	}
+	if err := completion.Complete(outcomeCompletionResult{State: persistenceStateSaved}); err != nil {
+		t.Fatal(err)
+	}
+	called, after := fake.snapshot()
+	if called != 1 {
+		t.Fatalf("已有 completion 完成后 dispatch=%d，want 1", called)
+	}
+	if before.Action != after.Action || before.RequestID != after.RequestID || before.SessionHash != after.SessionHash {
+		t.Fatalf("late producer 改变 snapshot identity: before=%+v after=%+v", before, after)
+	}
+}
+
+func errorsIsOutcomeSealed(err error) bool {
+	return err == ErrOutcomeProducersSealed
+}
+
+func TestRequestOutcomeHasNoDirectSinkOrGoroutine(t *testing.T) {
+	data, err := os.ReadFile("request_outcome.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := parser.ParseFile(token.NewFileSet(), "request_outcome.go", data, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var forbidden string
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.GoStmt:
+			forbidden = "go statement"
+		case *ast.ChanType:
+			forbidden = "channel type"
+		case *ast.CallExpr:
+			if selector, ok := typed.Fun.(*ast.SelectorExpr); ok {
+				switch selector.Sel.Name {
+				case "NewTimer", "NewTicker", "After", "AfterFunc":
+					forbidden = selector.Sel.Name
+				}
+			}
+		case *ast.SelectorExpr:
+			switch typed.Sel.Name {
+			case "LogAttrs", "Handle":
+				forbidden = typed.Sel.Name
+			}
+		case *ast.Ident:
+			if typed.Name == "LogHandler" || typed.Name == "SessionLogHandler" || typed.Name == "CombinedLogHandler" {
+				forbidden = typed.Name
+			}
+		}
+		return true
+	})
+	if forbidden != "" {
+		t.Fatalf("collector 直接依赖了禁止资源: %s", forbidden)
 	}
 }
