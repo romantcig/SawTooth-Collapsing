@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -25,6 +26,116 @@ type decayPersisted struct {
 	FilePaths map[string]string  `json:"file_paths"`
 }
 
+// PinnedPathSnapshot 是一次请求使用的路径快照。它的底层 slice 只在构造时
+// 写入，生产管线不会把它交回 DecayTracker，因此不同请求之间不会共享可变
+// pinned state。命名 slice 仍可与 []string 互相传递，保留旧调用方的便利性。
+type PinnedPathSnapshot []string
+
+// NewPinnedPathSnapshot 对路径去重、排序并做防御性复制。
+func NewPinnedPathSnapshot(paths []string) PinnedPathSnapshot {
+	seen := make(map[string]struct{}, len(paths))
+	copyPaths := make(PinnedPathSnapshot, 0, len(paths))
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		if _, exists := seen[path]; exists {
+			continue
+		}
+		seen[path] = struct{}{}
+		copyPaths = append(copyPaths, path)
+	}
+	sort.Strings(copyPaths)
+	return copyPaths
+}
+
+func (p PinnedPathSnapshot) clone() PinnedPathSnapshot {
+	return append(PinnedPathSnapshot(nil), p...)
+}
+
+func (p PinnedPathSnapshot) contains(filePath string) bool {
+	if filePath == "" || len(p) == 0 {
+		return false
+	}
+	for _, pinned := range p {
+		if filePath == pinned || strings.HasSuffix(filePath, pinned) || strings.HasSuffix(pinned, filePath) {
+			return true
+		}
+	}
+	return false
+}
+
+// DecayEvaluationSnapshot 是 stubify 登记完成后，在同一把 tracker 读锁下
+// 复制出的请求级事实。所有 map/slice 都是副本；后续 tracker 写入不会改变
+// 本请求的阶段判定。
+type DecayEvaluationSnapshot struct {
+	StateKey    string
+	RequestIdx  int
+	ThreadLen   int
+	Pressure    float64
+	Generation  uint64
+	PinnedPaths PinnedPathSnapshot
+	StubbedAt   map[string]int
+	Intensity   map[string]float64
+	FilePaths   map[string]string
+}
+
+func (s DecayEvaluationSnapshot) clone() DecayEvaluationSnapshot {
+	clone := DecayEvaluationSnapshot{
+		StateKey:    s.StateKey,
+		RequestIdx:  s.RequestIdx,
+		ThreadLen:   s.ThreadLen,
+		Pressure:    s.Pressure,
+		Generation:  s.Generation,
+		PinnedPaths: s.PinnedPaths.clone(),
+		StubbedAt:   make(map[string]int, len(s.StubbedAt)),
+		Intensity:   make(map[string]float64, len(s.Intensity)),
+		FilePaths:   make(map[string]string, len(s.FilePaths)),
+	}
+	for key, value := range s.StubbedAt {
+		clone.StubbedAt[key] = value
+	}
+	for key, value := range s.Intensity {
+		clone.Intensity[key] = value
+	}
+	for key, value := range s.FilePaths {
+		clone.FilePaths[key] = value
+	}
+	return clone
+}
+
+func (s DecayEvaluationSnapshot) SnapshotPinned(path string) bool {
+	return s.PinnedPaths.contains(path)
+}
+
+func (s DecayEvaluationSnapshot) stateKeyForIndex(index int) string {
+	return fmt.Sprintf("%s:msg_%d", s.StateKey, index)
+}
+
+func (s DecayEvaluationSnapshot) stageAt(index int) DecayPhase {
+	key := s.stateKeyForIndex(index)
+	stubbedAt, exists := s.StubbedAt[key]
+	if !exists {
+		return DecayFresh
+	}
+	boost := int(s.Intensity[key] * 20)
+	if s.PinnedPaths.contains(s.FilePaths[key]) {
+		boost += 30
+	}
+	age := s.RequestIdx - stubbedAt
+	s0end, s1end, s2end := decayBoundaries(s.ThreadLen, s.Pressure)
+	switch {
+	case age < s0end+boost:
+		return DecayFresh
+	case age < s1end+boost:
+		return DecayMiddle
+	case age < s2end+boost:
+		return DecayOld
+	default:
+		return DecayCompacted
+	}
+}
+
 // DecayTracker 追踪每条消息的桩化时间和关联数据，实现逐消息渐进式衰减。
 // 对标 YesMem decay.go:19-32。
 type DecayTracker struct {
@@ -35,8 +146,11 @@ type DecayTracker struct {
 	intensity map[string]float64
 	// messageKey → 关联文件路径（从 tool_use.input.file_path 提取）
 	filePaths map[string]string
-	// 当前活跃路径集合——引用这些路径的消息衰减更慢
-	pinnedPaths  map[string]bool
+	// legacyPinnedPaths 仅供旧测试/旧 API 兼容；生产请求不读取它。
+	// 新管线把 pinned paths 固定在 DecayEvaluationSnapshot 中。
+	legacyPinnedPaths map[string]bool
+	// generation 只用于诊断快照的一致性证明，不参与跨请求决策。
+	generation   map[string]uint64
 	persistFn    PersistFunc
 	loadFn       LoadFunc
 	loadedFromDB map[string]bool
@@ -47,13 +161,14 @@ type DecayTracker struct {
 // NewDecayTracker 创建新的衰减追踪器。
 func NewDecayTracker() *DecayTracker {
 	return &DecayTracker{
-		stubbedAt:    make(map[string]int),
-		intensity:    make(map[string]float64),
-		filePaths:    make(map[string]string),
-		pinnedPaths:  make(map[string]bool),
-		loadedFromDB: make(map[string]bool),
-		stateFoundDB: make(map[string]bool),
-		currentAlias: make(map[string]string),
+		stubbedAt:         make(map[string]int),
+		intensity:         make(map[string]float64),
+		filePaths:         make(map[string]string),
+		legacyPinnedPaths: make(map[string]bool),
+		generation:        make(map[string]uint64),
+		loadedFromDB:      make(map[string]bool),
+		stateFoundDB:      make(map[string]bool),
+		currentAlias:      make(map[string]string),
 	}
 }
 
@@ -166,6 +281,7 @@ func (d *DecayTracker) MarkStubbed(sessionID string, msgIndex, requestIdx int, e
 	if _, exists := d.stubbedAt[key]; !exists {
 		d.stubbedAt[key] = requestIdx
 		d.intensity[key] = emotionalIntensity
+		d.generation[sessionID]++
 	}
 }
 
@@ -180,6 +296,7 @@ func (d *DecayTracker) SetFilePath(sessionID string, msgIndex int, path string) 
 	sessionID = d.resolveStateKeyLocked(sessionID)
 	key := fmt.Sprintf("%s:msg_%d", sessionID, msgIndex)
 	d.filePaths[key] = path
+	d.generation[sessionID]++
 }
 
 // SetPinnedPaths 更新"活跃路径"集合——引用这些路径的消息衰减更慢。
@@ -187,27 +304,79 @@ func (d *DecayTracker) SetFilePath(sessionID string, msgIndex int, path string) 
 func (d *DecayTracker) SetPinnedPaths(paths []string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.pinnedPaths = make(map[string]bool, len(paths))
-	for _, p := range paths {
-		d.pinnedPaths[p] = true
+	d.legacyPinnedPaths = make(map[string]bool, len(paths))
+	for _, p := range NewPinnedPathSnapshot(paths) {
+		d.legacyPinnedPaths[p] = true
 	}
 }
 
 // isPinnedPath 检查文件路径是否匹配任意活跃路径。
 // 双向后缀匹配：短路径可匹配长路径的尾部和反向。
 func (d *DecayTracker) isPinnedPath(filePath string) bool {
-	if filePath == "" || len(d.pinnedPaths) == 0 {
+	if filePath == "" || len(d.legacyPinnedPaths) == 0 {
 		return false
 	}
-	if d.pinnedPaths[filePath] {
+	if d.legacyPinnedPaths[filePath] {
 		return true
 	}
-	for pp := range d.pinnedPaths {
+	for pp := range d.legacyPinnedPaths {
 		if strings.HasSuffix(filePath, pp) || strings.HasSuffix(pp, filePath) {
 			return true
 		}
 	}
 	return false
+}
+
+// BuildDecayEvaluationSnapshot 在一次读锁内复制指定 stateKey 的全部衰减
+// 事实和 request-local pinned paths。调用方可在返回后并发更新 tracker，已
+// 返回的 snapshot/plan 仍保持不变。
+func (d *DecayTracker) BuildDecayEvaluationSnapshot(stateKey string, pinned PinnedPathSnapshot, requestIdx, threadLen int, pressure float64) DecayEvaluationSnapshot {
+	snapshot := DecayEvaluationSnapshot{
+		StateKey:    stateKey,
+		RequestIdx:  requestIdx,
+		ThreadLen:   threadLen,
+		Pressure:    pressure,
+		PinnedPaths: NewPinnedPathSnapshot(pinned),
+		StubbedAt:   make(map[string]int),
+		Intensity:   make(map[string]float64),
+		FilePaths:   make(map[string]string),
+	}
+	if d == nil {
+		return snapshot
+	}
+	d.mu.RLock()
+	resolved := d.resolveStateKeyLocked(stateKey)
+	snapshot.StateKey = resolved
+	snapshot.Generation = d.generation[resolved]
+	prefix := resolved + ":msg_"
+	for key, value := range d.stubbedAt {
+		if strings.HasPrefix(key, prefix) {
+			snapshot.StubbedAt[key] = value
+		}
+	}
+	for key, value := range d.intensity {
+		if strings.HasPrefix(key, prefix) {
+			snapshot.Intensity[key] = value
+		}
+	}
+	for key, value := range d.filePaths {
+		if strings.HasPrefix(key, prefix) {
+			snapshot.FilePaths[key] = value
+		}
+	}
+	d.mu.RUnlock()
+	return snapshot
+}
+
+// Snapshot 是较短的兼容别名，供后续计划消费稳定接口。
+func (d *DecayTracker) Snapshot(stateKey string, pinned PinnedPathSnapshot, requestIdx, threadLen int, pressure float64) DecayEvaluationSnapshot {
+	return d.BuildDecayEvaluationSnapshot(stateKey, pinned, requestIdx, threadLen, pressure)
+}
+
+// BuildCompactionPlan 是 tracker 侧的便捷入口，返回的 plan 与 tracker
+// 生命周期解耦；后续阶段只应消费返回值。
+func (d *DecayTracker) BuildCompactionPlan(stateKey string, pinned PinnedPathSnapshot, messages, original []Message, requestIdx, totalTokens, threshold, keepRecent int, compactEnabled bool) *CompactionPlan {
+	return BuildCompactionPlanFromTracker(d, stateKey, pinned, messages, original, requestIdx, totalTokens, threshold, keepRecent, compactEnabled)
 }
 
 // decayBoundaries 根据线程长度和 token 压力计算自适应阶段边界。
@@ -572,11 +741,18 @@ func firstNWords(s string, n int) string {
 // ---- ApplyDecayBatch（批量逐消息衰减，供 proxy.go 使用） ----
 
 // ApplyDecayBatch 对消息执行逐消息阶段感知衰减处理。
-// 先估算 intensity、提取 pinnedPaths、计算压力，然后对每条消息按
-// DecayTracker 记录的历史阶段应用衰减。
-// 返回处理后的消息和基于压力的整体阶段（供下游 collapse 决策使用）。
-func (d *DecayTracker) ApplyDecayBatch(messages []Message, sessionID string, totalTokens int, threshold int, tc *TokenCounter, pivotText string, requestIdx int) ([]Message, DecayPhase) {
-	pressure := float64(totalTokens) / float64(threshold)
+// 可选 plan 参数是生产管线的唯一阶段/覆盖来源；未被 plan 覆盖的 Stage-3
+// 消息统一退回 Stage-2，绝不先清空再等待另一次 tracker 扫描。
+// 不带 plan 的调用保留旧 API 兼容，但同样采用安全的 Stage-2 fallback。
+func (d *DecayTracker) ApplyDecayBatch(messages []Message, sessionID string, totalTokens int, threshold int, tc *TokenCounter, pivotText string, requestIdx int, plans ...*CompactionPlan) ([]Message, DecayPhase) {
+	pressure := 0.0
+	if threshold > 0 {
+		pressure = float64(totalTokens) / float64(threshold)
+	}
+	var plan *CompactionPlan
+	if len(plans) > 0 {
+		plan = plans[0]
+	}
 
 	// 计算整体阶段（基于压力，供 collapse 决策）
 	var overallPhase DecayPhase
@@ -600,7 +776,27 @@ func (d *DecayTracker) ApplyDecayBatch(messages []Message, sessionID string, tot
 			result = append(result, msg)
 			continue
 		}
-		stage := d.GetStage(sessionID, i, requestIdx, threadLen, pressure)
+		stage := DecayFresh
+		fallbackStage2 := false
+		if plan != nil {
+			stage = plan.StageAt(i)
+		} else if d != nil {
+			stage = d.GetStage(sessionID, i, requestIdx, threadLen, pressure)
+		}
+		// Snapshot/plan 是 immutable 的；若旧调用没有 plan，也不能产生无
+		// replacement 的空正文，因此 Stage-3 默认先降级到 Stage-2。
+		stage3Covered := plan != nil && plan.IsCovered(i)
+		if stage == DecayCompacted && !stage3Covered {
+			stage = DecayOld
+			fallbackStage2 = true
+		}
+		if plan != nil && fallbackStage2 {
+			if fallback, ok := plan.Stage2Message(i); ok {
+				msg.Content = append(json.RawMessage(nil), fallback.Content...)
+				result = append(result, msg)
+				continue
+			}
+		}
 		blocks, isArray := parseContent(msg.Content)
 		changed := false
 
@@ -647,7 +843,15 @@ func (d *DecayTracker) ApplyDecayBatch(messages []Message, sessionID string, tot
 	}
 
 	// 持久化衰减状态（graceful: 失败不影响请求）
-	d.Persist(sessionID)
+	if d != nil {
+		d.Persist(sessionID)
+	}
 
 	return result, overallPhase
+}
+
+// ApplyDecayBatchWithPlan 是显式 plan-aware 入口，便于后续计划避免使用
+// variadic 兼容签名。
+func (d *DecayTracker) ApplyDecayBatchWithPlan(messages []Message, sessionID string, totalTokens, threshold int, tc *TokenCounter, pivotText string, requestIdx int, plan *CompactionPlan) ([]Message, DecayPhase) {
+	return d.ApplyDecayBatch(messages, sessionID, totalTokens, threshold, tc, pivotText, requestIdx, plan)
 }

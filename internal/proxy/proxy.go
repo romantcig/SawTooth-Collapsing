@@ -1048,16 +1048,23 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			// ── FALLBACK PATH: stubify+decay（cutoffIdx <= 0，对标 YesMem StubifyWithTotal） ──
 			// 以下代码与当前 stubify+decay+compact 流程完全一致，不变。
 
-			// 步骤 1: stubify（保护 messages[0] 和最近 4 条消息）
+			// 步骤 1: stubify（保护 messages[0] 和最近 keepRecent 条消息）
 			intensity := estimateIntensity(messages)
 			stubbedMessages, stats := stubifyMessages(messages, s.TokenCounter, pivotText, s.Config.Stubify.KeepRecent, s.Config.Stubify.KeepThinking, s.DecayTracker, stateKey, requestSeq, intensity, threshold)
 
-			// Phase B: 提取 pinnedPaths
-			pinnedPaths := extractPinnedPaths(messages)
-			s.DecayTracker.SetPinnedPaths(pinnedPaths)
+			// 步骤 2: 在 stubify 的登记完成后复制 request-local pinned/state
+			// snapshot，并一次性预检唯一 CompactionPlan。生产链不再调用
+			// DecayTracker.SetPinnedPaths，也不把 tracker 交给物化器。
+			pinnedPaths := NewPinnedPathSnapshot(extractPinnedPaths(originalMessages))
+			pressure := 0.0
+			if threshold > 0 {
+				pressure = float64(totalTokens) / float64(threshold)
+			}
+			snapshot := s.DecayTracker.BuildDecayEvaluationSnapshot(stateKey, pinnedPaths, requestSeq, len(stubbedMessages), pressure)
+			plan := BuildCompactionPlan(snapshot, stubbedMessages, originalMessages, s.Config.Stubify.KeepRecent, s.Config.Collapse.CompactEnabled)
 
-			// 步骤 2: decay
-			decayedMessages, phase := s.DecayTracker.ApplyDecayBatch(stubbedMessages, stateKey, totalTokens, threshold, s.TokenCounter, pivotText, requestSeq)
+			// 步骤 3: decay 只消费同一份 plan；plan 外 Stage-3 自动退回 Stage-2。
+			decayedMessages, phase := s.DecayTracker.ApplyDecayBatch(stubbedMessages, stateKey, totalTokens, threshold, s.TokenCounter, pivotText, requestSeq, plan)
 
 			meta.Logger.Info("stubify+decay 完成",
 				"original_tokens", stats.OriginalTokens,
@@ -1070,20 +1077,16 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				LogGreen,
 			)
 
-			// Phase C: CompactMessages
-			if s.Config.Collapse.CompactEnabled && s.DecayTracker != nil {
-				pressure := float64(totalTokens) / float64(threshold)
-				beforeCompact := len(decayedMessages)
-				var compactedBlocks []CompactedBlock
-				decayedMessages, compactedBlocks = CompactMessages(decayedMessages, originalMessages, s.DecayTracker, stateKey, requestSeq, pressure)
-				if len(compactedBlocks) > 0 {
-					meta.Logger.Info("compact 完成",
-						"before", beforeCompact,
-						"after", len(decayedMessages),
-						"blocks", len(compactedBlocks),
-						LogGreen,
-					)
-				}
+			// 步骤 4: 只物化预检 replacement；失败时恢复 plan 保存的 Stage-2。
+			beforeCompact := len(decayedMessages)
+			decayedMessages, compactedBlocks := CompactMessagesWithPlan(decayedMessages, originalMessages, plan)
+			if len(compactedBlocks) > 0 {
+				meta.Logger.Info("compact 完成",
+					"before", beforeCompact,
+					"after", len(decayedMessages),
+					"blocks", len(compactedBlocks),
+					LogGreen,
+				)
 			}
 
 			messages = decayedMessages
@@ -1292,16 +1295,19 @@ func extractLatestUserText(messages []Message) string {
 	return "" // no user messages found
 }
 
-// extractPinnedPaths 从消息数组的 tool_use 块中提取文件路径集合。
-// Phase B: 供 DecayTracker.SetPinnedPaths 使用（无 daemon 替代方案）。
+// extractPinnedPaths 从 detached 原始消息的 tool_use 块中提取文件路径集合。
+// 返回值随后会立即复制为 request-local PinnedPathSnapshot；不写入 Server 或
+// DecayTracker 的共享 mutable state。
 func extractPinnedPaths(messages []Message) []string {
 	seen := make(map[string]bool)
 	for _, msg := range messages {
 		blocks, _ := parseContent(msg.Content)
 		for _, block := range blocks {
 			if block.Type == "tool_use" && block.Input != nil {
-				if fp, ok := block.Input["file_path"].(string); ok && fp != "" && !seen[fp] {
-					seen[fp] = true
+				for _, key := range []string{"file_path", "path", "filePath"} {
+					if fp, ok := block.Input[key].(string); ok && fp != "" && !seen[fp] {
+						seen[fp] = true
+					}
 				}
 			}
 		}

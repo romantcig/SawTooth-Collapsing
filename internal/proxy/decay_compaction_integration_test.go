@@ -3,7 +3,6 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
-	"sync"
 	"testing"
 )
 
@@ -21,7 +20,7 @@ func TestCompactionPlanRunLengths(t *testing.T) {
 	}{
 		{name: "one", runLength: 1, wantReplaces: 0, wantBlocks: 0, wantStage2Run: true},
 		{name: "forty-nine", runLength: 49, wantReplaces: 0, wantBlocks: 0, wantStage2Run: true},
-		{name: "fifty", runLength: 50, wantReplaces: 1, wantBlocks: 1, wantStage2Run: false},
+		{name: "fifty", runLength: 50, wantReplaces: 2, wantBlocks: 2, wantStage2Run: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			messages := planFixtureMessages(tc.runLength + 2)
@@ -54,10 +53,13 @@ func TestCompactionPlanProtectedUnion(t *testing.T) {
 	messages := planFixtureMessages(70)
 	tracker := NewDecayTracker()
 	for i := 1; i < len(messages); i++ {
-		tracker.MarkStubbed("protected", i, 1, 0)
+		intensity := 0.0
+		if i == 20 {
+			intensity = 0.95
+		}
+		tracker.MarkStubbed("protected", i, 1, intensity)
 	}
 	tracker.SetFilePath("protected", 10, "src/pinned.go")
-	tracker.MarkStubbed("protected", 20, 1, 0.95)
 	pinned := NewPinnedPathSnapshot([]string{"pinned.go"})
 	snapshot := tracker.BuildDecayEvaluationSnapshot("protected", pinned, 200, len(messages), 3)
 	plan := BuildCompactionPlan(snapshot, messages, messages, 8, true)
@@ -121,7 +123,9 @@ func TestCompactionPlanPinnedSnapshotConcurrent(t *testing.T) {
 	tracker := NewDecayTracker()
 	tracker.MarkStubbed("same", 1, 1, 0)
 	tracker.SetFilePath("same", 1, "old.go")
-	pinned := NewPinnedPathSnapshot([]string{"old.go"})
+	paths := []string{"old.go"}
+	pinned := NewPinnedPathSnapshot(paths)
+	paths[0] = "mutated-after-snapshot.go"
 	snapshot := tracker.BuildDecayEvaluationSnapshot("same", pinned, 200, 2, 3)
 	start := make(chan struct{})
 	done := make(chan struct{})
@@ -166,10 +170,8 @@ func planFixtureMessages(n int) []Message {
 		if i%2 == 0 {
 			role = "user"
 		}
-		content, _ := json.Marshal("stage-two payload "+string(rune('a'+i%26))+" "+string(bytes.Repeat([]byte("x"), 120)))
+		content, _ := json.Marshal("stage-two payload " + string(rune('a'+i%26)) + " " + string(bytes.Repeat([]byte("x"), 120)))
 		messages[i] = Message{Role: role, Content: content}
 	}
 	return messages
 }
-
-var _ = sync.Once{}
