@@ -361,9 +361,8 @@ func sourceIndexForScope(scope HealthScope) int {
 	return -1
 }
 
-// syncOutcomeGapSnapshotAliases keeps the short/legacy field spellings in
-// lockstep. Snapshots are value types, so normalizing a copy here cannot mutate
-// caller-owned data and also makes claims safe to pass across goroutines.
+// syncOutcomeGapSnapshotAliases 保持 short/legacy 字段拼写同步。Snapshot
+// 是值类型，在副本上归一化不会修改调用方数据，也使 claim 可安全跨 goroutine 传递。
 func syncOutcomeGapSnapshotAliases(snapshot *OutcomeGapSnapshot) {
 	if snapshot == nil {
 		return
@@ -659,9 +658,8 @@ func claimFromValues(values []any, fallback OutcomeGapClaim) (OutcomeGapClaim, b
 		if claim, ok := claimFromAny(value); ok {
 			return claim, true
 		}
-		// A claim ID is useful to callers that intentionally keep the claim
-		// payload private; the accumulator still validates it against the
-		// unique in-flight claim before doing any state transition.
+		// 允许调用方只携带 claim ID 隐藏 payload；真正执行状态转换前仍会
+		// 对照唯一的 in-flight claim 做严格校验。
 		switch typed := value.(type) {
 		case uint64:
 			return OutcomeGapClaim{ID: typed}, typed != 0
@@ -808,7 +806,7 @@ func (a *OutcomeGapAccumulator) Generation(sources ...any) uint64 {
 	return generation
 }
 
-// ClaimInFlight reports whether a claim is currently awaiting Commit or Merge.
+// ClaimInFlight 报告当前是否有等待 Commit 或 Merge 的 claim。
 func (a *OutcomeGapAccumulator) ClaimInFlight() bool {
 	if a == nil {
 		return false
