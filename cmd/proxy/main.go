@@ -103,26 +103,14 @@ func main() {
 	if cfg.Frozen.Enabled {
 		srv.Frozen = frozenStore
 	}
-	slog.Info("FrozenStubs 已初始化",
-		"ttl_minutes", cfg.Frozen.TTLMinutes,
-		"enabled", cfg.Frozen.Enabled,
-	)
 
-	sawtoothTrigger := proxy.NewSawtoothTrigger(
-		proxy.CacheGapForTTL(cfg.Cache.CacheTTL), // Phase 8 D7: 从 cache_ttl 推导（替代硬编码 330s）
-		cfg.Stubify.TokenThreshold,               // tokenThreshold (D-03: 复用 stubify)
-		cfg.Stubify.TokenThreshold/2,             // tokenMinimum (D-03: threshold/2)
-	)
+	sawtoothTrigger := newSawtoothTrigger(cfg)
 	sawtoothTrigger.SetPersistFunc(func(key, value string) {
 		_ = store.PersistState(key, value) // best-effort，忽略错误
 	})
 	sawtoothTrigger.SetLoadFunc(store.LoadState)
 	srv.Sawtooth = sawtoothTrigger
-	slog.Info("SawtoothTrigger 已初始化",
-		"token_threshold", cfg.Stubify.TokenThreshold,
-		"token_minimum", cfg.Stubify.TokenThreshold/2,
-		"pause_threshold", "330s",
-	)
+	logSawtoothStartup(cfg.Frozen.Enabled)
 
 	// Phase 4: FrozenStubs 定时 eviction goroutine（每 5 分钟，D-12）
 	// evictCtx/evictCancel 在 if 外部声明——信号处理器需要 evictCancel。
@@ -188,6 +176,19 @@ func main() {
 		}
 		os.Exit(1)
 	}
+}
+
+func newSawtoothTrigger(cfg proxy.Config) *proxy.SawtoothTrigger {
+	return proxy.NewSawtoothTrigger(
+		proxy.CacheGapForTTL(cfg.Cache.CacheTTL), // 运行时等待只在 trigger 判定中生效
+		cfg.Stubify.TokenThreshold,
+		cfg.Stubify.TokenThreshold/2,
+	)
+}
+
+func logSawtoothStartup(frozenEnabled bool) {
+	slog.Info("FrozenStubs 已初始化", "enabled", frozenEnabled)
+	slog.Info("SawtoothTrigger 已初始化")
 }
 
 func logFullBodyDebugNotice(cfg proxy.Config) {
