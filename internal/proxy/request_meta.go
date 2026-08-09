@@ -38,6 +38,9 @@ type requestMeta struct {
 	responseBodyOnce        sync.Once
 	SessionHash             string
 	RunID                   string
+	// Outcome 是本请求唯一 authoritative outcome collector；完整 session ID
+	// 仍只留在 Logger 路由属性中，不进入 collector snapshot。
+	Outcome *requestOutcomeCollector
 }
 
 // tracksSawtoothState 使用默认安全策略：nil、零值、main 与 unknown 都保持状态跟踪，
@@ -78,7 +81,7 @@ func newRequestMeta(id uint64, requestSessionID string) *requestMeta {
 
 func newRequestMetaWithRun(id uint64, requestSessionID, runID string) *requestMeta {
 	baseLogger := slog.New(slog.Default().Handler()).With("request_id", id)
-	return &requestMeta{
+	meta := &requestMeta{
 		ID:                   id,
 		RequestSessionID:     requestSessionID,
 		SessionHash:          stableSessionHash(requestSessionID),
@@ -86,6 +89,8 @@ func newRequestMetaWithRun(id uint64, requestSessionID, runID string) *requestMe
 		Logger:               baseLogger.With("request_session_id", requestSessionID),
 		auxiliaryAuditLogger: baseLogger,
 	}
+	meta.Outcome = newRequestOutcomeCollector(id, meta.SessionHash)
+	return meta
 }
 
 // auxiliaryLogger 返回辅助分类专用审计 logger，只允许继承 request_id。
