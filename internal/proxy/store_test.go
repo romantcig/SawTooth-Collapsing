@@ -3,13 +3,240 @@ package proxy
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
+
+// ── 统一 error-aware StateLoader 的 missing/error 真值边界 ──
+
+// assertStateLoadFailure 收敛四类失败断言：结果必须是失败而非 missing，
+// 错误链可用 errors.Is 分类，且对外事实里没有 key 或数据库路径。
+func assertStateLoadFailure(t *testing.T, result StateLoadResult, key, dbPath string, wantSentinel error, wantClass StateLoadFailureClass) {
+	t.Helper()
+	if result.Found {
+		t.Fatalf("读取失败被当成命中: %+v", result)
+	}
+	if result.Value != "" {
+		t.Fatalf("失败结果携带了 value: %q", result.Value)
+	}
+	if result.Err == nil {
+		t.Fatal("读取失败被伪装成 Err=nil 的不存在")
+	}
+	if !errors.Is(result.Err, wantSentinel) {
+		t.Fatalf("错误链无法识别 %v: %v", wantSentinel, result.Err)
+	}
+	if result.FailureClass != wantClass {
+		t.Fatalf("failure class=%q, want %q", result.FailureClass, wantClass)
+	}
+	if strings.Contains(string(result.FailureClass), key) || strings.Contains(string(result.FailureClass), dbPath) {
+		t.Fatalf("failure class 泄漏 key/path: %q", result.FailureClass)
+	}
+	if strings.Contains(result.Err.Error(), key) || strings.Contains(result.Err.Error(), dbPath) {
+		t.Fatalf("错误消息泄漏 key/path: %v", result.Err)
+	}
+}
+
+func TestSQLiteStoreLoadStateResultExisting(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "load-existing.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var loader StateLoader = store
+	if err := store.PersistState("frozen:thread", `{"epoch":1}`); err != nil {
+		t.Fatal(err)
+	}
+	result := loader.LoadStateResult("frozen:thread")
+	if !result.Found || result.Err != nil || result.Value != `{"epoch":1}` {
+		t.Fatalf("命中结果=%+v", result)
+	}
+	if result.FailureClass != StateLoadFailureNone {
+		t.Fatalf("命中 failure class=%q, want none", result.FailureClass)
+	}
+}
+
+func TestSQLiteStoreLoadStateResultMissing(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "load-missing.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	result := store.LoadStateResult("frozen:absent")
+	if result.Found {
+		t.Fatalf("不存在的 key 被当成命中: %+v", result)
+	}
+	// 只有 sql.ErrNoRows 允许出现 Found=false 且 Err=nil。
+	if result.Err != nil {
+		t.Fatalf("ErrNoRows 不应带错误: %v", result.Err)
+	}
+	if result.FailureClass != StateLoadFailureNone {
+		t.Fatalf("missing failure class=%q, want none", result.FailureClass)
+	}
+	if value, ok := store.LoadState("frozen:absent"); ok || value != "" {
+		t.Fatalf("兼容 wrapper missing=%q/%v", value, ok)
+	}
+}
+
+func TestSQLiteStoreLoadStateResultClosed(t *testing.T) {
+	dbPath := filepath.Join(tempDirRetryCleanup(t), "load-closed.db")
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistState("frozen:closed", "value"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	result := store.LoadStateResult("frozen:closed")
+	assertStateLoadFailure(t, result, "frozen:closed", dbPath, ErrStateLoadClosed, StateLoadFailureSQLiteClosed)
+	// 兼容 wrapper 只能降级为 false，不能把 closed 说成不存在给生产使用。
+	if value, ok := store.LoadState("frozen:closed"); ok || value != "" {
+		t.Fatalf("兼容 wrapper closed=%q/%v", value, ok)
+	}
+}
+
+func TestSQLiteStoreLoadStateResultBusy(t *testing.T) {
+	dbPath := filepath.Join(tempDirRetryCleanup(t), "load-busy.db")
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistState("frozen:busy", "value"); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+
+	// 释放 store 的空闲连接，让另一个连接可以取得 EXCLUSIVE 文件锁。
+	store.db.SetMaxIdleConns(0)
+	deadline := time.Now().Add(5 * time.Second)
+	for store.db.Stats().OpenConnections > 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := store.db.Stats().OpenConnections; got != 0 {
+		_ = store.Close()
+		t.Fatalf("空闲连接未释放: OpenConnections=%d", got)
+	}
+
+	locker, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	locker.SetMaxOpenConns(1)
+	if _, err := locker.Exec("PRAGMA locking_mode=EXCLUSIVE"); err != nil {
+		locker.Close()
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if _, err := locker.Exec(`INSERT OR REPLACE INTO frozen_state (key, value) VALUES ('lock-holder', 'held')`); err != nil {
+		locker.Close()
+		_ = store.Close()
+		t.Fatalf("独占写入失败，无法构造 busy 场景: %v", err)
+	}
+
+	result := store.LoadStateResult("frozen:busy")
+	locker.Close()
+	_ = store.Close()
+	assertStateLoadFailure(t, result, "frozen:busy", dbPath, ErrStateLoadBusy, StateLoadFailureSQLiteBusy)
+}
+
+func TestSQLiteStoreLoadStateResultQueryError(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "load-query-error.db")
+	store, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.PersistState("frozen:query", "value"); err != nil {
+		t.Fatal(err)
+	}
+	// 真实 SQLite 查询失败：目标表消失，而不是注入假 error。
+	if _, err := store.db.Exec(`ALTER TABLE frozen_state RENAME TO frozen_state_moved`); err != nil {
+		t.Fatal(err)
+	}
+
+	result := store.LoadStateResult("frozen:query")
+	assertStateLoadFailure(t, result, "frozen:query", dbPath, ErrStateLoadQueryFailed, StateLoadFailureQueryFailed)
+	if errors.Is(result.Err, ErrStateLoadClosed) || errors.Is(result.Err, ErrStateLoadBusy) {
+		t.Fatalf("query error 被误分类: %v", result.Err)
+	}
+
+	if _, err := store.db.Exec(`ALTER TABLE frozen_state_moved RENAME TO frozen_state`); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.LoadStateResult("frozen:query"); !got.Found || got.Value != "value" {
+		t.Fatalf("恢复后读取=%+v", got)
+	}
+}
+
+func TestHistoryTransitionRemainsSynchronous(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "transition-sync.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// history transition 不属于 PersistenceBackend 合同：writer 在类型层面
+	// 就无法提交它，因此不存在"排队后再落库"的窗口。
+	var backend PersistenceBackend = store
+	if _, isTransition := backend.(interface {
+		CommitHistoryTransition(HistoryTransition) error
+	}); isTransition {
+		t.Fatal("PersistenceBackend 暴露了 history transition 入口")
+	}
+
+	if err := store.SaveArchive(archiveRangeTestBlock("sync", "sync-session", 1, 4, 1, "sync")); err != nil {
+		t.Fatal(err)
+	}
+	const stateKey = "history_epoch:sync"
+	if err := store.PersistState(stateKey, "old-state"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`CREATE TRIGGER fail_sync_transition
+		BEFORE UPDATE OF isolated ON archive_blocks
+		BEGIN SELECT RAISE(ABORT, 'forced isolation failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitHistoryTransition(HistoryTransition{
+		SessionID: "sync-session", StateKey: stateKey, StateValue: "new-state", CommonPrefix: 2,
+	}); err == nil {
+		t.Fatal("transition 失败时必须同步返回错误")
+	}
+	// 同步 fail-closed：state 与 visibility 都必须回滚。
+	if got := store.LoadStateResult(stateKey); !got.Found || got.Value != "old-state" {
+		t.Fatalf("失败 transition 部分提交 state: %+v", got)
+	}
+	var isolated int
+	if err := store.db.QueryRow(`SELECT isolated FROM archive_blocks WHERE id='sync'`).Scan(&isolated); err != nil {
+		t.Fatal(err)
+	}
+	if isolated != 0 {
+		t.Fatalf("失败 transition 部分提交 visibility: %d", isolated)
+	}
+
+	if _, err := store.db.Exec(`DROP TRIGGER fail_sync_transition`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitHistoryTransition(HistoryTransition{
+		SessionID: "sync-session", StateKey: stateKey, StateValue: "new-state", CommonPrefix: 2,
+	}); err != nil {
+		t.Fatalf("成功 transition 应同步提交: %v", err)
+	}
+	if got := store.LoadStateResult(stateKey); !got.Found || got.Value != "new-state" {
+		t.Fatalf("成功 transition 未同步可见: %+v", got)
+	}
+}
 
 func TestSQLiteStoreMigrationPreservesArchiveVisibilityData(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "legacy-visibility.db")

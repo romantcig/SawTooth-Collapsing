@@ -2,10 +2,12 @@ package proxy
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -872,6 +874,51 @@ func TestPersistenceWriterCloseAndDrainConcurrentSubmit(t *testing.T) {
 		case persistenceStateSaved, persistenceStateUnavailable:
 		default:
 			t.Fatalf("并发 close 下 op %d 结果=%s, want saved 或 unavailable", index, probe.diskState())
+		}
+	}
+}
+
+// ── Task 2：统一 error-aware loader 的静态门禁 ──
+
+// TestStateLoaderProductionCallersAreEnumerated 是 bool-only wrapper 的迁移门禁。
+// 它不允许在已知的四个 main wiring 站点之外新增 LoadState 引用；
+// 新代码必须使用 StateLoader/LoadStateResult。
+func TestStateLoaderProductionCallersAreEnumerated(t *testing.T) {
+	var _ StateLoader = (*SQLiteStore)(nil)
+
+	// Plan 05/06 需要迁移的四个 production wiring 站点，逐个列举以便迁移后清零。
+	wantMainCallers := 4
+	mainSource, err := os.ReadFile(filepath.Join("..", "..", "cmd", "proxy", "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(mainSource), "store.LoadState)"); got != wantMainCallers {
+		t.Fatalf("cmd/proxy/main.go 的 bool-only loader 引用=%d, want %d（新增引用必须改用 LoadStateResult）", got, wantMainCallers)
+	}
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		source, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(source)
+		if name == "store.go" {
+			// store.go 定义 wrapper 本身，只允许它内部调用新入口一次。
+			if !strings.Contains(text, "func (s *SQLiteStore) LoadStateResult(") {
+				t.Fatal("store.go 缺少 error-aware LoadStateResult")
+			}
+			continue
+		}
+		if strings.Contains(text, ".LoadState(") {
+			t.Fatalf("%s 引用了 bool-only LoadState；production 必须使用 StateLoader", name)
 		}
 	}
 }
