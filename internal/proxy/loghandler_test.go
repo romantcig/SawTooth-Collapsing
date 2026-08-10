@@ -3,7 +3,12 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -208,6 +213,416 @@ func TestLogHandlerContract(t *testing.T) {
 	if got := h.WithGroup(""); got != slog.Handler(h) {
 		t.Error("WithGroup(\"\") 应返回自身")
 	}
+}
+
+// terminalOutcomeSnapshot 构造一个 terminal-eligible 的健康基线 snapshot；
+// 各用例只改动自己关心的字段，避免每个 fixture 重复完整结构体。
+func terminalOutcomeSnapshot(mutate func(*requestOutcomeSnapshot)) requestOutcomeSnapshot {
+	snapshot := requestOutcomeSnapshot{
+		RequestID:           75,
+		SessionHash:         "0123456789abcdef",
+		StartedAt:           logTestTime,
+		FinishedAt:          logTestTime,
+		Eligibility:         outcomeEligibilityEvaluable,
+		TerminalEligibility: outcomeEligibilityTerminalEligible,
+		TriggerReason:       TriggerTokens,
+		PressureSource:      pressureSourceActualPlusDelta,
+		RequiredWait:        4 * time.Minute,
+		ActualWait:          5 * time.Minute,
+		ActualWaitKnown:     true,
+		Action:              outcomeActionCollapse,
+		BeforeMessages:      120,
+		AfterMessages:       40,
+		BeforeTokens:        90000,
+		AfterTokens:         30000,
+		UpstreamState:       upstreamStateSuccess,
+		UpstreamStatus:      200,
+		MemoryState:         persistenceStateSaved,
+		DiskState:           persistenceStateSaved,
+		FailureClass:        persistenceFailureNone,
+		Intervention:        interventionNotRequired,
+	}
+	if mutate != nil {
+		mutate(&snapshot)
+	}
+	return snapshot
+}
+
+func projectTerminalOutcome(t *testing.T, snapshot requestOutcomeSnapshot, admission outcomeDispatchResult) string {
+	t.Helper()
+	var buf bytes.Buffer
+	handler := NewLogHandler(&buf, slog.LevelInfo)
+	if err := handler.ProjectTerminal(snapshot, admission); err != nil {
+		t.Fatalf("ProjectTerminal 出错: %v", err)
+	}
+	return buf.String()
+}
+
+// terminalOutcomeForbidden 是终端结果行绝不允许出现的实现术语与技术片段。
+var terminalOutcomeForbidden = []string{
+	"SawtoothTrigger", "frozen", "Frozen", "baseline", "actual_plus_delta",
+	"collapse", "fallback", "passthrough", "fail_closed", "non_2xx",
+	"sqlite", "stub", "trigger_reason", "pressure_source", "terminal_eligibility",
+	"event=", "request_id", "session_hash", "unknown", "unavailable",
+	"[INFO]", "[WARN]", "[ERROR]", "[DEBUG]", "\033",
+	"秒", "分钟", "毫秒", "ms",
+}
+
+func assertTerminalOutcomeSafe(t *testing.T, line string) {
+	t.Helper()
+	for _, forbidden := range terminalOutcomeForbidden {
+		if strings.Contains(line, forbidden) {
+			t.Fatalf("终端结果泄漏禁止片段 %q: %q", forbidden, line)
+		}
+	}
+}
+
+func TestTerminalOutcomeRendererMatrix(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*requestOutcomeSnapshot)
+		want    []string
+		notWant []string
+	}{
+		{
+			name: "未触发直通",
+			mutate: func(snapshot *requestOutcomeSnapshot) {
+				snapshot.TriggerReason = TriggerNone
+				snapshot.Action = outcomeActionPassthrough
+				snapshot.RequiredWait, snapshot.ActualWait, snapshot.ActualWaitKnown = 0, 0, false
+				snapshot.BeforeMessages, snapshot.AfterMessages = 0, 0
+				snapshot.BeforeTokens, snapshot.AfterTokens = 0, 0
+			},
+			want: []string{"未触发", "原因：上下文仍有余量", "动作：原样转发", "结果：请求已完成", "无需人工处理"},
+		},
+		{
+			name:   "令牌触发整理",
+			mutate: nil,
+			want:   []string{"已触发", "原因：上下文接近上限", "动作：整理历史消息", "结果：请求已完成"},
+		},
+		{
+			name: "长时间未继续触发",
+			mutate: func(snapshot *requestOutcomeSnapshot) {
+				snapshot.TriggerReason = TriggerPause
+			},
+			want: []string{"已触发", "原因：对话长时间未继续", "动作：整理历史消息"},
+		},
+		{
+			name: "紧急触发",
+			mutate: func(snapshot *requestOutcomeSnapshot) {
+				snapshot.TriggerReason = TriggerEmergency
+			},
+			want: []string{"已触发", "原因：上下文即将超出上限"},
+		},
+		{
+			name: "备用整理方式",
+			mutate: func(snapshot *requestOutcomeSnapshot) {
+				snapshot.Action = outcomeActionFallback
+			},
+			want: []string{"动作：改用备用方式整理"},
+		},
+		{
+			name: "直接发送",
+			mutate: func(snapshot *requestOutcomeSnapshot) {
+				snapshot.TriggerReason = TriggerNone
+				snapshot.Action = outcomeActionDirect
+			},
+			want: []string{"未触发", "动作：直接发送"},
+		},
+		{
+			name: "复用已有整理结果",
+			mutate: func(snapshot *requestOutcomeSnapshot) {
+				snapshot.TriggerReason = TriggerNone
+				snapshot.Action = outcomeActionDirect
+				snapshot.BeforeMessages, snapshot.AfterMessages = 300, 42
+			},
+			want: []string{"未触发", "动作：直接发送", "结果：请求已完成"},
+		},
+		{
+			name: "历史判定失败保守转发",
+			mutate: func(snapshot *requestOutcomeSnapshot) {
+				snapshot.Eligibility = outcomeEligibilityNotEvaluable
+				snapshot.TriggerReason = TriggerUnknown
+				snapshot.Action = outcomeActionFailClosed
+				snapshot.Intervention = interventionNotRequired
+			},
+			want: []string{"未评估", "原因：本次请求未完成整理判定", "动作：保守转发，未改动历史"},
+		},
+		{
+			name: "上游失败",
+			mutate: func(snapshot *requestOutcomeSnapshot) {
+				snapshot.UpstreamState = upstreamStateTransportFailure
+				snapshot.UpstreamStatus = 0
+			},
+			want: []string{"结果：未能连接上游"},
+		},
+		{
+			name: "磁盘保存失败需要人工检查",
+			mutate: func(snapshot *requestOutcomeSnapshot) {
+				snapshot.DiskState = persistenceStateFailed
+				snapshot.FailureClass = persistenceFailureSQLite
+				snapshot.Intervention = interventionRequired
+			},
+			want: []string{"结果：请求已完成", "本地状态未能保存到磁盘", "需要人工检查"},
+		},
+		{
+			name: "内存与磁盘均正常时不需要干预",
+			mutate: func(snapshot *requestOutcomeSnapshot) {
+				snapshot.Intervention = interventionNone
+			},
+			want:    []string{"无需人工处理"},
+			notWant: []string{"需要人工检查"},
+		},
+	}
+
+	for _, testCase := range cases {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			out := projectTerminalOutcome(t, terminalOutcomeSnapshot(testCase.mutate), outcomeDispatchResult{SessionAccepted: true, TerminalAccepted: true})
+			if strings.Count(out, "\n") != 1 {
+				t.Fatalf("终端结果不是恰好一行: %q", out)
+			}
+			line := strings.TrimSuffix(out, "\n")
+			for _, want := range testCase.want {
+				if !strings.Contains(line, want) {
+					t.Fatalf("终端结果缺少 %q: %q", want, line)
+				}
+			}
+			for _, notWant := range testCase.notWant {
+				if strings.Contains(line, notWant) {
+					t.Fatalf("终端结果含多余 %q: %q", notWant, line)
+				}
+			}
+			assertTerminalOutcomeSafe(t, line)
+			if !strings.Contains(line, "会话=0123456789abcdef") || !strings.Contains(line, "请求=75") {
+				t.Fatalf("终端结果缺少短 hash/request 关联: %q", line)
+			}
+		})
+	}
+}
+
+func TestTerminalOutcomeFormatAndPrivacy(t *testing.T) {
+	snapshot := terminalOutcomeSnapshot(nil)
+	out := projectTerminalOutcome(t, snapshot, outcomeDispatchResult{SessionAccepted: true, TerminalAccepted: true})
+	line := strings.TrimSuffix(out, "\n")
+
+	if !strings.HasPrefix(line, logTestTime.Local().Format("15:04:05")+" ") {
+		t.Fatalf("终端结果前缀不是 HH:MM:SS: %q", line)
+	}
+	if strings.Contains(line, "2026/") || strings.Contains(line, logTestTime.Format("2006/01/02")) {
+		t.Fatalf("终端结果含年月日: %q", line)
+	}
+	assertTerminalOutcomeSafe(t, line)
+	for _, sentinel := range []string{"4m0s", "5m0s", "240", "300", "90000", "30000", "200"} {
+		if strings.Contains(line, sentinel) {
+			t.Fatalf("终端结果泄漏内部数值 %q: %q", sentinel, line)
+		}
+	}
+	full := "session-secret-full-identity"
+	leaky := terminalOutcomeSnapshot(func(mutable *requestOutcomeSnapshot) { mutable.SessionHash = full })
+	leakyLine := projectTerminalOutcome(t, leaky, outcomeDispatchResult{SessionAccepted: true})
+	if strings.Contains(leakyLine, full) {
+		t.Fatalf("终端结果泄漏完整 session: %q", leakyLine)
+	}
+	if !strings.Contains(leakyLine, stableSessionHash(full)) {
+		t.Fatalf("终端结果未归一为短 hash: %q", leakyLine)
+	}
+}
+
+func TestTerminalOutcomeImmediateSessionReject(t *testing.T) {
+	rejected := projectTerminalOutcome(t, terminalOutcomeSnapshot(nil), outcomeDispatchResult{SessionRejected: true, TerminalAccepted: true})
+	if !strings.Contains(rejected, "详细记录未保存") {
+		t.Fatalf("session 立即拒绝未追加缺失说明: %q", rejected)
+	}
+	if strings.Count(rejected, "\n") != 1 {
+		t.Fatalf("session 立即拒绝产生多行: %q", rejected)
+	}
+	assertTerminalOutcomeSafe(t, strings.TrimSuffix(rejected, "\n"))
+
+	accepted := projectTerminalOutcome(t, terminalOutcomeSnapshot(nil), outcomeDispatchResult{SessionAccepted: true, TerminalAccepted: true})
+	if strings.Contains(accepted, "详细记录未保存") {
+		t.Fatalf("session 已接受却提示未保存: %q", accepted)
+	}
+}
+
+func TestTerminalIneligibleHasNoResultLine(t *testing.T) {
+	for _, eligibility := range []outcomeEligibility{
+		outcomeEligibilityTerminalIneligible,
+		outcomeEligibilityNotApplicable,
+		outcomeEligibilityUnknown,
+	} {
+		snapshot := terminalOutcomeSnapshot(func(mutable *requestOutcomeSnapshot) {
+			mutable.TerminalEligibility = eligibility
+		})
+		if out := projectTerminalOutcome(t, snapshot, outcomeDispatchResult{SessionAccepted: true}); out != "" {
+			t.Fatalf("terminal-ineligible=%s 仍输出结果行: %q", eligibility, out)
+		}
+	}
+}
+
+// terminalHealthLine 用固定时间渲染一次 typed transition，返回终端输出。
+func terminalHealthLine(t *testing.T, transition HealthTransition) string {
+	t.Helper()
+	var buf bytes.Buffer
+	reporter := NewTerminalHealthReporter(NewLogHandler(&buf, slog.LevelInfo))
+	reporter.now = func() time.Time { return logTestTime }
+	reporter.ReportHealthTransition(transition)
+	return buf.String()
+}
+
+func TestTerminalHealthReporterAllScopes(t *testing.T) {
+	cases := []struct {
+		scope HealthScope
+		kind  HealthTransitionKind
+		want  string
+	}{
+		{HealthScopeSQLiteState, HealthTransitionEntered, "本地状态暂时无法保存到磁盘"},
+		{HealthScopeSQLiteState, HealthTransitionRecovered, "本地状态已恢复正常保存"},
+		{HealthScopeSQLiteArchive, HealthTransitionEntered, "归档暂时无法保存"},
+		{HealthScopeSQLiteArchive, HealthTransitionRecovered, "归档已恢复正常保存"},
+		{HealthScopeSessionQueueFull, HealthTransitionEntered, "详细记录暂时来不及保存"},
+		{HealthScopeSessionQueueFull, HealthTransitionRecovered, "详细记录已恢复保存"},
+		{HealthScopeSessionLogSink, HealthTransitionEntered, "详细记录暂时写不进文件"},
+		{HealthScopeSessionLogSink, HealthTransitionRecovered, "详细记录文件写入已恢复"},
+	}
+	for _, testCase := range cases {
+		testCase := testCase
+		t.Run(string(testCase.scope)+"-"+string(testCase.kind), func(t *testing.T) {
+			out := terminalHealthLine(t, makeHealthTransition(testCase.scope, HealthFailureClass(testCase.scope), testCase.kind, 7, 7))
+			if strings.Count(out, "\n") != 1 {
+				t.Fatalf("健康提示不是恰好一行: %q", out)
+			}
+			line := strings.TrimSuffix(out, "\n")
+			if !strings.HasPrefix(line, logTestTime.Format("15:04:05")+" ") {
+				t.Fatalf("健康提示前缀不是 HH:MM:SS: %q", line)
+			}
+			if !strings.Contains(line, testCase.want) {
+				t.Fatalf("健康提示缺少人类影响文案 %q: %q", testCase.want, line)
+			}
+			for _, forbidden := range []string{
+				string(testCase.scope), "generation", "7", "[INFO]", "[WARN]", "[ERROR]", "\033", "秒", "分钟",
+			} {
+				if strings.Contains(line, forbidden) {
+					t.Fatalf("健康提示泄漏内部片段 %q: %q", forbidden, line)
+				}
+			}
+		})
+	}
+}
+
+func TestTerminalHealthReporterSkipsOngoing(t *testing.T) {
+	for _, kind := range []HealthTransitionKind{HealthTransitionOngoing, HealthTransitionUnchanged} {
+		for _, scope := range HealthScopes() {
+			if out := terminalHealthLine(t, makeHealthTransition(scope, HealthFailureClass(scope), kind, 3, 0)); out != "" {
+				t.Fatalf("scope=%s kind=%s 仍写终端: %q", scope, kind, out)
+			}
+		}
+	}
+	if out := terminalHealthLine(t, makeHealthTransition("other_scope", "other_scope", HealthTransitionEntered, 1, 0)); out != "" {
+		t.Fatalf("未知 scope 仍写终端: %q", out)
+	}
+}
+
+// countingHandler 统计任何 file-capable logger 是否被健康路径调用。
+type countingHandler struct {
+	calls int
+}
+
+func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *countingHandler) Handle(context.Context, slog.Record) error {
+	h.calls++
+	return nil
+}
+
+func (h *countingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+
+func (h *countingHandler) WithGroup(string) slog.Handler { return h }
+
+func TestTerminalHealthReporterHasNoFileCapableDependency(t *testing.T) {
+	var terminal bytes.Buffer
+	dataDir := t.TempDir()
+	fileHandler := NewSessionLogHandler(dataDir, slog.LevelDebug, nil)
+	combinedProbe := &countingHandler{}
+	defaultProbe := &countingHandler{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(defaultProbe))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	_ = NewCombinedLogHandler(combinedProbe, fileHandler)
+
+	reporter := NewTerminalHealthReporter(NewLogHandler(&terminal, slog.LevelInfo))
+	tracker := NewHealthTracker(reporter)
+	for _, scope := range HealthScopes() {
+		tracker.ObserveFailure(scope, HealthFailureClass(scope), uint64(5))
+		tracker.ObserveFailure(scope, HealthFailureClass(scope), uint64(6))
+	}
+	if lines := strings.Count(terminal.String(), "\n"); lines != len(HealthScopes()) {
+		t.Fatalf("四 scope entered 行数=%d，want %d: %q", lines, len(HealthScopes()), terminal.String())
+	}
+	if combinedProbe.calls != 0 || defaultProbe.calls != 0 {
+		t.Fatalf("健康提示流经 file-capable logger: combined=%d default=%d", combinedProbe.calls, defaultProbe.calls)
+	}
+	if entries, err := os.ReadDir(filepath.Join(dataDir, "logs")); err == nil && len(entries) != 0 {
+		t.Fatalf("健康提示写入了文件日志: %v", entries)
+	}
+
+	source, err := os.ReadFile("loghandler.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parser.ParseFile(token.NewFileSet(), "loghandler.go", source, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forbidden := map[string]bool{
+		"SessionLogHandler": true, "CombinedLogHandler": true, "slog": true, "Logger": true,
+	}
+	var leaked string
+	inspectReporter := func(node ast.Node) {
+		ast.Inspect(node, func(inner ast.Node) bool {
+			ident, ok := inner.(*ast.Ident)
+			if ok && forbidden[ident.Name] {
+				leaked = ident.Name
+			}
+			if selector, ok := inner.(*ast.SelectorExpr); ok && selector.Sel.Name == "Handle" {
+				leaked = "Handle"
+			}
+			return true
+		})
+	}
+	for _, decl := range parsed.Decls {
+		switch typed := decl.(type) {
+		case *ast.FuncDecl:
+			if typed.Name.Name == "NewTerminalHealthReporter" || receiverTypeName(typed) == "TerminalHealthReporter" {
+				inspectReporter(typed)
+			}
+		case *ast.GenDecl:
+			for _, spec := range typed.Specs {
+				typeSpec, ok := spec.(*ast.TypeSpec)
+				if ok && typeSpec.Name.Name == "TerminalHealthReporter" {
+					inspectReporter(typeSpec)
+				}
+			}
+		}
+	}
+	if leaked != "" {
+		t.Fatalf("TerminalHealthReporter 依赖了 file-capable 资源: %s", leaked)
+	}
+}
+
+func receiverTypeName(decl *ast.FuncDecl) string {
+	if decl.Recv == nil || len(decl.Recv.List) == 0 {
+		return ""
+	}
+	switch typed := decl.Recv.List[0].Type.(type) {
+	case *ast.StarExpr:
+		if ident, ok := typed.X.(*ast.Ident); ok {
+			return ident.Name
+		}
+	case *ast.Ident:
+		return typed.Name
+	}
+	return ""
 }
 
 func TestLogHandlerRequestAttrsSharedAcrossLines(t *testing.T) {

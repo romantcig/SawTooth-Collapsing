@@ -1,11 +1,41 @@
 package proxy
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// lockedBuffer 让终端 writer 在 race 检测下可被测试安全读取；
+// LogHandler 自身已保证整行写入，这里只额外保护读侧。
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *lockedBuffer) lines() []string {
+	text := strings.TrimSuffix(b.String(), "\n")
+	if text == "" {
+		return nil
+	}
+	return strings.Split(text, "\n")
+}
 
 type dispatcherTestReporter struct {
 	mu          sync.Mutex
@@ -303,5 +333,140 @@ func TestOutcomeDispatcherClosingIsLifecycleError(t *testing.T) {
 	}
 	if !errors.Is(dispatcher.LastLifecycleError(), ErrOutcomeDispatcherClosing) {
 		t.Fatalf("last lifecycle error=%v", dispatcher.LastLifecycleError())
+	}
+}
+
+// terminalLaneFixture 组装真实 terminal renderer + terminal-only health reporter，
+// 用于验证两条 lane 的实际投影而不是 fake seam。
+type terminalLaneFixture struct {
+	out        *lockedBuffer
+	handler    *LogHandler
+	reporter   *TerminalHealthReporter
+	tracker    *HealthTracker
+	dispatcher *OutcomeDispatcher
+}
+
+func newTerminalLaneFixture(t *testing.T, session any) *terminalLaneFixture {
+	t.Helper()
+	out := &lockedBuffer{}
+	handler := NewLogHandler(out, slog.LevelInfo)
+	reporter := NewTerminalHealthReporter(handler)
+	tracker := NewHealthTracker(reporter)
+	dispatcher := NewOutcomeDispatcher(OutcomeDispatcherOptions{
+		TerminalProjector: handler,
+		SessionProjector:  session,
+		HealthTracker:     tracker,
+		Reporter:          reporter,
+	})
+	if !dispatcher.Configured() {
+		t.Fatal("dispatcher 未接受 terminal renderer/health reporter 配置")
+	}
+	t.Cleanup(func() { _ = dispatcher.CloseAndDrain() })
+	return &terminalLaneFixture{out: out, handler: handler, reporter: reporter, tracker: tracker, dispatcher: dispatcher}
+}
+
+func countOutcomeResultLines(lines []string) int {
+	count := 0
+	for _, line := range lines {
+		if strings.Contains(line, "ST ") {
+			count++
+		}
+	}
+	return count
+}
+
+func TestTerminalOutcomeLateSessionFailureIsNotRetroactive(t *testing.T) {
+	release := make(chan struct{})
+	session := sessionProjectorFunc(func(requestOutcomeSnapshot) error {
+		<-release
+		return errors.New("session sink failed")
+	})
+	fixture := newTerminalLaneFixture(t, session)
+
+	result := fixture.dispatcher.TryDispatch(dispatcherTestSnapshot(41))
+	if !result.SessionAccepted || !result.TerminalAccepted {
+		t.Fatalf("admission=%+v，want session/terminal 均接受", result)
+	}
+	waitForDispatcher(t, func() bool { return len(fixture.out.lines()) == 1 })
+	before := fixture.out.String()
+	if strings.Contains(before, "详细记录未保存") {
+		t.Fatalf("accepted 请求错误追加缺失后缀: %q", before)
+	}
+
+	close(release)
+	waitForDispatcher(t, func() bool { return len(fixture.out.lines()) == 2 })
+	after := fixture.out.String()
+	if !strings.HasPrefix(after, before) {
+		t.Fatalf("已输出的终端结果被回改: before=%q after=%q", before, after)
+	}
+	lines := fixture.out.lines()
+	if got := countOutcomeResultLines(lines); got != 1 {
+		t.Fatalf("终端结果行数=%d，want 1: %q", got, lines)
+	}
+	if !strings.Contains(lines[1], "详细记录暂时写不进文件") {
+		t.Fatalf("accepted 后的写入失败未由独立健康提示报告: %q", lines[1])
+	}
+	if !fixture.tracker.IsDegraded(HealthScopeSessionLogSink) {
+		t.Fatal("session_log_sink 未进入退化")
+	}
+	if fixture.tracker.IsDegraded(HealthScopeSessionQueueFull) {
+		t.Fatal("写入失败错误污染 session_queue_full scope")
+	}
+}
+
+func TestTerminalOutcomeOverflowIsBestEffortOnly(t *testing.T) {
+	sessionDone := make(chan struct{}, OutcomeDispatcherQueueCapacity+8)
+	session := sessionProjectorFunc(func(requestOutcomeSnapshot) error {
+		sessionDone <- struct{}{}
+		return nil
+	})
+	blockTerminal := make(chan struct{})
+	terminalEntered := make(chan struct{})
+	var enteredOnce sync.Once
+
+	out := &lockedBuffer{}
+	handler := NewLogHandler(out, slog.LevelInfo)
+	reporter := NewTerminalHealthReporter(handler)
+	tracker := NewHealthTracker(reporter)
+	terminal := terminalProjectorFunc(func(snapshot requestOutcomeSnapshot, admission outcomeDispatchResult) error {
+		enteredOnce.Do(func() { close(terminalEntered) })
+		<-blockTerminal
+		return handler.ProjectTerminal(snapshot, admission)
+	})
+	dispatcher := NewOutcomeDispatcher(OutcomeDispatcherOptions{
+		TerminalProjector: terminal,
+		SessionProjector:  session,
+		HealthTracker:     tracker,
+		Reporter:          reporter,
+	})
+	t.Cleanup(func() { close(blockTerminal); _ = dispatcher.CloseAndDrain() })
+
+	dispatcher.TryDispatch(dispatcherTestSnapshot(1))
+	<-terminalEntered
+	for i := 0; i < OutcomeDispatcherQueueCapacity; i++ {
+		dispatcher.TryDispatch(dispatcherTestSnapshot(uint64(i + 2)))
+	}
+	beforeLines := len(out.lines())
+	overflow := dispatcher.TryDispatch(dispatcherTestSnapshot(9999))
+	if !overflow.TerminalEmissionUnavailable || !overflow.SessionAccepted {
+		t.Fatalf("terminal 饱和结果=%+v", overflow)
+	}
+	if dispatcher.TerminalOverflowCount() == 0 {
+		t.Fatal("terminal 饱和未计入有界计数")
+	}
+	waitForDispatcher(t, func() bool { return len(sessionDone) >= OutcomeDispatcherQueueCapacity+2 })
+
+	if after := len(out.lines()); after != beforeLines {
+		t.Fatalf("terminal 饱和产生了补偿输出 %d -> %d", beforeLines, after)
+	}
+	for _, scope := range HealthScopes() {
+		if tracker.IsDegraded(scope) {
+			t.Fatalf("terminal 饱和污染 health scope=%s", scope)
+		}
+	}
+	for _, source := range []OutcomeGapSource{OutcomeGapSourceSessionQueueFull, OutcomeGapSourceSessionLogSink} {
+		if got := dispatcher.GapAccumulator().Snapshot(source).Count; got != 0 {
+			t.Fatalf("terminal 饱和写入 gap source=%s count=%d", source, got)
+		}
 	}
 }
