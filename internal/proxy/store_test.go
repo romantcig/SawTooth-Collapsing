@@ -189,11 +189,15 @@ func TestHistoryTransitionRemainsSynchronous(t *testing.T) {
 
 	// history transition 不属于 PersistenceBackend 合同：writer 在类型层面
 	// 就无法提交它，因此不存在"排队后再落库"的窗口。
-	var backend PersistenceBackend = store
-	if _, isTransition := backend.(interface {
-		CommitHistoryTransition(HistoryTransition) error
-	}); isTransition {
-		t.Fatal("PersistenceBackend 暴露了 history transition 入口")
+	// 只能对接口类型本身取方法集——对接口值做断言检查的是动态类型，
+	// *SQLiteStore 当然带着 CommitHistoryTransition，证明不了合同边界。
+	backendType := reflect.TypeOf((*PersistenceBackend)(nil)).Elem()
+	backendMethods := make([]string, 0, backendType.NumMethod())
+	for index := 0; index < backendType.NumMethod(); index++ {
+		backendMethods = append(backendMethods, backendType.Method(index).Name)
+	}
+	if !reflect.DeepEqual(backendMethods, []string{"DeleteState", "PersistState"}) {
+		t.Fatalf("PersistenceBackend 方法集=%v, want [DeleteState PersistState]", backendMethods)
 	}
 
 	if err := store.SaveArchive(archiveRangeTestBlock("sync", "sync-session", 1, 4, 1, "sync")); err != nil {

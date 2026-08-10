@@ -78,6 +78,43 @@ var (
 	ErrPersistenceWriterUnsupportedTarget = errors.New("persistence writer only accepts plain state operations")
 )
 
+// StateLoadFailureClass 是 loader 对外暴露的稳定失败类别 allowlist。
+// 它只描述失败种类，绝不包含 state key、数据库路径或 driver 原文。
+type StateLoadFailureClass string
+
+const (
+	StateLoadFailureNone         StateLoadFailureClass = "none"
+	StateLoadFailureSQLiteClosed StateLoadFailureClass = "sqlite_closed"
+	StateLoadFailureSQLiteBusy   StateLoadFailureClass = "sqlite_busy"
+	StateLoadFailureQueryFailed  StateLoadFailureClass = "query_failed"
+)
+
+// StateLoader 是本阶段唯一的 state 读取合同。bool-only 的旧 LoadState 只保留
+// 给尚未迁移的调用点，不属于这个接口。
+type StateLoader interface {
+	LoadStateResult(key string) StateLoadResult
+}
+
+// StateLoadResult 精确表达三种互斥事实：命中、确认不存在、读取失败。
+// Found=false 且 Err=nil 只能来自 sql.ErrNoRows；任何 closed/busy/query error
+// 都必须保留非 nil Err 与稳定 FailureClass。
+//
+// FailureClass 是对外的安全字段；Err 保留 %w 链只为让调用方用 errors.Is/As
+// 分类，构造时已确保消息里没有 key 与数据库路径。
+type StateLoadResult struct {
+	Value        string
+	Found        bool
+	Err          error
+	FailureClass StateLoadFailureClass
+}
+
+// 三个 sentinel 让调用方无需匹配 driver 文案即可分类失败。
+var (
+	ErrStateLoadClosed      = errors.New("sqlite state loader: database closed")
+	ErrStateLoadBusy        = errors.New("sqlite state loader: database busy")
+	ErrStateLoadQueryFailed = errors.New("sqlite state loader: query failed")
+)
+
 type persistenceJob struct {
 	kind        PersistenceOpKind
 	orderingKey string

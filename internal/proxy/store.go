@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	_ "modernc.org/sqlite" // 纯 Go SQLite 驱动，通过 init() 注册 database/sql
+	"modernc.org/sqlite" // 纯 Go SQLite 驱动，通过 init() 注册 database/sql
 )
 
 // SQLiteStore 管理 archive + decay state 的 SQLite 数据库。
@@ -392,18 +392,57 @@ func (s *SQLiteStore) PersistState(key, value string) error {
 	return nil
 }
 
-// LoadState 从 frozen_state 表加载 key 对应的 JSON 值（Phase 4, D-08）。
-// 返回状态字符串和 true；未找到则返回 "", false。
-func (s *SQLiteStore) LoadState(key string) (string, bool) {
+// LoadStateResult 是本阶段唯一的 error-aware 读取入口。
+// 只有 sql.ErrNoRows 会得到 Found=false 且 Err=nil；closed/busy/其他查询错误
+// 一律保留非 nil Err 与稳定 failure class，绝不伪装成"状态不存在"。
+func (s *SQLiteStore) LoadStateResult(key string) StateLoadResult {
 	var value string
 	err := s.db.QueryRow(
 		`SELECT value FROM frozen_state WHERE key = ?`,
 		key,
 	).Scan(&value)
-	if err != nil {
+	switch {
+	case err == nil:
+		return StateLoadResult{Value: value, Found: true, FailureClass: StateLoadFailureNone}
+	case errors.Is(err, sql.ErrNoRows):
+		return StateLoadResult{FailureClass: StateLoadFailureNone}
+	}
+	sentinel, class := classifyStateLoadError(err)
+	// 刻意不把 key 或数据库路径写进消息：它们不属于可外泄的失败事实。
+	return StateLoadResult{Err: fmt.Errorf("%w: %w", sentinel, err), FailureClass: class}
+}
+
+// SQLite 主结果码；扩展码需要先与 0xff 取低位再比较。
+const (
+	sqliteResultBusy   = 5
+	sqliteResultLocked = 6
+)
+
+func classifyStateLoadError(err error) (error, StateLoadFailureClass) {
+	if errors.Is(err, sql.ErrConnDone) || errors.Is(err, sql.ErrTxDone) ||
+		strings.Contains(err.Error(), "sql: database is closed") {
+		return ErrStateLoadClosed, StateLoadFailureSQLiteClosed
+	}
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		switch sqliteErr.Code() & 0xff {
+		case sqliteResultBusy, sqliteResultLocked:
+			return ErrStateLoadBusy, StateLoadFailureSQLiteBusy
+		}
+	}
+	return ErrStateLoadQueryFailed, StateLoadFailureQueryFailed
+}
+
+// LoadState 是 bool-only 兼容 wrapper，只供尚未迁移的旧调用点与测试使用。
+// 生产代码禁止引用：它把 closed/busy/query error 全部压成"不存在"，会让错误
+// 状态复活或被忽略。新代码一律使用 StateLoader/LoadStateResult；
+// cmd/proxy/main.go 的四个 wiring 站点由 Plan 05/06 迁移。
+func (s *SQLiteStore) LoadState(key string) (string, bool) {
+	result := s.LoadStateResult(key)
+	if result.Err != nil || !result.Found {
 		return "", false
 	}
-	return value, true
+	return result.Value, true
 }
 
 // DeleteState 删除持久化状态键，用于移除已确认失效或损坏的 frozen 快照。
