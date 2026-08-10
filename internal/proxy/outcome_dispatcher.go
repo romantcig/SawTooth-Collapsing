@@ -49,12 +49,14 @@ func (f sessionProjectorFunc) ProjectSession(snapshot requestOutcomeSnapshot) er
 }
 
 // OutcomeDispatcherOptions 允许生产 wiring 使用单个显式 options 值；默认容量
-// 字段故意不开放，避免破坏 256 bounded 合同。
+// 字段故意不开放，避免破坏 256 bounded 合同。GapAccumulator 可注入，使
+// dispatcher 与 session outcome writer 共享同一份缺口证据。
 type OutcomeDispatcherOptions struct {
 	TerminalProjector any
 	SessionProjector  any
 	HealthTracker     *HealthTracker
 	Reporter          any
+	GapAccumulator    *OutcomeGapAccumulator
 }
 
 type terminalAdmissionJob struct {
@@ -196,7 +198,7 @@ func adaptSessionProjector(value any) func(requestOutcomeSnapshot) error {
 	}
 }
 
-func parseOutcomeDispatcherOptions(args ...any) (terminal, session any, tracker *HealthTracker, reporter HealthTransitionReporter) {
+func parseOutcomeDispatcherOptions(args ...any) (terminal, session any, tracker *HealthTracker, reporter HealthTransitionReporter, gaps *OutcomeGapAccumulator) {
 	for _, arg := range args {
 		switch typed := arg.(type) {
 		case OutcomeDispatcherOptions:
@@ -212,9 +214,16 @@ func parseOutcomeDispatcherOptions(args ...any) (terminal, session any, tracker 
 			if reporter == nil {
 				reporter = adaptHealthReporter(typed.Reporter)
 			}
+			if gaps == nil {
+				gaps = typed.GapAccumulator
+			}
 		case *HealthTracker:
 			if tracker == nil {
 				tracker = typed
+			}
+		case *OutcomeGapAccumulator:
+			if gaps == nil {
+				gaps = typed
 			}
 		case HealthTransitionReporter:
 			if reporter == nil {
@@ -238,13 +247,16 @@ func parseOutcomeDispatcherOptions(args ...any) (terminal, session any, tracker 
 			}
 		}
 	}
-	return terminal, session, tracker, reporter
+	return terminal, session, tracker, reporter, gaps
 }
 
 // NewOutcomeDispatcher 需要调用方显式传入 HealthTracker 与 reporter。变参
 // 形式兼容不同阶段的 projector seam，但缺少任一依赖时不会启动可用 worker。
 func NewOutcomeDispatcher(args ...any) *OutcomeDispatcher {
-	terminal, session, tracker, reporter := parseOutcomeDispatcherOptions(args...)
+	terminal, session, tracker, reporter, gaps := parseOutcomeDispatcherOptions(args...)
+	if gaps == nil {
+		gaps = NewOutcomeGapAccumulator()
+	}
 	dispatcher := &OutcomeDispatcher{
 		terminalQueue: make(chan terminalAdmissionJob, OutcomeDispatcherTerminalQueueCapacity),
 		sessionQueue:  make(chan sessionOutcomeJob, OutcomeDispatcherSessionQueueCapacity),
@@ -252,7 +264,7 @@ func NewOutcomeDispatcher(args ...any) *OutcomeDispatcher {
 		sessionEmit:   adaptSessionProjector(session),
 		tracker:       tracker,
 		reporter:      reporter,
-		gaps:          NewOutcomeGapAccumulator(),
+		gaps:          gaps,
 	}
 	if tracker == nil || reporter == nil {
 		return dispatcher

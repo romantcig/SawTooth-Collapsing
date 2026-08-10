@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -341,4 +343,248 @@ func sanitizeFileLogText(value, sessionID string) string {
 	value = strings.ReplaceAll(value, "\r", "\\r")
 	value = strings.ReplaceAll(value, "\n", "\\n")
 	return value
+}
+
+// ---- AI 落盘的单条 request closure 与 process 级缺口摘要 ----
+
+const (
+	sessionOutcomeEvent    = "request_outcome"
+	sessionOutcomeGapEvent = "outcome_gap"
+)
+
+// ErrSessionOutcomeWriterNotConfigured 是缺少文件出口时的稳定生命周期错误。
+var ErrSessionOutcomeWriterNotConfigured = errors.New("session outcome writer sink not configured")
+
+// sessionOutcomeSink 是 closure 与 process 级缺口摘要的唯一整行出口；
+// shortHash 为空表示写 process 级记录。
+type sessionOutcomeSink interface {
+	WriteSessionLine(shortHash, line string) error
+}
+
+// WriteSessionLine 以整行为单位追加写入并返回真实错误。它与 Handle 的
+// best-effort 语义不同：整条记录的成败必须由 outcome writer 判定，
+// 因此这里不调用 report callback，也不吞掉失败。
+func (h *SessionLogHandler) WriteSessionLine(shortHash, line string) error {
+	if h == nil || line == "" {
+		return nil
+	}
+	path := h.outcomeLogPath(shortHash)
+	payload := sanitizeFileLogText(line, "") + "\n"
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err := os.MkdirAll(h.logRoot, 0700); err != nil {
+		return fmt.Errorf("创建文件日志目录 %s: %w", h.logRoot, err)
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+	if err != nil {
+		return fmt.Errorf("打开文件日志 %s: %w", path, err)
+	}
+	if _, writeErr := io.WriteString(file, payload); writeErr != nil {
+		_ = file.Close()
+		return fmt.Errorf("写入文件日志 %s: %w", path, writeErr)
+	}
+	if closeErr := file.Close(); closeErr != nil {
+		return fmt.Errorf("关闭文件日志 %s: %w", path, closeErr)
+	}
+	return nil
+}
+
+// outcomeLogPath 接受已归一的短 hash；非短 hash 输入再哈希一次，
+// 保证完整 session 身份不会出现在文件名里。
+func (h *SessionLogHandler) outcomeLogPath(shortHash string) string {
+	if shortHash == "" {
+		return filepath.Join(h.logRoot, "process.log")
+	}
+	if !isShortLowerHex(shortHash) {
+		shortHash = stableSessionHash(shortHash)
+	}
+	return filepath.Join(h.logRoot, shortHash+".log")
+}
+
+// SessionOutcomeWriter 把 accepted snapshot 投影成目标 session 文件里的一条
+// closure，并在成功后重放受控缺口：Claim → 写 process 级 outcome_gap →
+// generation-aware Commit。它只在 gap 摘要自身写失败时累计 sink 缺口，
+// closure 写失败由 dispatcher 统一累计，避免同一故障被计两次。
+type SessionOutcomeWriter struct {
+	sink    sessionOutcomeSink
+	gaps    *OutcomeGapAccumulator
+	tracker *HealthTracker
+	now     func() time.Time
+}
+
+func NewSessionOutcomeWriter(sink sessionOutcomeSink, gaps *OutcomeGapAccumulator, tracker *HealthTracker) *SessionOutcomeWriter {
+	return &SessionOutcomeWriter{sink: sink, gaps: gaps, tracker: tracker, now: time.Now}
+}
+
+// ProjectSession 实现 dispatcher 的 session lane projector 合同。
+func (w *SessionOutcomeWriter) ProjectSession(snapshot requestOutcomeSnapshot) error {
+	return w.WriteRequestOutcome(snapshot)
+}
+
+func (w *SessionOutcomeWriter) WriteRequestOutcome(snapshot requestOutcomeSnapshot) error {
+	if w == nil || w.sink == nil {
+		return ErrSessionOutcomeWriterNotConfigured
+	}
+	snapshot = snapshot.normalized()
+	if err := w.sink.WriteSessionLine(snapshot.SessionHash, formatRequestOutcomeClosure(snapshot)); err != nil {
+		// 整条 closure 缺失，不留半条因果链，也不在此重放缺口。
+		return err
+	}
+	w.replayGaps(snapshot)
+	return nil
+}
+
+// replayGaps 只在一次正常 closure 成功之后执行，且严格遵守
+// Claim → write → generation-aware Commit 的顺序。
+func (w *SessionOutcomeWriter) replayGaps(snapshot requestOutcomeSnapshot) {
+	if w.gaps == nil {
+		return
+	}
+	claim := w.gaps.Claim()
+	if claim.ID == 0 {
+		return
+	}
+	record := formatOutcomeGapRecord(claim, w.currentTime())
+	if record == "" {
+		w.gaps.Merge(claim)
+		return
+	}
+	if err := w.sink.WriteSessionLine("", record); err != nil {
+		// 先把本次摘要写失败记成新的 sink 缺口，再把原 claim 完整并回 current；
+		// 两步顺序保证 Merge 之后 generation 不回退，也不会产生任何 recovered。
+		generation := w.gaps.Accumulate(OutcomeGapEvent{
+			Source:      OutcomeGapSourceSessionLogSink,
+			SessionHash: snapshot.SessionHash,
+			RequestID:   snapshot.RequestID,
+			From:        snapshot.StartedAt,
+			To:          snapshot.FinishedAt,
+			Reason:      string(OutcomeGapReasonSessionLogSink),
+		})
+		if w.tracker != nil {
+			w.tracker.ObserveFailure(HealthScopeSessionLogSink, HealthFailureClassSessionLogSink, generation)
+		}
+		w.gaps.Merge(claim)
+		return
+	}
+	result := w.gaps.Commit(claim)
+	if w.tracker == nil {
+		return
+	}
+	// 只有 Commit 判定为可恢复的 scope 才拿到恢复证明；tracker 会再次校验 generation。
+	for _, scope := range result.RecoverableScopes {
+		generation, ok := result.CommittedGeneration(scope)
+		if !ok {
+			continue
+		}
+		w.tracker.ObserveGapCommit(scope, generation)
+	}
+}
+
+func (w *SessionOutcomeWriter) currentTime() time.Time {
+	if w.now != nil {
+		return w.now()
+	}
+	return time.Now()
+}
+
+// formatRequestOutcomeClosure 生成 AI 可读的单条闭环：触发原因与最终结果同一行。
+// 字段来自显式 allowlist，零值或无诊断价值的字段直接省略。
+func formatRequestOutcomeClosure(snapshot requestOutcomeSnapshot) string {
+	snapshot = snapshot.normalized()
+	var builder strings.Builder
+	builder.WriteString(outcomeDisplayTime(snapshot).Format("15:04:05"))
+	builder.WriteString(" #")
+	builder.WriteString(strconv.FormatUint(snapshot.RequestID, 10))
+	builder.WriteString(" 请求结果 event=")
+	builder.WriteString(sessionOutcomeEvent)
+	appendOutcomeField(&builder, "session", snapshot.SessionHash)
+	if snapshot.Eligibility != outcomeEligibilityEvaluable {
+		appendOutcomeField(&builder, "eligibility", string(snapshot.Eligibility))
+	}
+	appendOutcomeField(&builder, "trigger", closureTriggerToken(snapshot.TriggerReason))
+	if snapshot.PressureSource != pressureSourceUnknown {
+		appendOutcomeField(&builder, "pressure_source", string(snapshot.PressureSource))
+	}
+	if snapshot.RequiredWait > 0 || snapshot.ActualWaitKnown {
+		appendOutcomeField(&builder, "required_wait", snapshot.RequiredWait.String())
+		appendOutcomeField(&builder, "actual_wait", snapshot.ActualWait.String())
+		appendOutcomeField(&builder, "actual_wait_known", strconv.FormatBool(snapshot.ActualWaitKnown))
+	}
+	appendOutcomeField(&builder, "action", string(snapshot.Action))
+	if snapshot.BeforeMessages > 0 || snapshot.AfterMessages > 0 {
+		appendOutcomeField(&builder, "before_messages", strconv.Itoa(snapshot.BeforeMessages))
+		appendOutcomeField(&builder, "after_messages", strconv.Itoa(snapshot.AfterMessages))
+	}
+	if snapshot.BeforeTokens > 0 || snapshot.AfterTokens > 0 {
+		appendOutcomeField(&builder, "before_tokens", strconv.Itoa(snapshot.BeforeTokens))
+		appendOutcomeField(&builder, "after_tokens", strconv.Itoa(snapshot.AfterTokens))
+	}
+	appendOutcomeField(&builder, "upstream", string(snapshot.UpstreamState))
+	if snapshot.UpstreamStatus > 0 {
+		appendOutcomeField(&builder, "upstream_status", strconv.Itoa(snapshot.UpstreamStatus))
+	}
+	appendOutcomeField(&builder, "memory", string(snapshot.MemoryState))
+	appendOutcomeField(&builder, "disk", string(snapshot.DiskState))
+	if snapshot.FailureClass != persistenceFailureUnknown && snapshot.FailureClass != persistenceFailureNone {
+		appendOutcomeField(&builder, "failure", string(snapshot.FailureClass))
+	}
+	if snapshot.Intervention != interventionNone {
+		appendOutcomeField(&builder, "intervention", string(snapshot.Intervention))
+	}
+	return builder.String()
+}
+
+// formatOutcomeGapRecord 把一次 claim 渲染成一条 process 级摘要：逐 scope 保留
+// generation、数量、首尾短关联、时间范围与稳定原因；不含丢失明细、完整身份、
+// 正文、路径或 raw error。
+func formatOutcomeGapRecord(claim OutcomeGapClaim, at time.Time) string {
+	var builder strings.Builder
+	builder.WriteString(at.Format("15:04:05"))
+	builder.WriteString(" 详细记录缺口 event=")
+	builder.WriteString(sessionOutcomeGapEvent)
+	wrote := false
+	for index := range claim.Slots {
+		slot := claim.Slots[index]
+		if slot.Count == 0 {
+			continue
+		}
+		syncOutcomeGapSnapshotAliases(&slot)
+		prefix := string(slot.Scope)
+		if prefix == "" {
+			continue
+		}
+		appendOutcomeField(&builder, prefix+".generation", strconv.FormatUint(slot.Generation, 10))
+		appendOutcomeField(&builder, prefix+".count", strconv.FormatUint(slot.Count, 10))
+		appendOutcomeField(&builder, prefix+".first_session", slot.FirstShortHash)
+		appendOutcomeField(&builder, prefix+".first_request", strconv.FormatUint(slot.FirstRequestID, 10))
+		appendOutcomeField(&builder, prefix+".last_session", slot.LastShortHash)
+		appendOutcomeField(&builder, prefix+".last_request", strconv.FormatUint(slot.LastRequestID, 10))
+		appendOutcomeField(&builder, prefix+".from", slot.From.Local().Format("15:04:05"))
+		appendOutcomeField(&builder, prefix+".to", slot.To.Local().Format("15:04:05"))
+		appendOutcomeField(&builder, prefix+".reason", slot.Reason)
+		wrote = true
+	}
+	if !wrote {
+		return ""
+	}
+	return builder.String()
+}
+
+// closureTriggerToken 让“已评估但未触发”有稳定可读的取值，
+// 不与 TriggerReason 的空零值混淆。
+func closureTriggerToken(reason TriggerReason) string {
+	if reason == TriggerNone {
+		return "none"
+	}
+	return string(reason)
+}
+
+func appendOutcomeField(builder *strings.Builder, key, value string) {
+	if builder == nil || key == "" || value == "" {
+		return
+	}
+	builder.WriteByte(' ')
+	builder.WriteString(key)
+	builder.WriteByte('=')
+	builder.WriteString(value)
 }
