@@ -470,3 +470,79 @@ func TestTerminalOutcomeOverflowIsBestEffortOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionQueueFullEnteredOnceAndAcceptedDoesNotRecover(t *testing.T) {
+	terminal := &lockedBuffer{}
+	handler := NewLogHandler(terminal, slog.LevelInfo)
+	reporter := NewTerminalHealthReporter(handler)
+	tracker := NewHealthTracker(reporter)
+	gaps := NewOutcomeGapAccumulator()
+	sink := &fakeOutcomeSink{}
+
+	sessionEntered := make(chan struct{})
+	releaseSession := make(chan struct{})
+	var sessionOnce sync.Once
+	sink.setSessionHook(func() {
+		sessionOnce.Do(func() {
+			close(sessionEntered)
+			<-releaseSession
+		})
+	})
+	processEntered := make(chan struct{})
+	releaseProcess := make(chan struct{})
+	var processOnce sync.Once
+	sink.setProcessHook(func() {
+		processOnce.Do(func() {
+			close(processEntered)
+			<-releaseProcess
+		})
+	})
+
+	dispatcher := NewOutcomeDispatcher(OutcomeDispatcherOptions{
+		TerminalProjector: handler,
+		SessionProjector:  NewSessionOutcomeWriter(sink, gaps, tracker),
+		HealthTracker:     tracker,
+		Reporter:          reporter,
+		GapAccumulator:    gaps,
+	})
+	t.Cleanup(func() { _ = dispatcher.CloseAndDrain() })
+
+	dispatcher.TryDispatch(dispatcherTestSnapshot(1))
+	<-sessionEntered
+	rejected := 0
+	for i := 0; i < OutcomeDispatcherQueueCapacity+4; i++ {
+		if dispatcher.TryDispatch(dispatcherTestSnapshot(uint64(i + 2))).SessionRejected {
+			rejected++
+		}
+	}
+	if rejected < 3 {
+		t.Fatalf("队列饱和拒绝次数=%d，want >=3", rejected)
+	}
+	if got := countTerminalText(terminal.lines(), "详细记录暂时来不及保存"); got != 1 {
+		t.Fatalf("queue entered 提示=%d，want 1: %v", got, terminal.lines())
+	}
+
+	close(releaseSession)
+	<-processEntered
+	// 此刻：多次 accepted enqueue 已发生，一条普通 closure 也已成功写入，
+	// 但缺口摘要尚未落盘，queue scope 必须仍然退化。
+	if !tracker.IsDegraded(HealthScopeSessionQueueFull) {
+		t.Fatal("accepted enqueue 或普通 closure 写入伪造了 queue 恢复")
+	}
+	if got := countTerminalText(terminal.lines(), "详细记录已恢复保存"); got != 0 {
+		t.Fatalf("摘要落盘前出现恢复提示 %d 次", got)
+	}
+
+	close(releaseProcess)
+	waitForDispatcher(t, func() bool { return !tracker.IsDegraded(HealthScopeSessionQueueFull) })
+	if got := countTerminalText(terminal.lines(), "详细记录已恢复保存"); got != 1 {
+		t.Fatalf("queue recovered 提示=%d，want 1: %v", got, terminal.lines())
+	}
+	records := sink.process()
+	if len(records) != 1 {
+		t.Fatalf("process-level 摘要记录数=%d，want 1: %v", len(records), records)
+	}
+	if !strings.Contains(records[0], "event=outcome_gap") || !strings.Contains(records[0], "session_queue_full.count=") {
+		t.Fatalf("摘要缺少 queue 缺口证据: %q", records[0])
+	}
+}
