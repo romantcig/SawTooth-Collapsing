@@ -40,6 +40,7 @@ type ArchiveBlock struct {
 type ArchiveSummary struct {
 	ID               string   `json:"id"`
 	SessionID        string   `json:"session_id"`
+	HistoryEpoch     uint64   `json:"history_epoch"`
 	ContentHash      string   `json:"content_hash"`
 	BlockRangeStart  int      `json:"block_range_start"`
 	BlockRangeEnd    int      `json:"block_range_end"`
@@ -262,42 +263,55 @@ func (s *SQLiteStore) ensureArchiveSchema() error {
 	return nil
 }
 
-// SaveArchive 将 ArchiveBlock 及其关键词事务性写入 SQLite（D-10, D-15）。
-// 返回 error；调用方负责 graceful degradation（记录日志但不阻断请求）。
+// SaveArchive 是返回 error 的兼容 wrapper，只供尚未迁移的旧调用点使用。
+// 生产 durable-before-reference 路径必须使用 SaveArchiveResult 取得 canonical ID。
 func (s *SQLiteStore) SaveArchive(block ArchiveBlock) error {
+	_, err := s.SaveArchiveResult(block)
+	return err
+}
+
+// SaveArchiveResult 将 ArchiveBlock 及其关键词事务性写入 SQLite（D-10, D-15），
+// 并同步返回 canonical opaque ID：成功结果里的 ID 一定对应数据库中真实存在的行。
+// 内容身份冲突时返回既有行的 ID，而不是调用方新生成、未落库的 ID。
+// 返回的 error 只供日志使用；ArchiveCommitResult 是可外泄的受限事实。
+func (s *SQLiteStore) SaveArchiveResult(block ArchiveBlock) (ArchiveCommitResult, error) {
+	id, err := s.commitArchive(block)
+	if err != nil {
+		return ArchiveCommitResult{State: persistenceStateFailed, FailureClass: persistenceFailureArchive}, err
+	}
+	return ArchiveCommitResult{ID: id, State: persistenceStateSaved, FailureClass: persistenceFailureNone}, nil
+}
+
+func (s *SQLiteStore) commitArchive(block ArchiveBlock) (string, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return fmt.Errorf("开启事务失败: %w", err)
+		return "", fmt.Errorf("开启事务失败: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }() // Commit 后 Rollback 为 no-op
 
 	messagesJSON, err := json.Marshal(block.Messages)
 	if err != nil {
-		return fmt.Errorf("序列化消息失败: %w", err)
+		return "", fmt.Errorf("序列化消息失败: %w", err)
 	}
 	// 调用方提供的 hash 不可信；始终从实际正文重新计算。
 	block.ContentHash, err = archiveContentHash(block.Messages)
 	if err != nil {
-		return err
+		return "", err
 	}
 	historyEpoch := block.HistoryEpoch
 	if historyEpoch == 0 {
 		historyEpoch = 1
 	}
 
-	// 原子查询当前 session 的最大 epoch，防止迟到的旧 epoch Archive 绕过 visibility 门控（CR-01）。
-	var currentMaxEpoch uint64
-	err = tx.QueryRow(
-		`SELECT COALESCE(MAX(history_epoch), 0) FROM archive_blocks WHERE session_id = ?`,
-		block.SessionID,
-	).Scan(&currentMaxEpoch)
-	if err != nil && err != sql.ErrNoRows {
-		return fmt.Errorf("查询当前 epoch 失败: %w", err)
+	// 在同一事务内读取权威 history epoch 水位。archive_blocks 的 MAX(epoch)
+	// 不能充当水位：transition 提交后新 epoch 可能还没有任何 Archive 行，
+	// 那个窗口会让迟到的旧 epoch 写入蒙混过关（D-22）。
+	currentEpoch, err := currentHistoryEpochTx(tx, block.SessionID)
+	if err != nil {
+		return "", err
 	}
-	// 拒绝严格早于当前 max epoch 的迟到写入（epoch 切换后的并发请求）。
-	// 允许 historyEpoch == currentMaxEpoch（同 epoch 内的正常写入）。
-	if historyEpoch < currentMaxEpoch {
-		return fmt.Errorf("拒绝迟到 Archive 写入: block epoch=%d < current max=%d", historyEpoch, currentMaxEpoch)
+	if historyEpoch < currentEpoch {
+		return "", fmt.Errorf("拒绝迟到 Archive 写入: block epoch=%d < current epoch=%d", historyEpoch, currentEpoch)
 	}
 
 	result, err := tx.Exec(
@@ -312,14 +326,28 @@ func (s *SQLiteStore) SaveArchive(block ArchiveBlock) error {
 		string(messagesJSON), block.SummaryText, block.ContentHash, historyEpoch,
 	)
 	if err != nil {
-		return fmt.Errorf("插入 archive_block 失败: %w", err)
+		return "", fmt.Errorf("插入 archive_block 失败: %w", err)
 	}
 	inserted, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("读取 archive_block 插入结果失败: %w", err)
+		return "", fmt.Errorf("读取 archive_block 插入结果失败: %w", err)
 	}
 	if inserted == 0 {
-		return tx.Commit()
+		// 冲突可能来自内容身份，也可能来自调用方复用了已有主键。
+		// 只有内容身份命中才能证明既有行就是本次要引用的正文。
+		var canonicalID string
+		err = tx.QueryRow(
+			`SELECT id FROM archive_blocks
+			 WHERE session_id = ? AND block_range_start = ? AND block_range_end = ? AND content_hash = ?`,
+			block.SessionID, block.BlockRangeStart, block.BlockRangeEnd, block.ContentHash,
+		).Scan(&canonicalID)
+		if err != nil {
+			return "", fmt.Errorf("查询既有 archive_block canonical ID 失败: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return "", fmt.Errorf("提交 archive 事务失败: %w", err)
+		}
+		return canonicalID, nil
 	}
 
 	// 逐条插入关键词（触发器自动同步 FTS5）
@@ -329,11 +357,44 @@ func (s *SQLiteStore) SaveArchive(block ArchiveBlock) error {
 			block.ID, kw.Word, kw.Source,
 		)
 		if err != nil {
-			return fmt.Errorf("插入关键词失败: %w", err)
+			return "", fmt.Errorf("插入关键词失败: %w", err)
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("提交 archive 事务失败: %w", err)
+	}
+	return block.ID, nil
+}
+
+// archiveQuerier 让 epoch 水位读取在事务内外共用同一实现。
+type archiveQuerier interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+// currentHistoryEpochTx 读取权威 history state 中的当前 epoch。
+// 状态尚未落盘时返回 1：epoch 1 允许在初始 state 写入前建立。
+// 状态存在但无法解析时 fail closed——无法证明水位就不能放行写入。
+func currentHistoryEpochTx(q archiveQuerier, sessionID string) (uint64, error) {
+	var raw string
+	err := q.QueryRow(
+		`SELECT value FROM frozen_state WHERE key = ?`,
+		historyEpochPersistenceKey(sessionID),
+	).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 1, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("读取权威 history epoch 失败: %w", err)
+	}
+	var persisted historyEpochPersisted
+	if err := json.Unmarshal([]byte(raw), &persisted); err != nil {
+		return 0, fmt.Errorf("解析权威 history epoch 失败: %w", err)
+	}
+	if persisted.Epoch == 0 {
+		return 0, errors.New("权威 history epoch 为 0")
+	}
+	return persisted.Epoch, nil
 }
 
 // CommitHistoryTransition 在单一 SQLite transaction 内持久化 history state，
@@ -465,6 +526,9 @@ func (s *SQLiteStore) DeleteState(key string) error {
 // 将 CTE 扁平化回聚合上下文。
 // GROUP BY 主键 a.id 时其余 a.* 列函数依赖于主键（组内值一致），
 // SQLite 允许 bare columns，安全。
+// SearchArchives 是无 session 的兼容入口，只供旧调用点与测试使用。
+// 它跨 session 搜索并且不校验权威 epoch，因此生产召回禁止使用；
+// Plan 08 的 reexpand 必须改用 SearchVisibleArchives。
 func (s *SQLiteStore) SearchArchives(query string, limit int) ([]ArchiveSummary, error) {
 	if limit < 1 {
 		return nil, nil
@@ -478,7 +542,7 @@ func (s *SQLiteStore) SearchArchives(query string, limit int) ([]ArchiveSummary,
 		     FROM archive_keywords_fts
 		     WHERE archive_keywords_fts MATCH ?
 		 )
-		 SELECT a.id, a.session_id, COALESCE(a.content_hash, ''), a.block_range_start, a.block_range_end,
+		 SELECT a.id, a.session_id, a.history_epoch, COALESCE(a.content_hash, ''), a.block_range_start, a.block_range_end,
 		        a.message_count, a.estimated_tokens, a.summary_text, a.messages_json, a.created_at,
 		        GROUP_CONCAT(DISTINCT fts.keyword), COUNT(DISTINCT fts.keyword), SUM(fts.rank)
 		 FROM archive_blocks a
@@ -493,6 +557,80 @@ func (s *SQLiteStore) SearchArchives(query string, limit int) ([]ArchiveSummary,
 	if err != nil {
 		return nil, fmt.Errorf("搜索 archive 失败: %w", err)
 	}
+	return scanArchiveSummaries(rows)
+}
+
+// SearchVisibleArchives 是 production FTS 入口：必须显式给出 session，
+// 且只返回同 session、当前分支可见（isolated=0）、不晚于权威 epoch 的记录。
+// 排序、bm25 聚合与 limit 上限与旧入口完全一致，只是多了三道门禁。
+func (s *SQLiteStore) SearchVisibleArchives(sessionID, query string, limit int) ([]ArchiveSummary, error) {
+	if sessionID == "" || limit < 1 {
+		return nil, nil
+	}
+	if limit > 3 {
+		limit = 3
+	}
+	currentEpoch, err := currentHistoryEpochTx(s.db, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(
+		`WITH matched AS MATERIALIZED (
+		     SELECT rowid, keyword, bm25(archive_keywords_fts) AS rank
+		     FROM archive_keywords_fts
+		     WHERE archive_keywords_fts MATCH ?
+		 )
+		 SELECT a.id, a.session_id, a.history_epoch, COALESCE(a.content_hash, ''), a.block_range_start, a.block_range_end,
+		        a.message_count, a.estimated_tokens, a.summary_text, a.messages_json, a.created_at,
+		        GROUP_CONCAT(DISTINCT fts.keyword), COUNT(DISTINCT fts.keyword), SUM(fts.rank)
+		 FROM archive_blocks a
+		 JOIN archive_keywords k ON k.block_id = a.id
+		 JOIN matched fts ON fts.rowid = k.id
+		 WHERE a.isolated = 0 AND a.session_id = ? AND a.history_epoch <= ?
+		 GROUP BY a.id
+		 ORDER BY COUNT(DISTINCT fts.keyword) DESC, SUM(fts.rank) ASC, a.created_at DESC, a.id ASC
+		 LIMIT ?`,
+		query, sessionID, currentEpoch, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("搜索 archive 失败: %w", err)
+	}
+	return scanArchiveSummaries(rows)
+}
+
+// GetVisibleArchiveByID 是 production exact lookup：门禁与 SearchVisibleArchives
+// 完全一致，确保恢复 marker 指向的正文既属于本 session，也仍在当前分支上。
+func (s *SQLiteStore) GetVisibleArchiveByID(sessionID, id string) (ArchiveSummary, bool, error) {
+	if sessionID == "" || id == "" {
+		return ArchiveSummary{}, false, nil
+	}
+	currentEpoch, err := currentHistoryEpochTx(s.db, sessionID)
+	if err != nil {
+		return ArchiveSummary{}, false, err
+	}
+	var summary ArchiveSummary
+	err = s.db.QueryRow(
+		`SELECT id, session_id, history_epoch, COALESCE(content_hash, ''), block_range_start, block_range_end,
+		        message_count, estimated_tokens, summary_text, messages_json, created_at
+		 FROM archive_blocks
+		 WHERE id = ? AND session_id = ? AND isolated = 0 AND history_epoch <= ?`,
+		id, sessionID, currentEpoch,
+	).Scan(
+		&summary.ID, &summary.SessionID, &summary.HistoryEpoch, &summary.ContentHash,
+		&summary.BlockRangeStart, &summary.BlockRangeEnd,
+		&summary.MessageCount, &summary.EstimatedTokens,
+		&summary.SummaryText, &summary.MessagesJSON, &summary.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ArchiveSummary{}, false, nil
+	}
+	if err != nil {
+		return ArchiveSummary{}, false, fmt.Errorf("读取 archive 失败: %w", err)
+	}
+	return summary, true, nil
+}
+
+func scanArchiveSummaries(rows *sql.Rows) ([]ArchiveSummary, error) {
 	defer rows.Close()
 
 	var results []ArchiveSummary
@@ -500,7 +638,7 @@ func (s *SQLiteStore) SearchArchives(query string, limit int) ([]ArchiveSummary,
 		var summary ArchiveSummary
 		var matchedTerms string
 		if err := rows.Scan(
-			&summary.ID, &summary.SessionID, &summary.ContentHash,
+			&summary.ID, &summary.SessionID, &summary.HistoryEpoch, &summary.ContentHash,
 			&summary.BlockRangeStart, &summary.BlockRangeEnd,
 			&summary.MessageCount, &summary.EstimatedTokens,
 			&summary.SummaryText, &summary.MessagesJSON, &summary.CreatedAt,
