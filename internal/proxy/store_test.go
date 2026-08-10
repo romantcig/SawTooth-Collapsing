@@ -514,37 +514,297 @@ func TestSaveArchiveRejectsStaleEpochAfterTransition(t *testing.T) {
 		t.Fatalf("SaveArchive epoch=2 失败: %v", err)
 	}
 
-	// 模拟 epoch 切换到 3（CommitHistoryTransition）
-	transition := HistoryTransition{
-		SessionID:    "stale-session",
-		StateKey:     "history_epoch:stale-session",
-		StateValue:   `{"epoch":3,"valid":true}`,
-		CommonPrefix: 3,
-	}
-	if err := store.CommitHistoryTransition(transition); err != nil {
-		t.Fatalf("CommitHistoryTransition 失败: %v", err)
-	}
+	// 模拟 epoch 切换到 3：水位来自权威 history state，而不是 archive_blocks。
+	commitTestHistoryEpoch(t, store, "stale-session", 3, 3)
 
 	// 尝试写入迟到的 epoch 1 Archive（并发的旧请求）
 	staleBlock := archiveRangeTestBlock("block-stale", "stale-session", 6, 10, 1, "stale")
 	err = store.SaveArchive(staleBlock)
 	if err == nil {
-		t.Fatal("SaveArchive 应拒绝 epoch=1 < current=2 的迟到写入")
+		t.Fatal("SaveArchive 应拒绝 epoch=1 < current=3 的迟到写入")
 	}
-	if !strings.Contains(err.Error(), "拒绝迟到") && !strings.Contains(err.Error(), "block epoch=1 < current max=2") {
+	if !strings.Contains(err.Error(), "拒绝迟到") {
 		t.Fatalf("错误消息不符合预期: %v", err)
 	}
 
-	// 验证 epoch 2 的 Archive 仍可写入（同 epoch 内正常写入）
-	epoch2Block2 := archiveRangeTestBlock("block-epoch2-second", "stale-session", 11, 15, 2, "epoch two again")
-	if err := store.SaveArchive(epoch2Block2); err != nil {
-		t.Fatalf("SaveArchive epoch=2（同 epoch）应成功: %v", err)
+	// transition 已提交到 epoch 3 后，epoch 2 同样是迟到写入，必须一起拒绝。
+	epoch2Late := archiveRangeTestBlock("block-epoch2-late", "stale-session", 11, 15, 2, "epoch two again")
+	if err := store.SaveArchive(epoch2Late); err == nil {
+		t.Fatal("SaveArchive 应拒绝 epoch=2 < current=3 的迟到写入")
 	}
 
 	// 验证 epoch 3 的新 Archive 可写入
 	epoch3Block := archiveRangeTestBlock("block-epoch3", "stale-session", 16, 20, 3, "epoch three")
 	if err := store.SaveArchive(epoch3Block); err != nil {
 		t.Fatalf("SaveArchive epoch=3 应成功: %v", err)
+	}
+}
+
+// ── Task 3：权威 epoch 门禁、canonical ID 与 session-visible 读取 ──
+
+// commitTestHistoryEpoch 用权威 state key 提交一次 epoch 切换。
+func commitTestHistoryEpoch(t *testing.T, store *SQLiteStore, sessionID string, epoch uint64, commonPrefix int) {
+	t.Helper()
+	value, err := json.Marshal(historyEpochPersisted{
+		Version: historyEpochStateVersion, Epoch: epoch, Valid: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitHistoryTransition(HistoryTransition{
+		SessionID:    sessionID,
+		StateKey:     historyEpochPersistenceKey(sessionID),
+		StateValue:   string(value),
+		CommonPrefix: commonPrefix,
+	}); err != nil {
+		t.Fatalf("提交 epoch %d transition: %v", epoch, err)
+	}
+}
+
+func archiveRowExists(t *testing.T, store *SQLiteStore, id string) bool {
+	t.Helper()
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM archive_blocks WHERE id = ?`, id).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count > 0
+}
+
+func TestSaveArchiveUsesAuthoritativeHistoryEpoch(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "authoritative-epoch.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// 初始 state 尚未落盘时仍允许建立 epoch 1。
+	initial, err := store.SaveArchiveResult(archiveRangeTestBlock("initial", "epoch-session", 0, 1, 1, "initial"))
+	if err != nil {
+		t.Fatalf("初始 epoch 1 写入失败: %v", err)
+	}
+	if initial.State != persistenceStateSaved || initial.ID == "" {
+		t.Fatalf("初始 commit result=%+v", initial)
+	}
+
+	commitTestHistoryEpoch(t, store, "epoch-session", 2, 99)
+	current, err := store.SaveArchiveResult(archiveRangeTestBlock("epoch-two", "epoch-session", 2, 3, 2, "current"))
+	if err != nil || current.State != persistenceStateSaved {
+		t.Fatalf("epoch 2 写入=%+v err=%v", current, err)
+	}
+
+	// 水位来自权威 state：epoch 3 只存在于 state，archive_blocks 的 MAX(epoch) 仍是 2。
+	commitTestHistoryEpoch(t, store, "epoch-session", 3, 99)
+	var maxEpoch uint64
+	if err := store.db.QueryRow(`SELECT COALESCE(MAX(history_epoch), 0) FROM archive_blocks
+		WHERE session_id = 'epoch-session'`).Scan(&maxEpoch); err != nil {
+		t.Fatal(err)
+	}
+	if maxEpoch != 2 {
+		t.Fatalf("前置条件失效：archive MAX(epoch)=%d, want 2", maxEpoch)
+	}
+	late, err := store.SaveArchiveResult(archiveRangeTestBlock("late-epoch-two", "epoch-session", 4, 5, 2, "late"))
+	if err == nil {
+		t.Fatal("MAX(epoch) 仍是 2，但权威 epoch 已是 3，epoch 2 写入必须拒绝")
+	}
+	if late.State != persistenceStateFailed || late.FailureClass != persistenceFailureArchive {
+		t.Fatalf("拒绝结果=%+v, want failed/sqlite_archive", late)
+	}
+	if late.ID != "" {
+		t.Fatalf("失败结果携带了可用 ID: %q", late.ID)
+	}
+	if archiveRowExists(t, store, "late-epoch-two") {
+		t.Fatal("被拒绝的迟到写入仍留下了数据库行")
+	}
+}
+
+func TestSaveArchiveRejectsLateOldEpochWithoutNewArchiveRow(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "late-epoch.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	commitTestHistoryEpoch(t, store, "branch-session", 1, 99)
+	if _, err := store.SaveArchiveResult(archiveRangeTestBlock("epoch-one", "branch-session", 0, 2, 1, "epoch one")); err != nil {
+		t.Fatalf("epoch 1 写入失败: %v", err)
+	}
+
+	// 切到 epoch 2 并隔离旧分支；此时 epoch 2 尚无任何 Archive 行。
+	commitTestHistoryEpoch(t, store, "branch-session", 2, 0)
+	var epoch2Rows int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM archive_blocks
+		WHERE session_id = 'branch-session' AND history_epoch = 2`).Scan(&epoch2Rows); err != nil {
+		t.Fatal(err)
+	}
+	if epoch2Rows != 0 {
+		t.Fatalf("前置条件失效：epoch 2 已有 %d 行", epoch2Rows)
+	}
+
+	result, err := store.SaveArchiveResult(archiveRangeTestBlock("late-epoch-one", "branch-session", 3, 4, 1, "late"))
+	if err == nil {
+		t.Fatal("epoch 2 尚无 Archive 时，迟到 epoch 1 写入仍必须被同步拒绝")
+	}
+	if result.State != persistenceStateFailed || result.ID != "" {
+		t.Fatalf("迟到写入结果=%+v", result)
+	}
+	if archiveRowExists(t, store, "late-epoch-one") {
+		t.Fatal("被拒绝的迟到写入留下了数据库行")
+	}
+	summaries, err := store.SearchVisibleArchives("branch-session", `"late"`, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 0 {
+		t.Fatalf("被拒绝的迟到写入产生了可见记录: %+v", summaries)
+	}
+}
+
+func TestSaveArchiveReturnsCanonicalIDOnContentConflict(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "canonical-id.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	first := archiveRangeTestBlock("caller-generated-a", "conflict-session", 1, 4, 1, "same content")
+	second := archiveRangeTestBlock("caller-generated-b", "conflict-session", 1, 4, 1, "same content")
+
+	firstResult, err := store.SaveArchiveResult(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstResult.ID != first.ID || firstResult.State != persistenceStateSaved {
+		t.Fatalf("首次 commit result=%+v", firstResult)
+	}
+
+	secondResult, err := store.SaveArchiveResult(second)
+	if err != nil {
+		t.Fatalf("内容幂等冲突不应报错: %v", err)
+	}
+	if secondResult.State != persistenceStateSaved {
+		t.Fatalf("幂等冲突 state=%s, want saved", secondResult.State)
+	}
+	// 必须返回数据库中真实存在的既有行 ID，而不是调用方新生成、未落库的 ID。
+	if secondResult.ID != first.ID {
+		t.Fatalf("冲突返回 ID=%q, want 既有 canonical %q", secondResult.ID, first.ID)
+	}
+	if archiveRowExists(t, store, second.ID) {
+		t.Fatalf("调用方新 ID %q 被写入数据库", second.ID)
+	}
+	assertArchiveCounts(t, store, 1, len(first.Keywords))
+
+	got, found, err := store.GetVisibleArchiveByID("conflict-session", secondResult.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || got.ID != first.ID {
+		t.Fatalf("canonical ID 不可查询: found=%v got=%+v", found, got)
+	}
+	if got.HistoryEpoch != 1 {
+		t.Fatalf("ArchiveSummary.HistoryEpoch=%d, want 1", got.HistoryEpoch)
+	}
+}
+
+func TestGetVisibleArchiveByIDSessionAndBranchGate(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "visible-exact.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	commitTestHistoryEpoch(t, store, "visible-session", 2, 99)
+	for _, block := range []ArchiveBlock{
+		archiveRangeTestBlock("visible", "visible-session", 0, 1, 2, "visible body"),
+		archiveRangeTestBlock("old-branch", "visible-session", 2, 3, 2, "old branch body"),
+		archiveRangeTestBlock("other", "other-session", 0, 1, 1, "other session body"),
+	} {
+		if _, err := store.SaveArchiveResult(block); err != nil {
+			t.Fatalf("SaveArchiveResult(%s): %v", block.ID, err)
+		}
+	}
+	// 未来 epoch 行只能由旧库/旧写入产生；它晚于权威水位，必须不可见。
+	if _, err := store.db.Exec(`INSERT INTO archive_blocks
+		(id, session_id, block_range_start, block_range_end, message_count, estimated_tokens,
+		 messages_json, summary_text, created_at, content_hash, history_epoch, isolated)
+		VALUES ('future', 'visible-session', 4, 5, 2, 10, '[]', 'future body', datetime('now'), 'future-hash', 9, 0)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE archive_blocks SET isolated = 1 WHERE id = 'old-branch'`); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, found, err := store.GetVisibleArchiveByID("visible-session", "visible"); err != nil || !found || got.ID != "visible" {
+		t.Fatalf("同 session 当前分支记录不可见: found=%v got=%+v err=%v", found, got, err)
+	}
+	for name, lookup := range map[string][2]string{
+		"跨 session":    {"other-session", "visible"},
+		"跨 session 反向": {"visible-session", "other"},
+		"旧分支":          {"visible-session", "old-branch"},
+		"晚于权威 epoch":   {"visible-session", "future"},
+		"缺少 session":   {"", "visible"},
+		"不存在":          {"visible-session", "missing"},
+	} {
+		got, found, err := store.GetVisibleArchiveByID(lookup[0], lookup[1])
+		if err != nil {
+			t.Fatalf("%s 查询错误: %v", name, err)
+		}
+		if found {
+			t.Fatalf("%s 越过 visibility 门禁: %+v", name, got)
+		}
+	}
+}
+
+func TestSearchVisibleArchivesSessionAndBranchGate(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "visible-search-gate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	commitTestHistoryEpoch(t, store, "search-session", 2, 99)
+	mine := archiveRangeTestBlock("mine", "search-session", 0, 1, 2, "mine")
+	mine.Keywords = []KeywordEntry{{Word: "quasar", Source: "user_message"}}
+	stale := archiveRangeTestBlock("stale-branch", "search-session", 2, 3, 2, "stale")
+	stale.Keywords = []KeywordEntry{{Word: "quasar", Source: "user_message"}}
+	foreign := archiveRangeTestBlock("foreign", "foreign-session", 0, 1, 1, "foreign")
+	foreign.Keywords = []KeywordEntry{{Word: "quasar", Source: "user_message"}}
+	for _, block := range []ArchiveBlock{mine, stale, foreign} {
+		if _, err := store.SaveArchiveResult(block); err != nil {
+			t.Fatalf("SaveArchiveResult(%s): %v", block.ID, err)
+		}
+	}
+	if _, err := store.db.Exec(`UPDATE archive_blocks SET isolated = 1 WHERE id = 'stale-branch'`); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := store.SearchVisibleArchives("search-session", `"quasar"`, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].ID != "mine" {
+		t.Fatalf("session/visibility 门禁失效: %+v", results)
+	}
+	if results[0].HistoryEpoch != 2 {
+		t.Fatalf("ArchiveSummary.HistoryEpoch=%d, want 2", results[0].HistoryEpoch)
+	}
+	if results[0].SessionID != "search-session" {
+		t.Fatalf("返回了其他 session: %q", results[0].SessionID)
+	}
+
+	// 旧的无 session 入口仍能看到三条，证明新入口的门禁不是数据缺失造成的。
+	legacy, err := store.SearchArchives(`"quasar"`, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(legacy) != 2 {
+		t.Fatalf("旧入口结果=%d, want 2（isolated 之外的两条）", len(legacy))
+	}
+
+	if got, err := store.SearchVisibleArchives("", `"quasar"`, 3); err != nil || len(got) != 0 {
+		t.Fatalf("缺少 session 时结果=%+v err=%v", got, err)
+	}
+	if got, err := store.SearchVisibleArchives("foreign-session", `"quasar"`, 3); err != nil || len(got) != 1 || got[0].ID != "foreign" {
+		t.Fatalf("其他 session 只应看到自己的记录: %+v err=%v", got, err)
 	}
 }
 
