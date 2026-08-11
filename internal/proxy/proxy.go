@@ -223,10 +223,17 @@ type Server struct {
 	requestIdx        atomic.Uint64
 	debugLayout       *DebugLayout
 	debugRunID        string
+	// outcomeSink 是生产 wiring 注入的唯一 nonblocking dispatcher；每个请求的
+	// collector 共享同一个实例，不为请求创建 sink、goroutine 或队列。
+	outcomeSink outcomeDispatcher
 }
 
 func (s *Server) nextRequestMeta(requestSessionID string) *requestMeta {
-	return newRequestMetaWithRun(s.requestIdx.Add(1), requestSessionID, s.debugRunID)
+	meta := newRequestMetaWithRun(s.requestIdx.Add(1), requestSessionID, s.debugRunID)
+	if s.outcomeSink != nil {
+		meta.Outcome.SetDispatcher(s.outcomeSink)
+	}
+	return meta
 }
 
 // NewServer 创建代理服务实例。
@@ -627,6 +634,11 @@ func logHistoryMismatch(meta *requestMeta, decision HistoryEpochDecision) {
 func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	sessionID := extractSessionID(r)
 	meta := s.nextRequestMeta(sessionID)
+	// collector 在 meta 创建后的最早公共位置封口。defer 只做 seal：它不等待
+	// persistence receipt、不等待 dispatcher，也不启动任何 goroutine。
+	// 已登记的 one-shot completion 会在 handler 返回后自行补齐终态。
+	defer func() { _ = meta.Outcome.SealProducers() }()
+	outcome := meta.Outcome
 
 	requestSeq := 0
 
@@ -639,11 +651,17 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		r.Body.Close()
 		if err != nil {
 			meta.Logger.Error("读取请求体失败", "error", err)
+			outcome.SetAction(outcomeActionUnavailable)
+			outcome.SetIntervention(interventionRequired)
+			recordUpstreamOutcome(meta, upstreamStateNotStarted, 0)
 			http.Error(w, "Failed to read request body", http.StatusInternalServerError)
 			return
 		}
 		if len(body) > maxBodySize {
 			meta.Logger.Warn("请求体超限", "size", len(body))
+			outcome.SetAction(outcomeActionUnavailable)
+			outcome.SetIntervention(interventionRequired)
+			recordUpstreamOutcome(meta, upstreamStateNotStarted, 0)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusRequestEntityTooLarge)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "Request Entity Too Large"})
@@ -662,6 +680,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		var bodyMap map[string]json.RawMessage
 		if err := json.Unmarshal(body, &bodyMap); err != nil {
 			meta.Logger.Warn("无法解析请求体 JSON，跳过管线处理", "error", err)
+			outcome.SetAction(outcomeActionPassthrough)
 			r.Body = io.NopCloser(bytes.NewReader(body))
 			s.forwardRaw(w, r, meta)
 			return
@@ -671,6 +690,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		msgData, ok := bodyMap["messages"]
 		if !ok {
 			meta.Logger.Warn("请求体中缺少 messages 字段，原样转发")
+			outcome.SetAction(outcomeActionPassthrough)
 			r.Body = io.NopCloser(bytes.NewReader(body))
 			s.forwardRaw(w, r, meta)
 			return
@@ -678,6 +698,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		var messages []Message
 		if err := json.Unmarshal(msgData, &messages); err != nil {
 			meta.Logger.Warn("无法解析 messages 数组，原样转发", "error", err)
+			outcome.SetAction(outcomeActionPassthrough)
 			r.Body = io.NopCloser(bytes.NewReader(body))
 			s.forwardRaw(w, r, meta)
 			return
@@ -686,6 +707,9 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		auxiliary := classifyAuxiliaryRequest(bodyMap, messages)
 		if auxiliary.Kind == requestKindSessionTitle {
 			meta.RequestKind = auxiliary.Kind
+			// 辅助请求有自己的 AI 闭环，但绝不产生终端 ST 结果行。
+			outcome.SetTerminalEligible(false)
+			outcome.SetAction(outcomeActionPassthrough)
 			logAuxiliaryClassification(meta.auxiliaryLogger(), auxiliary, len(messages))
 			r.Body = io.NopCloser(bytes.NewReader(body))
 			s.forwardRaw(w, r, meta)
@@ -722,6 +746,8 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				"agent_reason", classification.Reason,
 				LogDim,
 			)
+			outcome.SetTerminalEligible(false)
+			outcome.SetAction(outcomeActionPassthrough)
 			newBody, err := rebuildBody(historyMessages)
 			if err != nil {
 				meta.Logger.Warn("Agent 请求体透明重建失败，回退原样转发", "error", err)
@@ -731,6 +757,9 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			s.forwardRaw(w, r, meta)
 			return
 		}
+
+		// 到这里请求已被显式分类为可跟踪主请求：终端 ST 结果行只对它启用。
+		outcome.SetTerminalEligible(true)
 
 		// History epoch gate：detach persistent context、清理已知 reminder 后，
 		// 在任何 request sequence、pressure、Frozen、Archive 或 Decay
@@ -750,6 +779,10 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				// 直接以本轮 raw history 直通，下一次请求可以重新读取。
 				meta.HistoryEpochReason = epochDecision.Reason
 				meta.HistoryReuseSafe = false
+				// history 读取失败下 ST 判定根本没发生：显式 unknown，不写 none。
+				outcome.SetTriggerReason(TriggerUnknown)
+				outcome.SetAction(outcomeActionFailClosed)
+				recordStateLoadFailure(meta, epochDecision.LoadFailure)
 				meta.Logger.Warn("历史状态读取失败，按 raw history 直通",
 					"failure_class", string(epochDecision.LoadFailure.Class),
 				)
@@ -778,6 +811,10 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				// 不得读取任何旧派生状态；直接以本轮 raw history 继续，
 				// 并让迟到响应因 IsCurrent 闸门保持无副作用。
 				meta.HistoryTransitionFailed = true
+				outcome.SetTriggerReason(TriggerUnknown)
+				outcome.SetAction(outcomeActionFailClosed)
+				outcome.SetFailureClass(persistenceFailureSQLite)
+				outcome.SetDiskState(persistenceStateFailed)
 				newBody, err := rebuildBody(historyMessages)
 				if err != nil {
 					meta.Logger.Warn("历史状态切换失败，原始请求体重建失败，回退原样转发", "error", err)
@@ -792,13 +829,13 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			// epoch 2+ 永不读取裸 key，避免已放弃分支重新进入当前主管线。
 			if epochDecision.Epoch == 1 {
 				if s.Sawtooth != nil {
-					s.Sawtooth.MigrateLegacyState(sessionID, stateKey)
+					recordStateLoadFailure(meta, s.Sawtooth.MigrateLegacyState(sessionID, stateKey))
 				}
 				if s.Frozen != nil {
-					s.Frozen.MigrateLegacyState(meta.Logger, sessionID, stateKey)
+					recordStateLoadFailure(meta, s.Frozen.MigrateLegacyState(meta.Logger, sessionID, stateKey))
 				}
 				if s.DecayTracker != nil {
-					s.DecayTracker.MigrateLegacyState(sessionID, stateKey)
+					recordStateLoadFailure(meta, s.DecayTracker.MigrateLegacyState(sessionID, stateKey))
 				}
 			}
 			if s.Sawtooth != nil {
@@ -813,7 +850,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		if s.HistoryEpoch != nil && !historyReuseSafe && !meta.HistoryEpochChanged {
 			if s.Frozen != nil {
-				s.Frozen.InvalidateWithLogger(meta.Logger, stateKey)
+				s.Frozen.InvalidateWithResult(meta.Logger, stateKey, beginStateCompletion(meta))
 			}
 			if s.Sawtooth != nil {
 				s.Sawtooth.ResetPressureBaseline(stateKey)
@@ -828,7 +865,9 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		threshold := s.Config.Stubify.TokenThreshold
 		baseline := pressureBaseline{}
 		if s.Sawtooth != nil && historyReuseSafe {
-			baseline = s.Sawtooth.PressureBaseline(stateKey)
+			loadedBaseline, baselineFailure := s.Sawtooth.PressureBaselineWithLoadResult(stateKey)
+			baseline = loadedBaseline
+			recordStateLoadFailure(meta, baselineFailure)
 		}
 		messages = historyMessages
 
@@ -862,11 +901,12 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		var frozenPrefixLen int
 		var frozenTokens int // YesMem shouldInvalidateFrozen: 存储 frozen prefix 的 token 估算
 		if s.Frozen != nil && historyReuseSafe {
-			result := s.Frozen.GetWithLogger(meta.Logger, stateKey, messages)
+			result, frozenFailure := s.Frozen.GetWithLoadResult(meta.Logger, stateKey, messages)
+			recordStateLoadFailure(meta, frozenFailure)
 			if result != nil {
 				if result.Cutoff <= 0 || result.Cutoff > len(messages) {
 					meta.Logger.Warn("frozen cutoff 非法，忽略状态", "cutoff", result.Cutoff, "message_count", len(messages))
-					s.Frozen.InvalidateWithLogger(meta.Logger, stateKey)
+					s.Frozen.InvalidateWithResult(meta.Logger, stateKey, beginStateCompletion(meta))
 					result = nil
 				}
 			}
@@ -884,14 +924,25 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// triggerEvaluation 保存本次 ST 判定实际使用的同锁快照；闭环记录只复制
+		// 它，绝不重新调用 ShouldTrigger、time.Since 或任何等待函数。
+		var triggerEvaluation TriggerEvaluation
 		selectPressure := func(candidate []Message) pressureDecision {
 			pressureMessages := finalizeMessages(candidate)
 			selected := buildPressureDecision(pressureMessages, bodyMap["system"], bodyMap["tools"], baseline, s.TokenCounter, threshold)
 			if s.Sawtooth != nil {
-				selected.TriggerReason = s.Sawtooth.ShouldTrigger(stateKey, selected.SelectedPressure)
-			} else if selected.SelectedPressure > threshold {
-				selected.TriggerReason = TriggerTokens
+				triggerEvaluation = s.Sawtooth.Evaluate(stateKey, selected.SelectedPressure, time.Now())
+			} else {
+				triggerEvaluation = TriggerEvaluation{
+					Reason:           TriggerNone,
+					SelectedPressure: selected.SelectedPressure,
+					TokenThreshold:   threshold,
+				}
+				if selected.SelectedPressure > threshold {
+					triggerEvaluation.Reason = TriggerTokens
+				}
 			}
+			selected.TriggerReason = triggerEvaluation.Reason
 			if s.HistoryEpoch != nil && !historyReuseSafe && !meta.HistoryEpochChanged {
 				selected.ResetReason = baselineResetMessagesChanged
 			}
@@ -911,7 +962,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					"threshold", threshold,
 					LogGreen,
 				)
-				s.Frozen.InvalidateWithLogger(meta.Logger, stateKey)
+				s.Frozen.InvalidateWithResult(meta.Logger, stateKey, beginStateCompletion(meta))
 				messages = originalMessages
 				frozenRawCutoff = 0
 				frozenPrefixLen = 0
@@ -928,6 +979,12 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		meta.PressureDecision = decision
+		// ST 判定至此已完成：eligibility、reason、压力来源与等待事实一次性写入
+		// closure，全部直接复制同锁 evaluation。
+		outcome.SetEligibility(outcomeEligibilityEvaluable)
+		outcome.SetTriggerReason(decision.TriggerReason)
+		outcome.SetPressureSource(decision.Source)
+		outcome.SetWait(triggerEvaluation.RequiredWait, triggerEvaluation.ActualWait, triggerEvaluation.ActualWaitKnown)
 		s.writePressureDecisionDebugFacts(meta, rawTimestamp)
 		logPressureSummary(meta)
 
@@ -944,6 +1001,10 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			recallOutcome = s.searchAndExpand(messages, reExpandBudget, meta)
 			messages = recallOutcome.Messages
 		}
+		outcome.SetRecallCounts(
+			boolToRecallAttempts(recallOutcome.Attempted),
+			recallOutcome.Candidates, recallOutcome.Selected, recallOutcome.Injected, recallOutcome.Discarded,
+		)
 
 		// 召回后的消息才是最终压缩输入；Frozen 失效分支不再重跑召回。
 		totalTokens = contextTokens + s.TokenCounter.CountMessagesTokens(messages)
@@ -1027,7 +1088,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					// 折叠后消息数组完全重建（indices 0:blank, 1:archive, 2+:tail），
 					// 旧 indices 不再有效。
 					if s.DecayTracker != nil {
-						s.DecayTracker.ClearSession(stateKey)
+						s.DecayTracker.ClearSessionWithResult(stateKey, beginStateCompletion(meta))
 					}
 
 					// 重建请求体
@@ -1052,13 +1113,18 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 							frozenPrefixLen = len(messages)
 							s.applyCacheControl(messages, frozenPrefixLen, sessionID)
 							compressedTokens := s.TokenCounter.CountMessagesTokens(messages)
-							s.Frozen.StoreWithLogger(meta.Logger, stateKey, messages, rawCutoff, rawBoundary, compressedTokens, rawEstimate, rawHistory)
+							s.Frozen.StoreWithResult(meta.Logger, stateKey, messages, rawCutoff, rawBoundary, compressedTokens, rawEstimate, beginStateCompletion(meta), rawHistory)
 						}
 					}
 
+					outcome.SetAction(outcomeActionCollapse)
+					s.recordOutcomeSizes(meta, rawCutoff, rawEstimate, messages)
 					newBody, err := rebuildBody(messages)
 					if err != nil {
 						meta.Logger.Error("重建折叠后请求体失败", "error", err)
+						outcome.SetAction(outcomeActionUnavailable)
+						outcome.SetIntervention(interventionRequired)
+						recordUpstreamOutcome(meta, upstreamStateNotStarted, 0)
 						http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 						return
 					}
@@ -1135,7 +1201,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 					frozenPrefixLen = len(messages)
 					s.applyCacheControl(messages, frozenPrefixLen, sessionID)
 					compressedTokens := s.TokenCounter.CountMessagesTokens(messages)
-					s.Frozen.StoreWithLogger(meta.Logger, stateKey, messages, rawCutoff, rawBoundary, compressedTokens, rawEstimate, rawHistory)
+					s.Frozen.StoreWithResult(meta.Logger, stateKey, messages, rawCutoff, rawBoundary, compressedTokens, rawEstimate, beginStateCompletion(meta), rawHistory)
 				} else {
 					s.applyCacheControl(messages, frozenPrefixLen, sessionID)
 				}
@@ -1143,9 +1209,21 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				s.applyCacheControl(messages, frozenPrefixLen, sessionID)
 			}
 
+			// fallback 与 compact 是两种不同的用户可见动作：只有真的合并出摘要块
+			// 才叫 compact，否则如实记为改用备用方式整理。
+			if len(compactedBlocks) > 0 {
+				outcome.SetAction(outcomeActionCompact)
+			} else {
+				outcome.SetAction(outcomeActionFallback)
+			}
+			s.recordOutcomeSizes(meta, rawCutoff, rawEstimate, messages)
+
 			newBody, err := rebuildBody(messages)
 			if err != nil {
 				meta.Logger.Error("重建请求体失败", "error", err)
+				outcome.SetAction(outcomeActionUnavailable)
+				outcome.SetIntervention(interventionRequired)
+				recordUpstreamOutcome(meta, upstreamStateNotStarted, 0)
 				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 				return
 			}
@@ -1165,6 +1243,13 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 			// pair repair 之后统一处理 frozen boundary。
 			s.applyCacheControl(messages, frozenPrefixLen, sessionID)
+			// 未触发整理：注入过归档内容才算轻度整理，否则是直接发送。
+			if recallOutcome.Injected > 0 {
+				outcome.SetAction(outcomeActionLight)
+			} else {
+				outcome.SetAction(outcomeActionDirect)
+			}
+			s.recordOutcomeSizes(meta, rawCutoff, rawEstimate, messages)
 			if newBody, err := rebuildBody(messages); err == nil {
 				r.Body = io.NopCloser(bytes.NewReader(newBody))
 			} else {
@@ -1220,6 +1305,29 @@ func (s *Server) searchAndExpand(messages []Message, budget *Budget, meta *reque
 		return s.searchAndExpandFn(messages, s.Store, s.Config.Stubify.TokenThreshold, s.TokenCounter, budget, meta)
 	}
 	return searchAndExpandWithMeta(messages, s.Store, s.Config.Stubify.TokenThreshold, s.TokenCounter, budget, meta)
+}
+
+// recordOutcomeSizes 记录本次实际执行路径的 before/after 事实。
+// before 使用原始 history 坐标，after 使用即将发往上游的最终消息。
+func (s *Server) recordOutcomeSizes(meta *requestMeta, beforeMessages, beforeTokens int, after []Message) {
+	outcome := requestOutcome(meta)
+	if outcome == nil {
+		return
+	}
+	afterTokens := 0
+	if s.TokenCounter != nil {
+		afterTokens = s.TokenCounter.CountMessagesTokens(after)
+	}
+	outcome.SetSizes(beforeMessages, len(after), beforeTokens, afterTokens)
+}
+
+// boolToRecallAttempts 把「是否尝试过召回」表达为受限计数，避免 collector
+// 为一个布尔新增字段。
+func boolToRecallAttempts(attempted bool) int {
+	if attempted {
+		return 1
+	}
+	return 0
 }
 
 // applyCacheControl 执行 cache_control 四步处理（Phase 4, D-09/D-10）。

@@ -622,30 +622,60 @@ func applyOutcomeCompletionLocked(snapshot *requestOutcomeSnapshot, kind outcome
 	result.FailureClass = normalizeFailureClass(result.FailureClass)
 	result.MemoryState = normalizePersistenceState(result.MemoryState)
 	result.DiskState = normalizePersistenceState(result.DiskState)
-	if result.FailureClass != persistenceFailureUnknown && result.FailureClass != persistenceFailureNone {
-		snapshot.FailureClass = result.FailureClass
-	}
+	applied := false
 	switch normalizeCompletionKind(kind) {
 	case outcomeCompletionKindMemory:
-		if result.MemoryState != persistenceStateUnknown {
-			snapshot.MemoryState = result.MemoryState
-		} else if result.State != persistenceStateUnknown {
-			snapshot.MemoryState = result.State
-		}
+		applied = mergeOutcomePersistenceState(&snapshot.MemoryState, pickCompletionState(result.MemoryState, result.State))
 	case outcomeCompletionKindDisk, outcomeCompletionKindSQLite:
-		if result.DiskState != persistenceStateUnknown {
-			snapshot.DiskState = result.DiskState
-		} else if result.State != persistenceStateUnknown {
-			snapshot.DiskState = result.State
-		}
+		applied = mergeOutcomePersistenceState(&snapshot.DiskState, pickCompletionState(result.DiskState, result.State))
 	default:
-		if result.MemoryState != persistenceStateUnknown {
-			snapshot.MemoryState = result.MemoryState
+		if mergeOutcomePersistenceState(&snapshot.MemoryState, result.MemoryState) {
+			applied = true
 		}
-		if result.DiskState != persistenceStateUnknown {
-			snapshot.DiskState = result.DiskState
+		if mergeOutcomePersistenceState(&snapshot.DiskState, result.DiskState) {
+			applied = true
 		}
 	}
+	// failure class 只跟随真正被采纳的那个结果；否则一次 not_attempted 的迟到
+	// completion 会把上一次真实 failed 的类别覆盖掉。
+	if applied && result.FailureClass != persistenceFailureUnknown && result.FailureClass != persistenceFailureNone {
+		snapshot.FailureClass = result.FailureClass
+	}
+}
+
+func pickCompletionState(specific, generic persistenceState) persistenceState {
+	if specific != persistenceStateUnknown {
+		return specific
+	}
+	return generic
+}
+
+// outcomePersistenceSeverity 让同一请求内的多次 persistence completion 形成
+// 单调聚合：更严重的结果不会被随后的 not_attempted 或 saved 抹掉。
+func outcomePersistenceSeverity(value persistenceState) int {
+	switch value {
+	case persistenceStateNotAttempted:
+		return 1
+	case persistenceStateSaved:
+		return 2
+	case persistenceStateUnavailable:
+		return 3
+	case persistenceStateFailed:
+		return 4
+	default:
+		return 0
+	}
+}
+
+func mergeOutcomePersistenceState(target *persistenceState, next persistenceState) bool {
+	if target == nil || next == persistenceStateUnknown {
+		return false
+	}
+	if outcomePersistenceSeverity(next) < outcomePersistenceSeverity(*target) {
+		return false
+	}
+	*target = next
+	return true
 }
 
 func normalizeOutcomeEligibility(value outcomeEligibility) outcomeEligibility {
@@ -744,4 +774,56 @@ func nonNegativeOutcomeInt(value int) int {
 		return 0
 	}
 	return value
+}
+
+// ── request 生命周期接线辅助 ──
+//
+// 这些 helper 只做 nil 防御和 typed 转写；它们不启动 goroutine、不等待任何
+// sink，也不猜测未知事实。
+
+// requestOutcome 返回请求 collector；零值/未接线 meta 返回 nil，所有 setter 均 nil-safe。
+func requestOutcome(meta *requestMeta) *requestOutcomeCollector {
+	if meta == nil {
+		return nil
+	}
+	return meta.Outcome
+}
+
+// beginStateCompletion 只在确实要发起一次普通 state 持久化前登记 completion。
+// 返回 nil 表示 collector 已封口——调用方照常提交，只是结果不再进入本次 closure。
+func beginStateCompletion(meta *requestMeta) *outcomeCompletion {
+	outcome := requestOutcome(meta)
+	if outcome == nil {
+		return nil
+	}
+	completion, err := outcome.BeginAsyncResult(outcomeCompletionKindSQLite)
+	if err != nil {
+		return nil
+	}
+	return completion
+}
+
+// recordUpstreamOutcome 固定一次上游终态；status <= 0 时不改写已知状态码。
+func recordUpstreamOutcome(meta *requestMeta, state upstreamState, status int) {
+	outcome := requestOutcome(meta)
+	if outcome == nil {
+		return
+	}
+	outcome.SetUpstreamState(state)
+	if status > 0 {
+		outcome.SetUpstreamStatus(status)
+	}
+}
+
+// recordStateLoadFailure 把四个状态组件的读取失败原样写进同一 closure。
+// 读取失败是磁盘事实，不是冷启动 missing，因此使用 sqlite failure class。
+func recordStateLoadFailure(meta *requestMeta, failure StateLoadFailure) {
+	if !failure.Failed {
+		return
+	}
+	outcome := requestOutcome(meta)
+	if outcome == nil {
+		return
+	}
+	outcome.SetFailureClass(persistenceFailureSQLite)
 }

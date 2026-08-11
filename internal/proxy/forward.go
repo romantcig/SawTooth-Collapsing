@@ -479,11 +479,17 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 	_ = r.Body.Close()
 	if err != nil {
 		logger.Error("读取请求体失败", "error", err)
+		requestOutcome(meta).SetAction(outcomeActionUnavailable)
+		requestOutcome(meta).SetIntervention(interventionRequired)
+		recordUpstreamOutcome(meta, upstreamStateNotStarted, 0)
 		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
 		return
 	}
 	if len(body) > maxBodySize {
 		logger.Warn("请求体超限", "size", len(body))
+		requestOutcome(meta).SetAction(outcomeActionUnavailable)
+		requestOutcome(meta).SetIntervention(interventionRequired)
+		recordUpstreamOutcome(meta, upstreamStateNotStarted, 0)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusRequestEntityTooLarge)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "Request Entity Too Large"})
@@ -517,6 +523,8 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 	upstreamReq, err := http.NewRequestWithContext(upstreamContext, r.Method, targetURL, bytes.NewReader(body))
 	if err != nil {
 		logUpstreamFailure(logger, "创建上游请求失败", err, upstreamStartedAt, tracker, "upstream_transport", stream, false)
+		recordUpstreamOutcome(meta, upstreamStateTransportFailure, 0)
+		requestOutcome(meta).SetFailureClass(persistenceFailureUpstream)
 		writeGatewayJSON(w, http.StatusBadGateway, "failed to create upstream request")
 		return
 	}
@@ -538,6 +546,8 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 	if err != nil {
 		decision := classifyUpstreamFailure(r.Context(), upstreamContext, tracker, nil, err, stream)
 		logUpstreamFailure(logger, "上游请求失败", err, upstreamStartedAt, tracker, decision.timeoutSource, stream, false)
+		recordUpstreamOutcome(meta, upstreamFailureState(decision, false, upstreamStateTransportFailure), 0)
+		requestOutcome(meta).SetFailureClass(persistenceFailureUpstream)
 		if decision.silent {
 			return
 		}
@@ -572,10 +582,42 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 
 	decision := classifyUpstreamFailure(r.Context(), upstreamContext, tracker, resp.Body, result.err, stream)
 	logUpstreamFailure(logger, "读取上游响应失败", result.err, upstreamStartedAt, tracker, decision.timeoutSource, stream, result.committed)
+	// 超时是比 handler 内部记录的 body/committed 失败更精确的事实，因此在这里
+	// 覆盖；非超时分类保持 handler 已固定的终态不变。
+	if state, ok := upstreamTimeoutState(decision); ok {
+		recordUpstreamOutcome(meta, state, resp.StatusCode)
+	}
 	if decision.silent || result.committed {
 		return
 	}
 	writeClassifiedGatewayError(w, decision, "failed to read upstream response", false)
+}
+
+// upstreamTimeoutState 把 classifyUpstreamFailure 的 timeout source 映射为受限终态。
+// 只有真正的超时/下游取消才返回 ok；其余分类由调用方保留自己的默认终态。
+func upstreamTimeoutState(decision upstreamFailureDecision) (upstreamState, bool) {
+	switch decision.timeoutSource {
+	case "downstream_context":
+		return upstreamStateUnavailable, true
+	case "proxy_hard_limit":
+		return upstreamStateHardTimeout, true
+	case "response_idle_timeout":
+		return upstreamStateIdleTimeout, true
+	case "stream_header_timeout", "non_stream_header_timeout":
+		return upstreamStateHeaderTimeout, true
+	default:
+		return upstreamStateUnknown, false
+	}
+}
+
+func upstreamFailureState(decision upstreamFailureDecision, committed bool, fallback upstreamState) upstreamState {
+	if state, ok := upstreamTimeoutState(decision); ok {
+		return state
+	}
+	if committed {
+		return upstreamStateCommittedFailure
+	}
+	return fallback
 }
 
 // markForwardedPressureCoordinates 将 pressure baseline 的坐标绑定到真正发送给上游的
@@ -820,9 +862,14 @@ func cloneResponseHeader(header http.Header) http.Header {
 func (s *Server) handleNon2xx(w http.ResponseWriter, resp *http.Response, meta *requestMeta, timestamp time.Time, model string, messageCount int) upstreamResponseResult {
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		recordUpstreamOutcome(meta, upstreamStateBodyReadFailure, resp.StatusCode)
+		requestOutcome(meta).SetFailureClass(persistenceFailureUpstream)
 		return upstreamResponseResult{err: err}
 	}
 	meta.Logger.Warn("上游返回非 2xx", "status", resp.StatusCode)
+	// 非 2xx 是明确的上游失败，绝不能因为下游成功写出而记成 success。
+	recordUpstreamOutcome(meta, upstreamStateNon2xx, resp.StatusCode)
+	requestOutcome(meta).SetFailureClass(persistenceFailureUpstream)
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(respBody)
@@ -929,6 +976,7 @@ func (state *sseBaselineState) complete() bool {
 func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *requestMeta, timestamp time.Time, model string, messageCount int) upstreamResponseResult {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		recordUpstreamOutcome(meta, upstreamStateUnavailable, resp.StatusCode)
 		return upstreamResponseResult{err: errors.New("ResponseWriter 不支持 Flush")}
 	}
 
@@ -938,6 +986,8 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 	if manualGzip {
 		gzReader, err := gzip.NewReader(resp.Body)
 		if err != nil {
+			recordUpstreamOutcome(meta, upstreamStateBodyReadFailure, resp.StatusCode)
+			requestOutcome(meta).SetFailureClass(persistenceFailureUpstream)
 			return upstreamResponseResult{err: fmt.Errorf("SSE gzip 解压失败: %w", err)}
 		}
 		defer gzReader.Close()
@@ -1016,10 +1066,14 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 		downstreamHeaders = cloneResponseHeader(w.Header())
 	}
 	s.writeFullBodyDebugWithSnapshots(meta, timestamp, debugBodyStageResponse, []byte(fullResponse.String()), resp.Header, downstreamHeaders, model, messageCount)
+	// scanner 必须完整结束、且下游写入没有失败，才允许标记 success。
 	if err := scanner.Err(); err != nil {
+		recordUpstreamOutcome(meta, sseInterruptedState(committed), resp.StatusCode)
+		requestOutcome(meta).SetFailureClass(persistenceFailureUpstream)
 		return upstreamResponseResult{err: err, committed: committed}
 	}
 	if downstreamErr != nil {
+		recordUpstreamOutcome(meta, sseInterruptedState(committed), resp.StatusCode)
 		return upstreamResponseResult{err: downstreamErr, committed: committed}
 	}
 	if baselineState.complete() {
@@ -1029,7 +1083,16 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 	if !committed {
 		commit()
 	}
+	recordUpstreamOutcome(meta, upstreamStateSuccess, resp.StatusCode)
 	return upstreamResponseResult{committed: true}
+}
+
+// sseInterruptedState 区分「已经把字节交给客户端后中断」与「一个字节都没提交」。
+func sseInterruptedState(committed bool) upstreamState {
+	if committed {
+		return upstreamStateCommittedFailure
+	}
+	return upstreamStateBodyReadFailure
 }
 
 // processSSEEvent 处理单个 SSE 事件。
@@ -1115,6 +1178,8 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *re
 	if manualGzip {
 		gzReader, err := gzip.NewReader(resp.Body)
 		if err != nil {
+			recordUpstreamOutcome(meta, upstreamStateBodyReadFailure, resp.StatusCode)
+			requestOutcome(meta).SetFailureClass(persistenceFailureUpstream)
 			return upstreamResponseResult{err: fmt.Errorf("JSON gzip 解压失败: %w", err)}
 		}
 		defer gzReader.Close()
@@ -1123,6 +1188,8 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *re
 
 	respBody, err := io.ReadAll(bodyReader)
 	if err != nil {
+		recordUpstreamOutcome(meta, upstreamStateBodyReadFailure, resp.StatusCode)
+		requestOutcome(meta).SetFailureClass(persistenceFailureUpstream)
 		return upstreamResponseResult{err: err}
 	}
 	codingChanged := manualGzip || resp.Uncompressed
@@ -1165,11 +1232,14 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *re
 	// 步骤 5: Debug 写 JSON 响应
 	s.writeFullBodyDebugWithSnapshots(meta, timestamp, debugBodyStageResponse, respBody, resp.Header, downstreamHeaders, model, messageCount)
 	if writeErr != nil {
+		// 响应已提交，失败只属于下游写入；绝不能记成 upstream success。
+		recordUpstreamOutcome(meta, upstreamStateCommittedFailure, resp.StatusCode)
 		return upstreamResponseResult{
 			err:          writeErr,
 			committed:    true,
 			failureClass: downstreamWriteFailureClass,
 		}
 	}
+	recordUpstreamOutcome(meta, upstreamStateSuccess, resp.StatusCode)
 	return upstreamResponseResult{committed: true}
 }

@@ -2310,7 +2310,9 @@ func TestRequestOutcomeActionMatrix(t *testing.T) {
 
 	t.Run("fallback", func(t *testing.T) {
 		server, sink := newOutcomePipelineServer(t, upstream.URL)
-		server.Config.Collapse.Enabled = false
+		// keepRecent 覆盖整个 history 时 CalcCollapseCutoff 无解，主路径必然
+		// 退到 stubify+decay fallback。
+		server.Config.Stubify.KeepRecent = 200
 		serveOutcomeMessages(t, server, "outcome-fallback", pipelineMessages(80, 260))
 		snapshot := sink.sole(t)
 		if snapshot.Action != outcomeActionFallback && snapshot.Action != outcomeActionCompact {
