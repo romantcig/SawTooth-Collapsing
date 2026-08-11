@@ -2136,6 +2136,34 @@ func (b *blockingStateBackend) PersistState(string, string) error { return b.run
 
 func (b *blockingStateBackend) DeleteState(string) error { return b.run() }
 
+// saturatePersistenceQueue 让 writer 队列稳定处于满载：先确保一个 op 已被 worker
+// 取走并阻塞（同 ordering key 因此不会再被调度），再把队列精确补到容量。
+// 直接连续提交 capacity+1 个 op 是有竞态的——worker 可能在提交途中取走一个，
+// 留下一个空位让被测请求的普通 state op 被接受并永久阻塞。
+func saturatePersistenceQueue(t *testing.T, writer *PersistenceWriter, backend *blockingStateBackend) {
+	t.Helper()
+	const key = "frozen:saturate"
+	submit := func() (PersistenceReceipt, error) {
+		return writer.TrySubmit(PersistenceOp{
+			Target: PersistenceTargetState, Kind: PersistenceOpPut,
+			OrderingKey: key, Key: key, Value: "v",
+		})
+	}
+	if receipt, err := submit(); err != nil || !receipt.Accepted {
+		t.Fatalf("首个饱和 op receipt=%+v err=%v", receipt, err)
+	}
+	<-backend.started
+	for index := 0; index < PersistenceWriterQueueCapacity; index++ {
+		receipt, err := submit()
+		if err != nil || !receipt.Accepted {
+			t.Fatalf("第 %d 个饱和 op 应在容量内被接受: receipt=%+v err=%v", index, receipt, err)
+		}
+	}
+	if got := writer.QueueLength(); got != PersistenceWriterQueueCapacity {
+		t.Fatalf("饱和后 queue 深度=%d, want %d", got, PersistenceWriterQueueCapacity)
+	}
+}
+
 func newOutcomePipelineServer(t *testing.T, upstreamURL string) (*Server, *recordingOutcomeDispatcher) {
 	t.Helper()
 	server := newPipelineTestServer(t, upstreamURL)
@@ -2437,14 +2465,7 @@ func TestRequestOutcomePersistenceCompletion(t *testing.T) {
 		backend := newBlockingStateBackend()
 		backend.block()
 		writer, _, reporter := newPersistenceWriterTest(t, backend)
-		for index := 0; index <= PersistenceWriterQueueCapacity; index++ {
-			if _, err := writer.TrySubmit(PersistenceOp{
-				Target: PersistenceTargetState, Kind: PersistenceOpPut,
-				OrderingKey: "frozen:saturate", Key: "frozen:saturate", Value: "v",
-			}); err != nil {
-				t.Fatalf("预填充 queue: %v", err)
-			}
-		}
+		saturatePersistenceQueue(t, writer, backend)
 		defer func() {
 			backend.release()
 			_ = writer.CloseAndDrain()
@@ -2741,14 +2762,7 @@ func TestArchiveStateQueueFullDoesNotAffectCommit(t *testing.T) {
 	backend := newBlockingStateBackend()
 	backend.block()
 	writer, _, _ := newPersistenceWriterTest(t, backend)
-	for index := 0; index <= PersistenceWriterQueueCapacity; index++ {
-		if _, err := writer.TrySubmit(PersistenceOp{
-			Target: PersistenceTargetState, Kind: PersistenceOpPut,
-			OrderingKey: "frozen:saturate", Key: "frozen:saturate", Value: "v",
-		}); err != nil {
-			t.Fatalf("预填充 queue: %v", err)
-		}
-	}
+	saturatePersistenceQueue(t, writer, backend)
 	defer func() {
 		backend.release()
 		_ = writer.CloseAndDrain()
