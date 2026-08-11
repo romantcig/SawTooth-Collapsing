@@ -848,3 +848,46 @@ func collapseTextMessages(count, words int) []Message {
 	}
 	return messages
 }
+
+// ── Plan 06 Task 2：Collapse 只消费已提交的 canonical Archive ID ──
+
+func TestCollapseArchiveCoverage(t *testing.T) {
+	tc := mustTokenCounter(t)
+	messages := collapseTextMessages(20, 80)
+	original := deepCopyMessages(messages)
+	cutoff := 12
+
+	plan := PlanCollapse(messages, original, cutoff, tc, "collapse-archive-session")
+	if !plan.Valid() {
+		t.Fatal("合法 cutoff 应产生 collapse 意图")
+	}
+	if plan.Block.ID == "" || len(plan.Block.Messages) != cutoff {
+		t.Fatalf("archive intent 无效: id=%q messages=%d", plan.Block.ID, len(plan.Block.Messages))
+	}
+
+	if _, ok := plan.Materialize(""); ok {
+		t.Fatal("canonical ID 为空时不得物化折叠")
+	}
+
+	collapsed, ok := plan.Materialize("canonical-collapse-id")
+	if !ok {
+		t.Fatal("已落库 canonical ID 应可物化折叠")
+	}
+	if len(collapsed) != 2+len(messages)-cutoff {
+		t.Fatalf("折叠后消息数=%d, want %d", len(collapsed), 2+len(messages)-cutoff)
+	}
+	marker := allText(t, collapsed[1])
+	if !strings.Contains(marker, "recover('canonical-collapse-id')") {
+		t.Fatalf("归档摘要缺少 canonical 恢复引用: %s", marker)
+	}
+	// marker 必须落在 Stage-1/2 截断裁不掉的受保护位置（archive 摘要消息本体）。
+	if !strings.Contains(marker, "Archived messages") {
+		t.Fatalf("恢复引用未与归档摘要同处一条受保护消息: %s", marker)
+	}
+	// 恢复引用只暴露不透明 ID，不得泄漏 session、路径或原文。
+	for _, secret := range []string{"collapse-archive-session", "collapse-text-"} {
+		if strings.Contains(marker, secret) {
+			t.Fatalf("恢复引用泄漏 %q: %s", secret, marker)
+		}
+	}
+}

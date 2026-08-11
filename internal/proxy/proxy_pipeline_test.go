@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -2488,6 +2489,369 @@ func TestPressureAndUsageFactsRemain(t *testing.T) {
 		id, _ := fact["request_id"].(float64)
 		if uint64(id) != snapshot.RequestID {
 			t.Fatalf("%s facts request_id=%v, want %d", name, fact["request_id"], snapshot.RequestID)
+		}
+	}
+}
+
+// ── Plan 06 Task 2：Archive durable gate、消息上限与两个压缩开关 ──
+
+// countingStateLoader 统计四个组件对 SQLite 的读取次数，用于证明「拒绝前零副作用」。
+type countingStateLoader struct {
+	mu    sync.Mutex
+	calls int
+	inner StateLoader
+}
+
+func (l *countingStateLoader) LoadStateResult(key string) StateLoadResult {
+	l.mu.Lock()
+	l.calls++
+	l.mu.Unlock()
+	if l.inner == nil {
+		return StateLoadResult{}
+	}
+	return l.inner.LoadStateResult(key)
+}
+
+func (l *countingStateLoader) count() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.calls
+}
+
+func installCountingLoaders(server *Server) *countingStateLoader {
+	loader := &countingStateLoader{inner: server.Store}
+	server.HistoryEpoch.SetStateLoader(loader)
+	server.Frozen.SetStateLoader(loader)
+	server.Sawtooth.SetStateLoader(loader)
+	server.DecayTracker.SetStateLoader(loader)
+	return loader
+}
+
+// failingArchiveCommitter 让同步 Archive 提交稳定失败，用于证明不产生悬空 marker。
+type failingArchiveCommitter struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *failingArchiveCommitter) SaveArchiveResult(ArchiveBlock) (ArchiveCommitResult, error) {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+	return ArchiveCommitResult{State: persistenceStateFailed, FailureClass: persistenceFailureArchive},
+		errors.New("forced archive failure")
+}
+
+func (c *failingArchiveCommitter) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+// capturingUpstream 记录最终发往上游的 messages。
+func capturingUpstream(t *testing.T, captured *[][]Message) *httptest.Server {
+	t.Helper()
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []Message `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			mu.Lock()
+			*captured = append(*captured, body.Messages)
+			mu.Unlock()
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":1200,"output_tokens":7}}`))
+	}))
+	t.Cleanup(upstream.Close)
+	return upstream
+}
+
+func joinedMessageText(t *testing.T, messages []Message) string {
+	t.Helper()
+	var builder strings.Builder
+	for _, message := range messages {
+		builder.WriteString(allText(t, message))
+		builder.WriteString("\n")
+	}
+	return builder.String()
+}
+
+// archiveRecoveryIDsIn 从最终 wire 文本中提取全部 canonical 恢复引用。
+// 它复用生产 marker 前缀常量，因此 marker 格式变化会立刻反映到断言上。
+func archiveRecoveryIDsIn(text string) []string {
+	var ids []string
+	rest := text
+	for {
+		index := strings.Index(rest, archiveRecoveryMarkerPrefix)
+		if index < 0 {
+			return ids
+		}
+		rest = rest[index+len(archiveRecoveryMarkerPrefix):]
+		end := strings.Index(rest, "')")
+		if end < 0 {
+			return ids
+		}
+		if id := rest[:end]; id != "" {
+			ids = append(ids, id)
+		}
+		rest = rest[end+2:]
+	}
+}
+
+func TestTooManyMessagesRejectedBeforeStateSideEffects(t *testing.T) {
+	upstream := jsonOutcomeUpstream(t)
+
+	for _, tc := range []struct {
+		count      int
+		wantStatus int
+	}{
+		{9999, http.StatusOK},
+		{10000, http.StatusOK},
+		{10001, http.StatusRequestEntityTooLarge},
+		{10002, http.StatusRequestEntityTooLarge},
+	} {
+		t.Run(strconv.Itoa(tc.count), func(t *testing.T) {
+			server, sink := newOutcomePipelineServer(t, upstream.URL)
+			// 阈值放到不可能触发的高度，把本用例限定在「消息数上限」这一件事上。
+			server.Config.Stubify.TokenThreshold = 50_000_000
+			loader := installCountingLoaders(server)
+			sessionID := "too-many-" + strconv.Itoa(tc.count)
+
+			recorder := serveOutcomeMessages(t, server, sessionID, pipelineMessages(tc.count, 1))
+			if recorder.Code != tc.wantStatus {
+				t.Fatalf("status=%d, want %d body=%s", recorder.Code, tc.wantStatus, recorder.Body.String())
+			}
+			if tc.wantStatus != http.StatusRequestEntityTooLarge {
+				if loader.count() == 0 {
+					t.Fatal("上限内请求未走正常状态路径")
+				}
+				return
+			}
+			if !strings.Contains(recorder.Body.String(), "too_many_messages") {
+				t.Fatalf("拒绝响应缺少稳定原因: %s", recorder.Body.String())
+			}
+			if loader.count() != 0 {
+				t.Fatalf("拒绝前读取了 %d 次状态", loader.count())
+			}
+			if got := server.Sawtooth.GetRequestSeq(sessionID); got != 0 {
+				t.Fatalf("拒绝前推进了 request sequence: %d", got)
+			}
+			if got := archiveCount(t, server.Store); got != 0 {
+				t.Fatalf("拒绝前写了 %d 条 Archive", got)
+			}
+			snapshot := sink.sole(t)
+			if snapshot.Action != outcomeActionFailClosed || snapshot.UpstreamState != upstreamStateNotStarted {
+				t.Fatalf("outcome=%s/%s, want fail_closed/not_started", snapshot.Action, snapshot.UpstreamState)
+			}
+			if snapshot.TerminalEligibility != outcomeEligibilityTerminalEligible {
+				t.Fatalf("terminal_eligibility=%s, want terminal_eligible", snapshot.TerminalEligibility)
+			}
+		})
+	}
+}
+
+func TestArchiveMarkerOnlyAfterDurableCommit(t *testing.T) {
+	var captured [][]Message
+	upstream := capturingUpstream(t, &captured)
+	server, _ := newOutcomePipelineServer(t, upstream.URL)
+
+	const sessionID = "archive-durable-session"
+	serveOutcomeMessages(t, server, sessionID, pipelineMessages(80, 260))
+	if len(captured) != 1 {
+		t.Fatalf("上游收到 %d 个请求, want 1", len(captured))
+	}
+	text := joinedMessageText(t, captured[0])
+	ids := archiveRecoveryIDsIn(text)
+	if len(ids) == 0 {
+		t.Fatalf("折叠后未产生 canonical 恢复引用: %s", text)
+	}
+	for _, id := range ids {
+		summary, found, err := server.Store.GetVisibleArchiveByID(sessionID, id)
+		if err != nil {
+			t.Fatalf("按 canonical ID 查询失败: %v", err)
+		}
+		if !found {
+			t.Fatalf("恢复引用 %q 在同 session/当前分支不可见", id)
+		}
+		if summary.MessagesJSON == "" || summary.SessionID != sessionID {
+			t.Fatalf("canonical 引用未指向本 session 原文: %+v", summary)
+		}
+	}
+}
+
+func TestArchiveFailurePreservesOriginalOrFailsClosed(t *testing.T) {
+	t.Run("optional_compression_preserves_original", func(t *testing.T) {
+		var captured [][]Message
+		upstream := capturingUpstream(t, &captured)
+		server, _ := newOutcomePipelineServer(t, upstream.URL)
+		committer := &failingArchiveCommitter{}
+		server.archiveCommitter = committer
+
+		messages := pipelineMessages(80, 260)
+		recorder := serveOutcomeMessages(t, server, "archive-fail-preserve", messages)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200 body=%s", recorder.Code, recorder.Body.String())
+		}
+		if committer.count() == 0 {
+			t.Fatal("未尝试同步 Archive 提交")
+		}
+		if len(captured) != 1 {
+			t.Fatalf("上游收到 %d 个请求, want 1", len(captured))
+		}
+		text := joinedMessageText(t, captured[0])
+		if strings.Contains(text, "recover('") {
+			t.Fatalf("Archive 失败仍产生了恢复引用: %s", text)
+		}
+		if len(captured[0]) != len(messages) {
+			t.Fatalf("Archive 失败仍执行了破坏性折叠: %d, want %d", len(captured[0]), len(messages))
+		}
+		if got := archiveCount(t, server.Store); got != 0 {
+			t.Fatalf("失败提交仍写入 %d 条 Archive", got)
+		}
+	})
+
+	t.Run("mandatory_compression_fails_closed", func(t *testing.T) {
+		var captured [][]Message
+		upstream := capturingUpstream(t, &captured)
+		server, _ := newOutcomePipelineServer(t, upstream.URL)
+		server.archiveCommitter = &failingArchiveCommitter{}
+		// 阈值压到很低，使本轮压力越过 emergency 线：不压缩就一定超限。
+		server.Config.Stubify.TokenThreshold = 1000
+		server.Sawtooth = NewSawtoothTrigger(time.Minute, 1000, 500)
+
+		recorder := serveOutcomeMessages(t, server, "archive-fail-closed", pipelineMessages(80, 260))
+		if recorder.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status=%d, want 503 body=%s", recorder.Code, recorder.Body.String())
+		}
+		if !strings.Contains(recorder.Body.String(), "archive_persistence_unavailable") {
+			t.Fatalf("失败响应缺少稳定原因: %s", recorder.Body.String())
+		}
+		if len(captured) != 0 {
+			t.Fatalf("信息已损失仍发出了 %d 个上游请求", len(captured))
+		}
+	})
+}
+
+func TestArchiveStateQueueFullDoesNotAffectCommit(t *testing.T) {
+	var captured [][]Message
+	upstream := capturingUpstream(t, &captured)
+	server, sink := newOutcomePipelineServer(t, upstream.URL)
+
+	backend := newBlockingStateBackend()
+	backend.block()
+	writer, _, _ := newPersistenceWriterTest(t, backend)
+	for index := 0; index <= PersistenceWriterQueueCapacity; index++ {
+		if _, err := writer.TrySubmit(PersistenceOp{
+			Target: PersistenceTargetState, Kind: PersistenceOpPut,
+			OrderingKey: "frozen:saturate", Key: "frozen:saturate", Value: "v",
+		}); err != nil {
+			t.Fatalf("预填充 queue: %v", err)
+		}
+	}
+	defer func() {
+		backend.release()
+		_ = writer.CloseAndDrain()
+	}()
+	server.Frozen.SetStateSubmitter(writer)
+	server.DecayTracker.SetStateSubmitter(writer)
+
+	const sessionID = "archive-queue-full-session"
+	serveOutcomeMessages(t, server, sessionID, pipelineMessages(80, 260))
+	if got := archiveCount(t, server.Store); got == 0 {
+		t.Fatal("state queue 满时 Archive 被一起丢弃")
+	}
+	if len(captured) != 1 {
+		t.Fatalf("上游收到 %d 个请求, want 1", len(captured))
+	}
+	if ids := archiveRecoveryIDsIn(joinedMessageText(t, captured[0])); len(ids) == 0 {
+		t.Fatal("state queue 满时恢复引用消失")
+	}
+	// 普通 state 仍是非阻塞 best-effort：本请求的磁盘结果必须如实是 unavailable。
+	snapshot := sink.waitFor(t, 1)[0]
+	if snapshot.DiskState != persistenceStateUnavailable {
+		t.Fatalf("disk_state=%s, want unavailable", snapshot.DiskState)
+	}
+}
+
+func TestArchiveReturnsCanonicalIDOnConflict(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "conflict.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	messages := pipelineMessages(6, 4)
+	first := ArchiveBlock{
+		ID: "first-id", SessionID: "conflict-session", HistoryEpoch: 1,
+		BlockRangeStart: 1, BlockRangeEnd: 5, MessageCount: len(messages),
+		Messages: messages, SummaryText: "summary",
+	}
+	firstResult, err := store.SaveArchiveResult(first)
+	if err != nil || firstResult.State != persistenceStateSaved || firstResult.ID != "first-id" {
+		t.Fatalf("首次提交=%+v err=%v", firstResult, err)
+	}
+
+	second := first
+	second.ID = "second-id"
+	secondResult, err := store.SaveArchiveResult(second)
+	if err != nil {
+		t.Fatalf("内容相同的重复提交应成功: %v", err)
+	}
+	if secondResult.ID != "first-id" {
+		t.Fatalf("冲突返回 ID=%q, want 既有 canonical ID first-id", secondResult.ID)
+	}
+	if _, found, err := store.GetVisibleArchiveByID("conflict-session", secondResult.ID); err != nil || !found {
+		t.Fatalf("canonical ID 不可按同 session 找回: found=%v err=%v", found, err)
+	}
+	if _, found, _ := store.GetVisibleArchiveByID("other-session", secondResult.ID); found {
+		t.Fatal("canonical ID 跨 session 可见")
+	}
+}
+
+func TestCollapseEnabledOnlyControlsPrimary(t *testing.T) {
+	var captured [][]Message
+	upstream := capturingUpstream(t, &captured)
+	server, sink := newOutcomePipelineServer(t, upstream.URL)
+	server.Config.Collapse.Enabled = false
+
+	serveOutcomeMessages(t, server, "collapse-disabled-session", pipelineMessages(80, 260))
+	snapshot := sink.sole(t)
+	if snapshot.Action == outcomeActionCollapse {
+		t.Fatal("collapse.enabled=false 时主 Collapse 仍被执行")
+	}
+	if snapshot.Action != outcomeActionFallback && snapshot.Action != outcomeActionCompact {
+		t.Fatalf("action=%s, want fallback 或 compact", snapshot.Action)
+	}
+	if len(captured) != 1 {
+		t.Fatalf("上游收到 %d 个请求, want 1", len(captured))
+	}
+
+	// 开关打开时同一负载走主 Collapse。
+	enabledServer, enabledSink := newOutcomePipelineServer(t, upstream.URL)
+	serveOutcomeMessages(t, enabledServer, "collapse-enabled-session", pipelineMessages(80, 260))
+	if got := enabledSink.sole(t).Action; got != outcomeActionCollapse {
+		t.Fatalf("collapse.enabled=true 时 action=%s, want collapse", got)
+	}
+}
+
+func TestCompactDisabledUsesSafePlan(t *testing.T) {
+	var captured [][]Message
+	upstream := capturingUpstream(t, &captured)
+	server, _ := newOutcomePipelineServer(t, upstream.URL)
+	server.Config.Collapse.Enabled = false
+	server.Config.Collapse.CompactEnabled = false
+
+	serveOutcomeMessages(t, server, "compact-disabled-session", pipelineMessages(80, 260))
+	if len(captured) != 1 {
+		t.Fatalf("上游收到 %d 个请求, want 1", len(captured))
+	}
+	for index, message := range captured[0] {
+		if len(bytes.TrimSpace(message.Content)) == 0 {
+			t.Fatalf("compact_enabled=false 产生了空正文消息 #%d", index)
+		}
+		if text := strings.TrimSpace(allText(t, message)); text == "" && !bytes.Contains(message.Content, []byte("tool_")) {
+			t.Fatalf("compact_enabled=false 产生了 Stage-3 空正文消息 #%d: %s", index, message.Content)
 		}
 	}
 }

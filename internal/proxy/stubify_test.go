@@ -756,3 +756,44 @@ func TestTruncateRunesCutAfterClosedBlockNoAppend(t *testing.T) {
 			strings.Count(result, "```"), result)
 	}
 }
+
+// ── Plan 06 Task 2：fallback 破坏性替换的受保护 opaque Archive marker ──
+
+func TestStubifyArchiveCoverage(t *testing.T) {
+	tc := mustTokenCounter(t)
+	body := strings.Repeat("stubbable tool output line\n", 200)
+	messages := []Message{
+		{Role: "user", Content: mustMarshal("head")},
+		{Role: "assistant", Content: rebuildContent([]ContentBlock{
+			{Type: "tool_use", ID: "tool_s", Name: "Read", Input: map[string]any{"file_path": "/app/main.go"}},
+		}, true)},
+		{Role: "user", Content: rebuildContent([]ContentBlock{
+			{Type: "tool_result", ToolUseID: "tool_s", Content: body},
+		}, true)},
+		{Role: "assistant", Content: mustMarshal(strings.Repeat("assistant tail ", 200))},
+	}
+
+	withoutRef, _ := stubifyMessages(messages, tc, "", 0, false, nil, "stub-archive", 1, 0.0, 1)
+	joined := ""
+	for _, message := range withoutRef {
+		joined += allText(t, message)
+	}
+	if !strings.Contains(joined, "[tool result archived]") {
+		t.Fatalf("fixture 未触发 tool_result 桩化: %s", joined)
+	}
+	if strings.Contains(joined, "recover('") {
+		t.Fatalf("没有 canonical ID 时不得出现恢复引用: %s", joined)
+	}
+
+	withRef, _ := stubifyMessages(messages, tc, "", 0, false, nil, "stub-archive", 1, 0.0, 1, "canonical-stub-id")
+	joined = ""
+	for _, message := range withRef {
+		joined += allText(t, message)
+	}
+	if !strings.Contains(joined, "[tool result archived] → recover('canonical-stub-id')") {
+		t.Fatalf("桩化标记缺少 canonical 恢复引用: %s", joined)
+	}
+	if strings.Contains(joined, "stub-archive") {
+		t.Fatalf("恢复引用泄漏 session: %s", joined)
+	}
+}

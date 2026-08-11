@@ -755,3 +755,66 @@ func jsonEqual(a, b json.RawMessage) bool {
 	bb, _ := json.Marshal(b)
 	return string(aa) == string(bb)
 }
+
+// ── Plan 06 Task 2：CompressContext 两阶段 destructive intent / materialize ──
+
+func TestCompressContextArchiveCoverage(t *testing.T) {
+	tc := mustTokenCounter(t)
+	longText := strings.Repeat("compressible tool output line\n", 400)
+	messages := []Message{
+		{Role: "user", Content: mustMarshal("head")},
+		{Role: "assistant", Content: rebuildContent([]ContentBlock{
+			{Type: "tool_use", ID: "tool_a", Name: "Read", Input: map[string]any{"file_path": "/app/main.go"}},
+		}, true)},
+		{Role: "user", Content: rebuildContent([]ContentBlock{
+			{Type: "tool_result", ToolUseID: "tool_a", Content: longText},
+		}, true)},
+		{Role: "assistant", Content: mustMarshal("tail-1")},
+		{Role: "user", Content: mustMarshal("tail-2")},
+	}
+
+	plan := PlanCompressContext(messages, 1, tc)
+	if !plan.Destructive() {
+		t.Fatal("大 tool_result 应产生破坏性压缩意图")
+	}
+	if len(plan.ArchiveMessages()) == 0 {
+		t.Fatal("destructive intent 必须携带待归档原文")
+	}
+	if plan.ArchiveCount() <= 0 {
+		t.Fatalf("archive count=%d, want > 0", plan.ArchiveCount())
+	}
+
+	// canonical ID 为空 = Archive 未落库：绝不物化替换，原文必须原样保留。
+	preserved, result, ok := plan.Materialize("")
+	if ok {
+		t.Fatal("空 canonical ID 不得物化破坏性替换")
+	}
+	if result.ToolResultsCompressed != 0 {
+		t.Fatalf("未落库仍统计了压缩: %+v", result)
+	}
+	if !strings.Contains(allText(t, preserved[2]), "compressible tool output line") {
+		t.Fatalf("Archive 未落库时原文被破坏: %s", allText(t, preserved[2]))
+	}
+
+	compressed, result, ok := plan.Materialize("canonical-compress-id")
+	if !ok || result.ToolResultsCompressed == 0 {
+		t.Fatalf("落库后应物化压缩: ok=%v result=%+v", ok, result)
+	}
+	text := allText(t, compressed[2])
+	if strings.Contains(text, "compressible tool output line\ncompressible") {
+		t.Fatalf("tool_result 未被压缩: %s", text)
+	}
+	if !strings.Contains(text, "recover('canonical-compress-id')") {
+		t.Fatalf("压缩占位符缺少 canonical 恢复引用: %s", text)
+	}
+
+	// 无破坏性替换时不得凭空产生 Archive 意图。
+	plain := []Message{
+		{Role: "user", Content: mustMarshal("a")},
+		{Role: "assistant", Content: mustMarshal("b")},
+		{Role: "user", Content: mustMarshal("c")},
+	}
+	if PlanCompressContext(plain, 1, tc).Destructive() {
+		t.Fatal("无可压缩内容却报告破坏性意图")
+	}
+}
