@@ -914,3 +914,457 @@ func frozenTestMessages(count int) []Message {
 	}
 	return messages
 }
+
+// ── Plan 12.1-05：error-aware StateLoader 与 result-bearing persistence ──
+
+// stateLoaderFunc 让测试用闭包实现 Plan 04 的 StateLoader 合同。
+type stateLoaderFunc func(key string) StateLoadResult
+
+func (f stateLoaderFunc) LoadStateResult(key string) StateLoadResult { return f(key) }
+
+// stateLoadErrorCases 是三类必须与 missing 严格区分的真实读取失败。
+func stateLoadErrorCases() map[string]StateLoadResult {
+	return map[string]StateLoadResult{
+		"closed": {Err: ErrStateLoadClosed, FailureClass: StateLoadFailureSQLiteClosed},
+		"busy":   {Err: ErrStateLoadBusy, FailureClass: StateLoadFailureSQLiteBusy},
+		"query":  {Err: ErrStateLoadQueryFailed, FailureClass: StateLoadFailureQueryFailed},
+	}
+}
+
+// reentrantStateSubmitter 在提交路径上回读组件状态。若组件在自己的 mutex 内
+// 调用 submit，这次回读会自锁死，因此它是"锁外提交"的可执行证据。
+type reentrantStateSubmitter struct {
+	inner StateSubmitter
+	probe func()
+}
+
+func (s reentrantStateSubmitter) TrySubmit(op PersistenceOp) (PersistenceReceipt, error) {
+	s.probe()
+	return s.inner.TrySubmit(op)
+}
+
+// runWithinTimeout 把"可能自锁死"的调用变成可失败断言而不是挂起。
+func runWithinTimeout(t *testing.T, name string, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s 超时：提交很可能发生在组件 mutex 内", name)
+	}
+}
+
+func TestFrozenStateLoaderMissingVsError(t *testing.T) {
+	const threadID = "frozen-loader-truth"
+	current := frozenTestMessages(3)
+
+	t.Run("missing", func(t *testing.T) {
+		frozen := NewFrozenStubs()
+		calls := 0
+		frozen.SetStateLoader(stateLoaderFunc(func(string) StateLoadResult {
+			calls++
+			return StateLoadResult{}
+		}))
+		result, failure := frozen.GetWithLoadResult(nil, threadID, current)
+		if result != nil || failure.Failed {
+			t.Fatalf("missing 应是正常冷启动: result=%+v failure=%+v", result, failure)
+		}
+		frozen.mu.RLock()
+		loaded, found := frozen.loadedFromDB[threadID], frozen.stateFoundDB[threadID]
+		frozen.mu.RUnlock()
+		if !loaded || found {
+			t.Fatalf("missing 后 loaded=%v found=%v, want true/false", loaded, found)
+		}
+		frozen.GetWithLoadResult(nil, threadID, current)
+		if calls != 1 {
+			t.Fatalf("missing 是终态，却查询了 %d 次", calls)
+		}
+	})
+
+	for name, failureResult := range stateLoadErrorCases() {
+		t.Run(name, func(t *testing.T) {
+			frozen := NewFrozenStubs()
+			calls := 0
+			frozen.SetStateLoader(stateLoaderFunc(func(string) StateLoadResult {
+				calls++
+				return failureResult
+			}))
+			result, failure := frozen.GetWithLoadResult(nil, threadID, current)
+			if result != nil {
+				t.Fatalf("读取失败不得返回 frozen prefix: %+v", result)
+			}
+			if !failure.Failed || failure.Class != failureResult.FailureClass {
+				t.Fatalf("failure=%+v, want class %q", failure, failureResult.FailureClass)
+			}
+			frozen.mu.RLock()
+			loaded, found := frozen.loadedFromDB[threadID], frozen.stateFoundDB[threadID]
+			frozen.mu.RUnlock()
+			if loaded || found {
+				t.Fatalf("读取失败被当成冷启动 missing: loaded=%v found=%v", loaded, found)
+			}
+			frozen.GetWithLoadResult(nil, threadID, current)
+			if calls != 2 {
+				t.Fatalf("读取失败后不可重试，查询次数=%d", calls)
+			}
+		})
+	}
+}
+
+func TestFrozenStateLoaderFailClosedAndRetry(t *testing.T) {
+	const threadID = "frozen-loader-retry"
+	raw := frozenTestMessages(4)
+	var persisted string
+	producer := NewFrozenStubs()
+	producer.SetPersistFunc(func(_ string, value string) { persisted = value })
+	producer.Store(threadID, deepCopyMessages(raw[:2]), 3, raw[2], 20, 30)
+	if persisted == "" {
+		t.Fatal("producer 未产出持久化状态")
+	}
+
+	var calls int64
+	restored := NewFrozenStubs()
+	restored.SetStateLoader(stateLoaderFunc(func(string) StateLoadResult {
+		if atomic.AddInt64(&calls, 1) == 1 {
+			return StateLoadResult{Err: ErrStateLoadBusy, FailureClass: StateLoadFailureSQLiteBusy}
+		}
+		return StateLoadResult{Value: persisted, Found: true}
+	}))
+	if result, failure := restored.GetWithLoadResult(nil, threadID, raw); result != nil || !failure.Failed {
+		t.Fatalf("busy 时应 fail closed: result=%+v failure=%+v", result, failure)
+	}
+	result, failure := restored.GetWithLoadResult(nil, threadID, raw)
+	if failure.Failed || result == nil || result.Cutoff != 3 || len(result.Messages) != 2 {
+		t.Fatalf("后续成功读取未恢复状态: result=%+v failure=%+v", result, failure)
+	}
+	if got := atomic.LoadInt64(&calls); got != 2 {
+		t.Fatalf("loader 调用次数=%d, want 2", got)
+	}
+
+	// 并发等待方共享同一次失败结果，而不是把 error 悄悄折叠成 missing。
+	blocked := NewFrozenStubs()
+	loadStarted := make(chan struct{})
+	releaseLoad := make(chan struct{})
+	var blockedCalls int64
+	blocked.SetStateLoader(stateLoaderFunc(func(string) StateLoadResult {
+		if atomic.AddInt64(&blockedCalls, 1) == 1 {
+			close(loadStarted)
+			<-releaseLoad
+		}
+		return StateLoadResult{Err: ErrStateLoadClosed, FailureClass: StateLoadFailureSQLiteClosed}
+	}))
+	failures := make(chan StateLoadFailure, 2)
+	go func() {
+		_, got := blocked.GetWithLoadResult(nil, threadID, raw)
+		failures <- got
+	}()
+	<-loadStarted
+	go func() {
+		_, got := blocked.GetWithLoadResult(nil, threadID, raw)
+		failures <- got
+	}()
+	select {
+	case got := <-failures:
+		t.Fatalf("并发等待方在加载完成前返回: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseLoad)
+	for i := 0; i < 2; i++ {
+		got := <-failures
+		if !got.Failed || got.Class != StateLoadFailureSQLiteClosed {
+			t.Fatalf("并发等待方 failure=%+v, want closed", got)
+		}
+	}
+	if got := atomic.LoadInt64(&blockedCalls); got != 1 {
+		t.Fatalf("并发冷启动查询 %d 次, want 1", got)
+	}
+}
+
+func TestFrozenMigrationTargetErrorStopsLegacy(t *testing.T) {
+	const sessionID = "frozen-migrate"
+	stateKey := historyEpochStateKey(sessionID, 1)
+	raw := frozenTestMessages(4)
+	var legacyValue string
+	producer := NewFrozenStubs()
+	producer.SetPersistFunc(func(_ string, value string) { legacyValue = value })
+	producer.Store(sessionID, deepCopyMessages(raw[:2]), 3, raw[2], 20, 30)
+	if legacyValue == "" {
+		t.Fatal("producer 未产出 legacy 状态")
+	}
+
+	for name, failureResult := range stateLoadErrorCases() {
+		t.Run(name, func(t *testing.T) {
+			var queried []string
+			frozen := NewFrozenStubs()
+			frozen.SetStateLoader(stateLoaderFunc(func(key string) StateLoadResult {
+				queried = append(queried, key)
+				if key == "frozen:"+stateKey {
+					return failureResult
+				}
+				return StateLoadResult{Value: legacyValue, Found: true}
+			}))
+			failure := frozen.MigrateLegacyState(nil, sessionID, stateKey)
+			if !failure.Failed || failure.Class != failureResult.FailureClass {
+				t.Fatalf("target 读取失败未上报: %+v", failure)
+			}
+			if len(queried) != 1 || queried[0] != "frozen:"+stateKey {
+				t.Fatalf("target 失败后仍读取 legacy: %v", queried)
+			}
+			if frozen.LengthFor(stateKey) != 0 {
+				t.Fatal("target 读取失败后仍复用旧状态")
+			}
+		})
+	}
+
+	// ErrNoRows 是 missing，既有 epoch 1 legacy migration 必须保持可用。
+	var queried []string
+	frozen := NewFrozenStubs()
+	frozen.SetStateLoader(stateLoaderFunc(func(key string) StateLoadResult {
+		queried = append(queried, key)
+		if key == "frozen:"+stateKey {
+			return StateLoadResult{}
+		}
+		return StateLoadResult{Value: legacyValue, Found: true}
+	}))
+	if failure := frozen.MigrateLegacyState(nil, sessionID, stateKey); failure.Failed {
+		t.Fatalf("missing 不应被当作失败: %+v", failure)
+	}
+	if got := frozen.LengthFor(stateKey); got != 2 {
+		t.Fatalf("epoch 1 legacy migration 未执行: len=%d", got)
+	}
+	if len(queried) != 2 {
+		t.Fatalf("migration 查询序列=%v, want target 后再读 legacy", queried)
+	}
+}
+
+func TestSawtoothStateLoaderMissingVsError(t *testing.T) {
+	const threadID = "sawtooth-loader-truth"
+
+	t.Run("missing", func(t *testing.T) {
+		trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+		calls := 0
+		trigger.SetStateLoader(stateLoaderFunc(func(string) StateLoadResult {
+			calls++
+			return StateLoadResult{}
+		}))
+		baseline, failure := trigger.PressureBaselineWithLoadResult(threadID)
+		if failure.Failed || baseline.Available || baseline.ResetReason != baselineResetNoActual {
+			t.Fatalf("missing baseline=%+v failure=%+v", baseline, failure)
+		}
+		trigger.PressureBaselineWithLoadResult(threadID)
+		if calls != 1 {
+			t.Fatalf("missing 是终态，却查询了 %d 次", calls)
+		}
+	})
+
+	for name, failureResult := range stateLoadErrorCases() {
+		t.Run(name, func(t *testing.T) {
+			trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+			calls := 0
+			trigger.SetStateLoader(stateLoaderFunc(func(string) StateLoadResult {
+				calls++
+				return failureResult
+			}))
+			baseline, failure := trigger.PressureBaselineWithLoadResult(threadID)
+			if !failure.Failed || failure.Class != failureResult.FailureClass {
+				t.Fatalf("failure=%+v, want class %q", failure, failureResult.FailureClass)
+			}
+			if baseline.Available || baseline.ResetReason != baselineResetStateLoadFailed {
+				t.Fatalf("读取失败伪装成 %q: %+v", baseline.ResetReason, baseline)
+			}
+			if baseline.ActualTokens != 0 || baseline.MessageCount != 0 {
+				t.Fatalf("读取失败后暴露了臆造 baseline: %+v", baseline)
+			}
+			trigger.mu.RLock()
+			loaded, found := trigger.loadedFromDB[threadID], trigger.stateFoundDB[threadID]
+			trigger.mu.RUnlock()
+			if loaded || found {
+				t.Fatalf("读取失败被当成冷启动 missing: loaded=%v found=%v", loaded, found)
+			}
+			trigger.PressureBaselineWithLoadResult(threadID)
+			if calls != 2 {
+				t.Fatalf("读取失败后不可重试，查询次数=%d", calls)
+			}
+		})
+	}
+}
+
+func TestSawtoothLoadFailureUsesLocalFull(t *testing.T) {
+	const threadID = "sawtooth-local-full"
+	state, err := json.Marshal(persistedState{
+		Tokens: 120_000, MsgCount: 2,
+		SystemFingerprint:         strings.Repeat("a", 64),
+		ToolsFingerprint:          strings.Repeat("b", 64),
+		MessagesPrefixFingerprint: strings.Repeat("c", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls int64
+	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+	trigger.SetStateLoader(stateLoaderFunc(func(string) StateLoadResult {
+		if atomic.AddInt64(&calls, 1) == 1 {
+			return StateLoadResult{Err: ErrStateLoadClosed, FailureClass: StateLoadFailureSQLiteClosed}
+		}
+		return StateLoadResult{Value: string(state), Found: true}
+	}))
+
+	baseline, failure := trigger.PressureBaselineWithLoadResult(threadID)
+	if !failure.Failed {
+		t.Fatalf("closed 未上报为读取失败: %+v", failure)
+	}
+	tokenCounter, err := NewTokenCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := buildPressureDecision(frozenTestMessages(2), nil, nil, baseline, tokenCounter, 100_000)
+	if decision.Source != pressureSourceLocalFull {
+		t.Fatalf("读取失败时 pressure source=%q, want local_full", decision.Source)
+	}
+	if decision.ResetReason != baselineResetStateLoadFailed {
+		t.Fatalf("读取失败被记成 %q, 掩盖了真实原因", decision.ResetReason)
+	}
+
+	recovered, recoveredFailure := trigger.PressureBaselineWithLoadResult(threadID)
+	if recoveredFailure.Failed || !recovered.Available || recovered.ActualTokens != 120_000 {
+		t.Fatalf("后续成功读取未恢复 baseline: %+v failure=%+v", recovered, recoveredFailure)
+	}
+}
+
+func TestSawtoothMigrationTargetErrorStopsLegacy(t *testing.T) {
+	const sessionID = "sawtooth-migrate"
+	stateKey := historyEpochStateKey(sessionID, 1)
+	legacyValue, err := json.Marshal(persistedState{
+		Tokens: 55_000, MsgCount: 3,
+		SystemFingerprint:         strings.Repeat("d", 64),
+		ToolsFingerprint:          strings.Repeat("e", 64),
+		MessagesPrefixFingerprint: strings.Repeat("f", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for name, failureResult := range stateLoadErrorCases() {
+		t.Run(name, func(t *testing.T) {
+			var queried []string
+			trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+			trigger.SetStateLoader(stateLoaderFunc(func(key string) StateLoadResult {
+				queried = append(queried, key)
+				if key == "sawtooth:"+stateKey {
+					return failureResult
+				}
+				return StateLoadResult{Value: string(legacyValue), Found: true}
+			}))
+			failure := trigger.MigrateLegacyState(sessionID, stateKey)
+			if !failure.Failed || failure.Class != failureResult.FailureClass {
+				t.Fatalf("target 读取失败未上报: %+v", failure)
+			}
+			if len(queried) != 1 || queried[0] != "sawtooth:"+stateKey {
+				t.Fatalf("target 失败后仍读取 legacy: %v", queried)
+			}
+			trigger.mu.RLock()
+			migrated := trigger.hasStateLocked(stateKey)
+			trigger.mu.RUnlock()
+			if migrated {
+				t.Fatal("target 读取失败后仍复用 legacy 状态")
+			}
+		})
+	}
+
+	var queried []string
+	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+	trigger.SetStateLoader(stateLoaderFunc(func(key string) StateLoadResult {
+		queried = append(queried, key)
+		if key == "sawtooth:"+stateKey {
+			return StateLoadResult{}
+		}
+		return StateLoadResult{Value: string(legacyValue), Found: true}
+	}))
+	if failure := trigger.MigrateLegacyState(sessionID, stateKey); failure.Failed {
+		t.Fatalf("missing 不应被当作失败: %+v", failure)
+	}
+	baseline, failure := trigger.PressureBaselineWithLoadResult(stateKey)
+	if failure.Failed || !baseline.Available || baseline.ActualTokens != 55_000 {
+		t.Fatalf("epoch 1 legacy migration 未执行: %+v failure=%+v", baseline, failure)
+	}
+	if len(queried) != 2 {
+		t.Fatalf("migration 查询序列=%v, want target 后再读 legacy", queried)
+	}
+}
+
+func TestFrozenAndSawtoothResultBearingPersistence(t *testing.T) {
+	const threadID = "result-bearing"
+	raw := frozenTestMessages(4)
+	backend := newPersistenceFakeBackend()
+	writer, _, _ := newPersistenceWriterTest(t, backend)
+	defer func() { _ = writer.CloseAndDrain() }()
+
+	frozen := NewFrozenStubs()
+	trigger := NewSawtoothTrigger(0, 100_000, 10_000)
+
+	// 提交必须发生在组件 mutex 之外：submitter 回读组件状态，锁内提交会自锁死。
+	frozen.SetStateSubmitter(reentrantStateSubmitter{inner: writer, probe: func() { frozen.LengthFor(threadID) }})
+	trigger.SetStateSubmitter(reentrantStateSubmitter{inner: writer, probe: func() { trigger.GetRequestSeq(threadID) }})
+
+	// 1. 磁盘阻塞时内存先行，当前请求不被 SQLite 拖住。
+	started := backend.blockKey("frozen:" + threadID)
+	blockedProbe := newPersistenceProbe(t, 1)
+	var blockedReceipt PersistenceReceipt
+	runWithinTimeout(t, "Frozen 阻塞写入", func() {
+		blockedReceipt = frozen.StoreWithResult(nil, threadID, deepCopyMessages(raw[:1]), 2, raw[1], 10, 20, blockedProbe.completion)
+	})
+	if !blockedReceipt.Accepted {
+		t.Fatalf("阻塞写入未被接受: %+v", blockedReceipt)
+	}
+	if frozen.LengthFor(threadID) != 1 {
+		t.Fatal("内存状态未先于磁盘更新")
+	}
+	<-started
+	if got := blockedProbe.diskState(); got == persistenceStateSaved {
+		t.Fatalf("SQLite 尚未返回就记为 saved: %q", got)
+	}
+	backend.releaseAll()
+	waitForPersistence(t, func() bool { return blockedProbe.diskState() == persistenceStateSaved })
+
+	// 2. SQLite 失败必须如实进入 request closure，且不阻塞内存更新。
+	backend.failKey("frozen:"+threadID, true)
+	failedProbe := newPersistenceProbe(t, 2)
+	runWithinTimeout(t, "Frozen 失败写入", func() {
+		frozen.StoreWithResult(nil, threadID, deepCopyMessages(raw[:2]), 3, raw[2], 20, 30, failedProbe.completion)
+	})
+	waitForPersistence(t, func() bool { return failedProbe.diskState() == persistenceStateFailed })
+	if got := failedProbe.failureClass(); got != persistenceFailureSQLite {
+		t.Fatalf("失败类别=%q, want sqlite", got)
+	}
+	if frozen.LengthFor(threadID) != 2 {
+		t.Fatal("磁盘失败不应回滚内存状态")
+	}
+
+	// 3. Sawtooth baseline 同样 result-bearing。
+	baselineProbe := newPersistenceProbe(t, 3)
+	var accepted bool
+	var baselineReceipt PersistenceReceipt
+	runWithinTimeout(t, "Sawtooth baseline 写入", func() {
+		accepted, baselineReceipt = trigger.UpdatePressureBaselineWithResult(threadID, 0, 77_000, 4,
+			strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64), baselineProbe.completion)
+	})
+	if !accepted || !baselineReceipt.Accepted {
+		t.Fatalf("baseline 写入未被接受: accepted=%v receipt=%+v", accepted, baselineReceipt)
+	}
+	waitForPersistence(t, func() bool { return baselineProbe.diskState() == persistenceStateSaved })
+	if got := trigger.PressureBaseline(threadID); !got.Available || got.ActualTokens != 77_000 {
+		t.Fatalf("baseline 内存状态=%+v", got)
+	}
+
+	// 4. 兼容 void callback 不得产生 saved 事实。
+	legacy := NewFrozenStubs()
+	legacy.SetPersistFunc(func(string, string) {})
+	legacyProbe := newPersistenceProbe(t, 4)
+	receipt := legacy.StoreWithResult(nil, threadID, deepCopyMessages(raw[:1]), 2, raw[1], 10, 20, legacyProbe.completion)
+	if receipt.Result.State == persistenceStateSaved || legacyProbe.diskState() == persistenceStateSaved {
+		t.Fatalf("兼容 void callback 伪造了 saved: receipt=%+v disk=%q", receipt, legacyProbe.diskState())
+	}
+}
