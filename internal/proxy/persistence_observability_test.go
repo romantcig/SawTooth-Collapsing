@@ -1079,6 +1079,11 @@ func TestProductionHealthTransitionWiringAllScopes(t *testing.T) {
 	fixture.sink.mu.Lock()
 	fixture.sink.sessionHook = nil
 	fixture.sink.mu.Unlock()
+	// 先把 session lane 完全排空，再进入 sink 故障阶段：否则两段故障会交错，
+	// 无法证明每条 scope 各自只 entered/recovered 一次。
+	if err := fixture.dispatcher.CloseAndDrain(); err != nil {
+		t.Fatalf("dispatcher drain: %v", err)
+	}
 
 	// 4) session_log_sink：accepted 之后的整行写失败驱动独立 scope。
 	fixture.sink.mu.Lock()

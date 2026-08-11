@@ -250,6 +250,25 @@ type ArchiveCommitObserver interface {
 // 超限时必须在任何状态副作用之前拒绝，而不是静默截取一段窗口。
 const maxPrimaryRequestMessages = 10000
 
+// SetOutcomeDispatcher 注入进程级 nonblocking dispatcher。
+// 生产 wiring 只调用一次；此后每个请求 collector 共享同一实例。
+func (s *Server) SetOutcomeDispatcher(dispatcher *OutcomeDispatcher) {
+	if s == nil || dispatcher == nil {
+		return
+	}
+	s.outcomeSink = dispatcher
+}
+
+// SetArchiveHealthObserver 注入同步 Archive commit 的 typed health 出口。
+// 传入的实现与普通 state writer 共享同一个 HealthTracker/reporter，
+// 但 Archive 本身永远不进入 writer 队列。
+func (s *Server) SetArchiveHealthObserver(observer ArchiveCommitObserver) {
+	if s == nil || observer == nil {
+		return
+	}
+	s.archiveHealth = observer
+}
+
 func (s *Server) archiveCommitTarget() archiveCommitter {
 	if s.archiveCommitter != nil {
 		return s.archiveCommitter
