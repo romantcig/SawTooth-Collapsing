@@ -30,6 +30,7 @@ const (
 	HistoryEpochReasonChanged          HistoryEpochReason = "history_changed"
 	HistoryEpochReasonInvalid          HistoryEpochReason = "invalid_history"
 	HistoryEpochReasonTransitionFailed HistoryEpochReason = "transition_failed"
+	HistoryEpochReasonLoadFailed       HistoryEpochReason = "state_load_failed"
 )
 
 // historyFingerprints 分离两个用途不同的历史证明：
@@ -52,8 +53,13 @@ type HistoryEpochDecision struct {
 	ReuseSafe        bool
 	EpochChanged     bool
 	TransitionFailed bool
-	FirstMismatch    bool
-	Reason           HistoryEpochReason
+	// LoadFailed 表示本次请求根本没能读到权威 history 状态。它与
+	// TransitionFailed 是两件事：后者读到了旧状态但没能原子提交新 epoch，
+	// 前者连"上一个 epoch 是什么"都不成立，因此不发布任何 epoch。
+	LoadFailed    bool
+	LoadFailure   StateLoadFailure
+	FirstMismatch bool
+	Reason        HistoryEpochReason
 }
 
 // HistoryTransitionFunc 原子提交一次 epoch 状态和 Archive 可见性。
@@ -85,6 +91,7 @@ type HistoryEpochManager struct {
 	configMu     sync.RWMutex
 	persistFn    PersistFunc
 	loadFn       LoadFunc
+	stateLoader  StateLoader
 	transitionFn HistoryTransitionFunc
 }
 
@@ -101,12 +108,29 @@ func (m *HistoryEpochManager) SetPersistFunc(fn PersistFunc) {
 	m.configMu.Unlock()
 }
 
+// SetLoadFunc 是 bool-only 加载回调的兼容入口，只供尚未迁移的测试使用。
+// 它把回调包装成永远不产生 Err 的 StateLoader；生产 wiring 必须用
+// SetStateLoader，否则查询失败会被当成"这个 session 没有历史状态"。
 func (m *HistoryEpochManager) SetLoadFunc(fn LoadFunc) {
 	if m == nil {
 		return
 	}
 	m.configMu.Lock()
 	m.loadFn = fn
+	m.stateLoader = stateLoaderFromLoadFunc(fn)
+	m.configMu.Unlock()
+}
+
+// SetStateLoader 设置生产使用的 error-aware 状态读取合同。
+// 这里刻意没有对应的 SetStateSubmitter：history 状态切换必须走
+// CommitHistoryTransition 的同步事务，放进普通异步 writer 会让 epoch
+// 与 Archive 可见性失去原子性。
+func (m *HistoryEpochManager) SetStateLoader(loader StateLoader) {
+	if m == nil {
+		return
+	}
+	m.configMu.Lock()
+	m.stateLoader = loader
 	m.configMu.Unlock()
 }
 
@@ -136,7 +160,16 @@ func (m *HistoryEpochManager) Begin(sessionID string, messages []Message) Histor
 	session := m.session(sessionID)
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	m.loadSessionLocked(sessionID, session)
+	if failure := m.loadSessionLocked(sessionID, session); failure.Failed {
+		// 读不到权威状态就无法证明任何 epoch。不发布 epoch、不写状态、
+		// 不触发 transition：主管线必须以本轮 raw history 直通。
+		return HistoryEpochDecision{
+			LoadFailed:  true,
+			LoadFailure: failure,
+			ReuseSafe:   false,
+			Reason:      HistoryEpochReasonLoadFailed,
+		}
+	}
 
 	current, canonicalErr := canonicalizeHistory(messages)
 	previous := session.state
@@ -259,7 +292,10 @@ func (m *HistoryEpochManager) IsCurrent(sessionID string, epoch uint64) bool {
 	session := m.session(sessionID)
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	m.loadSessionLocked(sessionID, session)
+	if failure := m.loadSessionLocked(sessionID, session); failure.Failed {
+		// 读取失败时无法证明任何 epoch 是当前 epoch，闸门必须关闭。
+		return false
+	}
 	return session.state.Epoch == epoch
 }
 
@@ -277,24 +313,31 @@ func (m *HistoryEpochManager) session(sessionID string) *historyEpochSession {
 	return session
 }
 
-func (m *HistoryEpochManager) loadSessionLocked(sessionID string, session *historyEpochSession) {
+// loadSessionLocked 只在读取给出终态（命中或确认不存在）后才置 loaded。
+// 查询失败既不写 session.state 也不置 loaded，下一次请求可以重新读取。
+func (m *HistoryEpochManager) loadSessionLocked(sessionID string, session *historyEpochSession) StateLoadFailure {
 	if session.loaded {
-		return
+		return StateLoadFailure{}
+	}
+	m.configMu.RLock()
+	loader := m.stateLoader
+	m.configMu.RUnlock()
+	if loader == nil {
+		session.loaded = true
+		return StateLoadFailure{}
+	}
+	result := loader.LoadStateResult(historyEpochPersistenceKey(sessionID))
+	if result.Err != nil {
+		// 查询失败不是"这个 session 没有历史状态"：不置 loaded，也不发布 epoch。
+		return stateLoadFailureFrom(result)
 	}
 	session.loaded = true
-	m.configMu.RLock()
-	loadFn := m.loadFn
-	m.configMu.RUnlock()
-	if loadFn == nil {
-		return
-	}
-	raw, ok := loadFn(historyEpochPersistenceKey(sessionID))
-	if !ok || raw == "" {
-		return
+	if !result.Found || result.Value == "" {
+		return StateLoadFailure{}
 	}
 	var persisted historyEpochPersisted
-	if json.Unmarshal([]byte(raw), &persisted) != nil || persisted.Epoch == 0 {
-		return
+	if json.Unmarshal([]byte(result.Value), &persisted) != nil || persisted.Epoch == 0 {
+		return StateLoadFailure{}
 	}
 	if persisted.Version != historyEpochStateVersion || !validHistoryEpochState(persisted) {
 		// 保留已持久化的单调 epoch，但把不可证明的旧内容标记为无效。
@@ -305,6 +348,7 @@ func (m *HistoryEpochManager) loadSessionLocked(sessionID string, session *histo
 		}
 	}
 	session.state = persisted
+	return StateLoadFailure{}
 }
 
 func (m *HistoryEpochManager) persistSessionLocked(sessionID string, state historyEpochPersisted) {

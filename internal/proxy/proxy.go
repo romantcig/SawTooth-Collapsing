@@ -744,6 +744,24 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		historyReuseSafe := true
 		if s.HistoryEpoch != nil {
 			epochDecision := s.HistoryEpoch.Begin(sessionID, historyMessages)
+			if epochDecision.LoadFailed {
+				// 权威 history 状态读不出来时，"上一个 epoch 是什么"根本不成立。
+				// 不发布 epoch、不迁移 legacy、不建立 alias，也不读取任何派生状态；
+				// 直接以本轮 raw history 直通，下一次请求可以重新读取。
+				meta.HistoryEpochReason = epochDecision.Reason
+				meta.HistoryReuseSafe = false
+				meta.Logger.Warn("历史状态读取失败，按 raw history 直通",
+					"failure_class", string(epochDecision.LoadFailure.Class),
+				)
+				newBody, err := rebuildBody(historyMessages)
+				if err != nil {
+					meta.Logger.Warn("历史状态读取失败，原始请求体重建失败，回退原样转发", "error", err)
+					newBody = body
+				}
+				r.Body = io.NopCloser(bytes.NewReader(newBody))
+				s.forwardRaw(w, r, meta)
+				return
+			}
 			meta.HistoryEpoch = epochDecision.Epoch
 			meta.HistoryStateKey = epochDecision.StateKey
 			meta.HistoryEpochReason = epochDecision.Reason

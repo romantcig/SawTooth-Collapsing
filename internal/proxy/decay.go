@@ -26,6 +26,15 @@ type decayPersisted struct {
 	FilePaths map[string]string  `json:"file_paths"`
 }
 
+// decayLoadPollution 是加载一条记录时被忽略条目的稳定计数。
+// 它只保留类别与数量：被忽略的 state key 本身既不进入内存，也不进入诊断。
+type decayLoadPollution struct {
+	// ForeignPrefix 是属于其他 session/epoch 的记录数。
+	ForeignPrefix int
+	// BareMessage 是无法归属任何 session/epoch 的裸 msg_N 记录数。
+	BareMessage int
+}
+
 // PinnedPathSnapshot 是一次请求使用的路径快照。它的底层 slice 只在构造时
 // 写入，生产管线不会把它交回 DecayTracker，因此不同请求之间不会共享可变
 // pinned state。命名 slice 仍可与 []string 互相传递，保留旧调用方的便利性。
@@ -153,9 +162,16 @@ type DecayTracker struct {
 	generation   map[string]uint64
 	persistFn    PersistFunc
 	loadFn       LoadFunc
+	stateLoader  StateLoader    // 生产：error-aware 状态读取合同
+	submitter    StateSubmitter // 生产：锁外 result-bearing 写入提交
 	loadedFromDB map[string]bool
 	stateFoundDB map[string]bool
 	currentAlias map[string]string
+	// persistLocks 让同一 stateKey 的"快照 + 提交"整体串行，从而在不持有
+	// d.mu 的前提下保持磁盘顺序与内存顺序一致。
+	persistLocks map[string]*sync.Mutex
+	// loadPollution 记录每个 stateKey 加载时被忽略的条目数量。
+	loadPollution map[string]decayLoadPollution
 }
 
 // NewDecayTracker 创建新的衰减追踪器。
@@ -169,6 +185,8 @@ func NewDecayTracker() *DecayTracker {
 		loadedFromDB:      make(map[string]bool),
 		stateFoundDB:      make(map[string]bool),
 		currentAlias:      make(map[string]string),
+		persistLocks:      make(map[string]*sync.Mutex),
+		loadPollution:     make(map[string]decayLoadPollution),
 	}
 }
 
@@ -212,24 +230,32 @@ func (d *DecayTracker) hasSessionStateLocked(sessionID string) bool {
 
 // MigrateLegacyState 一次性把裸 session 前缀的衰减状态复制到 epoch 1 key。
 // 显式目标 key 已存在时目标优先，绝不再读取旧裸 key。
-func (d *DecayTracker) MigrateLegacyState(sessionID, stateKey string) {
+// 目标 key 读取失败时同样立即终止：查询错误不是"目标没有状态"，回退读 legacy
+// 会让上一个 epoch 的衰减状态复活。
+func (d *DecayTracker) MigrateLegacyState(sessionID, stateKey string) StateLoadFailure {
 	if d == nil || sessionID == "" || stateKey == "" || sessionID == stateKey {
-		return
+		return StateLoadFailure{}
 	}
-	d.LoadFromDB(stateKey)
+	if failure := d.LoadFromDB(stateKey); failure.Failed {
+		return failure
+	}
 	d.mu.RLock()
 	targetExists := d.hasSessionStateLocked(stateKey)
 	targetFound := d.stateFoundDB[stateKey]
 	d.mu.RUnlock()
 	if targetExists || targetFound {
-		return
+		return StateLoadFailure{}
 	}
 
 	d.LoadFromDB(sessionID)
+	persistLock := d.decayPersistLock(stateKey)
+	persistLock.Lock()
+	defer persistLock.Unlock()
+
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.hasSessionStateLocked(stateKey) || d.stateFoundDB[stateKey] || !d.hasSessionStateLocked(sessionID) {
-		return
+		d.mu.Unlock()
+		return StateLoadFailure{}
 	}
 	legacyPrefix := sessionID + ":msg_"
 	targetPrefix := stateKey + ":msg_"
@@ -249,10 +275,18 @@ func (d *DecayTracker) MigrateLegacyState(sessionID, stateKey string) {
 		}
 	}
 	d.loadedFromDB[stateKey] = true
-	if d.persistFn != nil {
-		d.PersistUnlocked(stateKey)
+	snapshot := d.snapshotStateLocked(stateKey)
+	submitter, persistFn := d.submitter, d.persistFn
+	shouldPersist := submitter != nil || persistFn != nil
+	if shouldPersist {
 		d.stateFoundDB[stateKey] = true
 	}
+	d.mu.Unlock()
+
+	if shouldPersist {
+		d.submitDecayState(submitter, persistFn, stateKey, snapshot, nil)
+	}
+	return StateLoadFailure{}
 }
 
 // SetPersistFunc 设置持久化回调。
@@ -262,11 +296,86 @@ func (d *DecayTracker) SetPersistFunc(fn PersistFunc) {
 	d.persistFn = fn
 }
 
-// SetLoadFunc 设置冷启动加载回调。
+// SetLoadFunc 是 bool-only 加载回调的兼容入口，只供尚未迁移的测试使用。
+// 它把回调包装成永远不产生 Err 的 StateLoader；生产 wiring 必须用
+// SetStateLoader，否则查询失败会被当成"状态不存在"。
 func (d *DecayTracker) SetLoadFunc(fn LoadFunc) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.loadFn = fn
+	d.stateLoader = stateLoaderFromLoadFunc(fn)
+}
+
+// SetStateLoader 设置生产使用的 error-aware 状态读取合同。
+func (d *DecayTracker) SetStateLoader(loader StateLoader) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.stateLoader = loader
+}
+
+// SetStateSubmitter 设置锁外 result-bearing 写入提交器。
+func (d *DecayTracker) SetStateSubmitter(submitter StateSubmitter) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.submitter = submitter
+}
+
+// decayPersistLock 返回 stateKey 的持久化串行锁。它自己会短暂获取 d.mu，
+// 因此必须在进入组件锁之前调用。
+func (d *DecayTracker) decayPersistLock(stateKey string) *sync.Mutex {
+	d.mu.Lock()
+	lock := d.persistLocks[stateKey]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		d.persistLocks[stateKey] = lock
+	}
+	d.mu.Unlock()
+	return lock
+}
+
+// snapshotStateLocked 是三张全局 map 唯一的持久化取样口：只复制
+// "stateKey:msg_" 前缀的记录，其他 session/epoch 与裸 msg_N 一律不进入快照。
+// 调用方必须持有 d.mu（读锁或写锁）。
+func (d *DecayTracker) snapshotStateLocked(stateKey string) decayPersisted {
+	prefix := stateKey + ":msg_"
+	dp := decayPersisted{
+		StubbedAt: make(map[string]int),
+		Intensity: make(map[string]float64),
+		FilePaths: make(map[string]string),
+	}
+	for key, value := range d.stubbedAt {
+		if strings.HasPrefix(key, prefix) {
+			dp.StubbedAt[key] = value
+		}
+	}
+	for key, value := range d.intensity {
+		if strings.HasPrefix(key, prefix) {
+			dp.Intensity[key] = value
+		}
+	}
+	for key, value := range d.filePaths {
+		if strings.HasPrefix(key, prefix) {
+			dp.FilePaths[key] = value
+		}
+	}
+	return dp
+}
+
+// submitDecayState 是唯一的外部写入口，必须在 d.mu 之外调用。
+func (d *DecayTracker) submitDecayState(submitter StateSubmitter, persistFn PersistFunc, stateKey string, snapshot decayPersisted, completion *outcomeCompletion) PersistenceReceipt {
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		return completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
+	}
+	key := "decay:" + stateKey
+	value := string(data)
+	var legacy func()
+	if persistFn != nil {
+		legacy = func() { persistFn(key, value) }
+	}
+	return submitStateOp(submitter, legacy, PersistenceOp{
+		Kind: PersistenceOpPut, OrderingKey: key, Key: key, Value: value, Completion: completion,
+	})
 }
 
 // MarkStubbed 记录一条消息在指定请求序号被桩化。
@@ -451,91 +560,149 @@ func (d *DecayTracker) GetStage(sessionID string, msgIndex, currentRequestIdx, t
 
 // Persist 将当前衰减状态持久化到 DB。
 func (d *DecayTracker) Persist(threadID string) {
-	d.mu.RLock()
-	threadID = d.resolveStateKeyLocked(threadID)
-	fn := d.persistFn
-	if fn == nil {
-		d.mu.RUnlock()
-		return
-	}
-	dp := decayPersisted{
-		StubbedAt: make(map[string]int),
-		Intensity: make(map[string]float64),
-		FilePaths: make(map[string]string),
-	}
-	for k, v := range d.stubbedAt {
-		dp.StubbedAt[k] = v
-	}
-	for k, v := range d.intensity {
-		dp.Intensity[k] = v
-	}
-	for k, v := range d.filePaths {
-		dp.FilePaths[k] = v
-	}
-	d.mu.RUnlock()
-
-	if data, err := json.Marshal(dp); err == nil {
-		fn("decay:"+threadID, string(data))
-	}
+	d.PersistWithResult(threadID, nil)
 }
 
-// LoadFromDB 从 DB 恢复衰减状态。每个 thread 仅加载一次。
-func (d *DecayTracker) LoadFromDB(threadID string) {
-	d.mu.Lock()
-	threadID = d.resolveStateKeyLocked(threadID)
-	if d.loadedFromDB[threadID] {
-		d.mu.Unlock()
-		return
+// PersistWithResult 是 result-bearing 的持久化入口：快照在组件锁内取样，
+// 外部提交在锁外完成，磁盘结果通过 completion 回到调用方的 request outcome。
+func (d *DecayTracker) PersistWithResult(threadID string, completion *outcomeCompletion) PersistenceReceipt {
+	if d == nil {
+		return completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
 	}
-	d.loadedFromDB[threadID] = true
-	loadFn := d.loadFn
+	d.mu.RLock()
+	stateKey := d.resolveStateKeyLocked(threadID)
+	hasSink := d.submitter != nil || d.persistFn != nil
+	d.mu.RUnlock()
+	if !hasSink {
+		return completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
+	}
+
+	lock := d.decayPersistLock(stateKey)
+	lock.Lock()
+	defer lock.Unlock()
+
+	d.mu.RLock()
+	snapshot := d.snapshotStateLocked(stateKey)
+	submitter, persistFn := d.submitter, d.persistFn
+	d.mu.RUnlock()
+
+	return d.submitDecayState(submitter, persistFn, stateKey, snapshot, completion)
+}
+
+// LoadFromDB 从 DB 恢复衰减状态。只有 ErrNoRows（Found=false 且 Err=nil）才算
+// missing；读取失败不设置任何已加载标记、不应用任何状态，允许下一次请求重试。
+// 加载只接受当前 stateKey 前缀的记录：污染进来的其他 session/epoch 与无法归属
+// 的裸 msg_N 一律忽略，只留下稳定的数量计数。
+func (d *DecayTracker) LoadFromDB(threadID string) StateLoadFailure {
+	d.mu.Lock()
+	stateKey := d.resolveStateKeyLocked(threadID)
+	if d.loadedFromDB[stateKey] {
+		d.mu.Unlock()
+		return StateLoadFailure{}
+	}
+	loader := d.stateLoader
 	d.mu.Unlock()
 
-	if loadFn == nil {
-		return
+	if loader == nil {
+		d.mu.Lock()
+		d.loadedFromDB[stateKey] = true
+		d.mu.Unlock()
+		return StateLoadFailure{}
 	}
 
-	raw, ok := loadFn("decay:" + threadID)
-	if !ok || raw == "" {
-		return
+	result := loader.LoadStateResult("decay:" + stateKey)
+	if result.Err != nil {
+		// 查询失败不是"状态不存在"：不设置 loaded，也不写入任何状态。
+		return stateLoadFailureFrom(result)
+	}
+	if !result.Found || result.Value == "" {
+		d.mu.Lock()
+		d.loadedFromDB[stateKey] = true
+		d.mu.Unlock()
+		return StateLoadFailure{}
 	}
 	d.mu.Lock()
-	d.stateFoundDB[threadID] = true
+	d.stateFoundDB[stateKey] = true
+	d.loadedFromDB[stateKey] = true
 	d.mu.Unlock()
 
 	var dp decayPersisted
-	if err := json.Unmarshal([]byte(raw), &dp); err != nil {
-		return
+	if err := json.Unmarshal([]byte(result.Value), &dp); err != nil {
+		return StateLoadFailure{}
 	}
 
+	prefix := stateKey + ":msg_"
+	var pollution decayLoadPollution
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for k, v := range dp.StubbedAt {
+		if !strings.HasPrefix(k, prefix) {
+			pollution.observe(k)
+			continue
+		}
 		if _, exists := d.stubbedAt[k]; !exists {
 			d.stubbedAt[k] = v
 		}
 	}
 	for k, v := range dp.Intensity {
+		if !strings.HasPrefix(k, prefix) {
+			pollution.observe(k)
+			continue
+		}
 		if _, exists := d.intensity[k]; !exists {
 			d.intensity[k] = v
 		}
 	}
 	for k, v := range dp.FilePaths {
+		if !strings.HasPrefix(k, prefix) {
+			pollution.observe(k)
+			continue
+		}
 		if _, exists := d.filePaths[k]; !exists {
 			d.filePaths[k] = v
 		}
 	}
+	if pollution.ForeignPrefix > 0 || pollution.BareMessage > 0 {
+		total := d.loadPollution[stateKey]
+		total.ForeignPrefix += pollution.ForeignPrefix
+		total.BareMessage += pollution.BareMessage
+		d.loadPollution[stateKey] = total
+	}
+	return StateLoadFailure{}
+}
+
+// observe 把一个被拒绝的 key 归入稳定类别，只累加数量、不保存 key 本身。
+func (p *decayLoadPollution) observe(key string) {
+	if strings.HasPrefix(key, "msg_") {
+		p.BareMessage++
+		return
+	}
+	p.ForeignPrefix++
 }
 
 // ClearSession 清空指定 session 的全部衰减追踪状态。
 // collapse 重建消息数组后调用——旧 key 不再有效。
 // key 格式为 "sessionID:msg_N"，ClearSession 按前缀匹配删除。
 func (d *DecayTracker) ClearSession(sessionID string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	sessionID = d.resolveStateKeyLocked(sessionID)
+	d.ClearSessionWithResult(sessionID, nil)
+}
 
-	prefix := sessionID + ":"
+// ClearSessionWithResult 是 result-bearing 的清理入口：删除与快照在组件锁内完成，
+// 外部提交在锁外完成。
+func (d *DecayTracker) ClearSessionWithResult(sessionID string, completion *outcomeCompletion) PersistenceReceipt {
+	if d == nil {
+		return completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
+	}
+	d.mu.RLock()
+	stateKey := d.resolveStateKeyLocked(sessionID)
+	d.mu.RUnlock()
+
+	lock := d.decayPersistLock(stateKey)
+	lock.Lock()
+	defer lock.Unlock()
+
+	prefix := stateKey + ":msg_"
+	d.mu.Lock()
 	for k := range d.stubbedAt {
 		if strings.HasPrefix(k, prefix) {
 			delete(d.stubbedAt, k)
@@ -551,22 +718,23 @@ func (d *DecayTracker) ClearSession(sessionID string) {
 			delete(d.filePaths, k)
 		}
 	}
-	d.PersistUnlocked(sessionID)
+	_, snapshot := d.PersistUnlocked(stateKey)
+	submitter, persistFn := d.submitter, d.persistFn
+	d.mu.Unlock()
+
+	if submitter == nil && persistFn == nil {
+		return completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
+	}
+	return d.submitDecayState(submitter, persistFn, stateKey, snapshot, completion)
 }
 
-// PersistUnlocked 在已持有锁的情况下持久化到 DB。
-func (d *DecayTracker) PersistUnlocked(threadID string) {
-	if d.persistFn == nil {
-		return
-	}
-	dp := decayPersisted{
-		StubbedAt: d.stubbedAt,
-		Intensity: d.intensity,
-		FilePaths: d.filePaths,
-	}
-	if data, err := json.Marshal(dp); err == nil {
-		d.persistFn("decay:"+threadID, string(data))
-	}
+// PersistUnlocked 在调用方已持有 d.mu 时生成待持久化快照。它复用
+// snapshotStateLocked，因此与 Persist 走同一套前缀过滤；并且刻意不执行外部
+// 提交——组件锁内调用 SQLite 会阻塞其他请求，提交必须由调用方在释放锁之后
+// 用 submitDecayState 完成。
+func (d *DecayTracker) PersistUnlocked(threadID string) (string, decayPersisted) {
+	stateKey := d.resolveStateKeyLocked(threadID)
+	return stateKey, d.snapshotStateLocked(stateKey)
 }
 
 // ---- estimateIntensity ----
