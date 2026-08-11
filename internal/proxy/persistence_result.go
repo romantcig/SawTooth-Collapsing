@@ -115,6 +115,72 @@ var (
 	ErrStateLoadQueryFailed = errors.New("sqlite state loader: query failed")
 )
 
+// StateLoadFailure 是状态组件向调用方与 request outcome 暴露的稳定读取失败事实。
+// Failed=false 表示本次读取给出了终态（命中或确认不存在）；Failed=true 时
+// 组件既没有应用旧状态，也没有把失败标记成冷启动 missing。
+type StateLoadFailure struct {
+	Failed bool
+	Class  StateLoadFailureClass
+}
+
+// stateLoadFailureFrom 只在 Err 非 nil 时构造失败事实。
+func stateLoadFailureFrom(result StateLoadResult) StateLoadFailure {
+	if result.Err == nil {
+		return StateLoadFailure{}
+	}
+	class := result.FailureClass
+	if class == "" || class == StateLoadFailureNone {
+		class = StateLoadFailureQueryFailed
+	}
+	return StateLoadFailure{Failed: true, Class: class}
+}
+
+// StateSubmitter 是状态组件在自身 mutex 之外提交普通 state 写入的最小合同。
+// *PersistenceWriter 满足它；组件因此永远不直接调用 SQLite，也不会为提交
+// 启动 goroutine。
+type StateSubmitter interface {
+	TrySubmit(op PersistenceOp) (PersistenceReceipt, error)
+}
+
+// legacyStateLoaderAdapter 把 bool-only LoadFunc 包成 StateLoader，只供尚未
+// 迁移的测试使用。它永远不产生 Err：旧回调无法区分 missing 与查询失败，
+// 因此只能表达 missing，生产 wiring 必须注入真正的 StateLoader。
+type legacyStateLoaderAdapter struct{ fn LoadFunc }
+
+func (a legacyStateLoaderAdapter) LoadStateResult(key string) StateLoadResult {
+	value, ok := a.fn(key)
+	return StateLoadResult{Value: value, Found: ok}
+}
+
+func stateLoaderFromLoadFunc(fn LoadFunc) StateLoader {
+	if fn == nil {
+		return nil
+	}
+	return legacyStateLoaderAdapter{fn: fn}
+}
+
+// submitStateOp 是四个状态组件共用的锁外提交路径。
+// 只有真正的 StateSubmitter 才可能产生 saved：legacy void callback 无法证明
+// SQLite 写入成功，最多得到 unavailable。
+func submitStateOp(submitter StateSubmitter, legacy func(), op PersistenceOp) PersistenceReceipt {
+	op.Target = PersistenceTargetState
+	if submitter != nil {
+		receipt, _ := submitter.TrySubmit(op)
+		return receipt
+	}
+	if legacy != nil {
+		legacy()
+		return completeStateOp(op.Completion, persistenceStateUnavailable, persistenceFailureLifecycle)
+	}
+	return completeStateOp(op.Completion, persistenceStateNotAttempted, persistenceFailureNone)
+}
+
+func completeStateOp(completion *outcomeCompletion, state persistenceState, class persistenceFailureClass) PersistenceReceipt {
+	result := PersistenceResult{Target: PersistenceTargetState, State: state, FailureClass: class}
+	completePersistenceOutcome(completion, result)
+	return PersistenceReceipt{Result: result}
+}
+
 type persistenceJob struct {
 	kind        PersistenceOpKind
 	orderingKey string

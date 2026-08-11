@@ -529,6 +529,12 @@ func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessa
 		ToolsFingerprint:          tools.fingerprint,
 		MessagesPrefixFingerprint: fingerprintMessagesPrefix(messages, len(messages)),
 	}
+	if baseline.ResetReason == baselineResetStateLoadFailed {
+		// 状态读取失败不是"这个 thread 没有 actual"：fail closed 到 local_full，
+		// 同时保留真实原因，避免闭环记录把它写成冷启动 no_actual。
+		decision.ResetReason = baselineResetStateLoadFailed
+		return decision
+	}
 	if baseline.Conservative {
 		// Conservative 是旧版在 forwarded 坐标改变时写入的不可验证高水位。
 		// 无论旧记录是否带有新坐标指纹，都不能先进入 legacy high-water

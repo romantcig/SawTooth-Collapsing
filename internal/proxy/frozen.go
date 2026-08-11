@@ -40,13 +40,17 @@ type FrozenStubs struct {
 	tokens        map[string]int // threadID → frozen stubs 的 token 估算
 	rawTokens     map[string]int // threadID → Store 时原始 token 估算（压缩前）
 	lastAccess    map[string]time.Time
-	persistFn     PersistFunc              // 可选：持久化 frozen 状态到 DB
-	loadFn        LoadFunc                 // 可选：冷启动时从 DB 加载 frozen 状态
-	deleteFn      DeleteFunc               // 可选：失效时删除 DB 中的 frozen 状态
-	loadedFromDB  map[string]bool          // threadID → 已尝试从 DB 加载
-	loadingFromDB map[string]chan struct{} // stateKey → 正在进行的 DB 加载完成信号
-	stateFoundDB  map[string]bool          // threadID → DB 中曾存在显式状态（即使内容无效）
-	currentAlias  map[string]string        // legacy session key → 当前 epoch state key
+	persistFn     PersistFunc                 // 可选：持久化 frozen 状态到 DB
+	loadFn        LoadFunc                    // 兼容：旧 bool-only 加载回调（仅测试）
+	stateLoader   StateLoader                 // 生产：error-aware 状态读取合同
+	submitter     StateSubmitter              // 生产：锁外 result-bearing 写入提交
+	deleteFn      DeleteFunc                  // 可选：失效时删除 DB 中的 frozen 状态
+	loadedFromDB  map[string]bool             // threadID → 已尝试从 DB 加载
+	loadingFromDB map[string]chan struct{}    // stateKey → 正在进行的 DB 加载完成信号
+	loadFailures  map[string]StateLoadFailure // stateKey → 最近一次读取失败事实
+	persistLocks  map[string]*sync.Mutex      // stateKey → 锁外持久化串行锁
+	stateFoundDB  map[string]bool             // threadID → DB 中曾存在显式状态（即使内容无效）
+	currentAlias  map[string]string           // legacy session key → 当前 epoch state key
 }
 
 // frozenPersisted 是 frozen 桩化状态的可 JSON 序列化形式。
@@ -90,6 +94,8 @@ func NewFrozenStubsWithTTL(ttl time.Duration) *FrozenStubs {
 		lastAccess:    make(map[string]time.Time),
 		loadedFromDB:  make(map[string]bool),
 		loadingFromDB: make(map[string]chan struct{}),
+		loadFailures:  make(map[string]StateLoadFailure),
+		persistLocks:  make(map[string]*sync.Mutex),
 		stateFoundDB:  make(map[string]bool),
 		currentAlias:  make(map[string]string),
 	}
@@ -150,22 +156,26 @@ func (f *FrozenStubs) mirrorCurrentAliasesLocked(stateKey string) {
 
 // MigrateLegacyState 一次性把旧裸 session key 的 Frozen 快照复制到明确的 epoch key。
 // 迁移后主管线只访问 stateKey；旧键仅作为兼容性观察镜像，不再作为当前读取键。
-func (f *FrozenStubs) MigrateLegacyState(logger *slog.Logger, sessionID, stateKey string) {
+// 返回 target key 的读取失败事实：读取失败时既不迁移也不回退 legacy key。
+func (f *FrozenStubs) MigrateLegacyState(logger *slog.Logger, sessionID, stateKey string) StateLoadFailure {
 	if f == nil || sessionID == "" || stateKey == "" || sessionID == stateKey {
-		return
+		return StateLoadFailure{}
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 	// 目标 key 永远优先。即使持久化内容无效并已 fail-closed 删除，也不能
 	// 再退回裸 key，否则旧状态可能在显式 epoch 状态之后重新进入主管线。
-	f.loadFrozenFromDB(logger, stateKey)
+	if failure := f.loadFrozenFromDB(logger, stateKey); failure.Failed {
+		// 读取失败不是"目标状态不存在"：此时读 legacy 会破坏 epoch 隔离。
+		return failure
+	}
 	f.mu.RLock()
 	_, targetExists := f.messages[stateKey]
 	targetFound := f.stateFoundDB[stateKey]
 	f.mu.RUnlock()
 	if targetExists || targetFound {
-		return
+		return StateLoadFailure{}
 	}
 
 	f.loadFrozenFromDB(logger, sessionID)
@@ -173,7 +183,7 @@ func (f *FrozenStubs) MigrateLegacyState(logger *slog.Logger, sessionID, stateKe
 	legacy, exists := f.messages[sessionID]
 	if !exists {
 		f.mu.RUnlock()
-		return
+		return StateLoadFailure{}
 	}
 	messages := deepCopyMessages(legacy)
 	cutoff := f.cutoff[sessionID]
@@ -187,7 +197,7 @@ func (f *FrozenStubs) MigrateLegacyState(logger *slog.Logger, sessionID, stateKe
 	lastAccess := f.lastAccess[sessionID]
 	f.mu.RUnlock()
 	if messages == nil {
-		return
+		return StateLoadFailure{}
 	}
 	persisted, err := json.Marshal(frozenPersisted{
 		Messages: messages, Cutoff: cutoff, BoundaryHash: boundaryHash,
@@ -195,13 +205,17 @@ func (f *FrozenStubs) MigrateLegacyState(logger *slog.Logger, sessionID, stateKe
 		Tokens: tokens, RawTokens: rawTokens,
 	})
 	if err != nil {
-		return
+		return StateLoadFailure{}
 	}
 
+	persistLock := f.frozenPersistLock(stateKey)
+	persistLock.Lock()
+	defer persistLock.Unlock()
+
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	if _, exists := f.messages[stateKey]; exists || f.stateFoundDB[stateKey] {
-		return
+		f.mu.Unlock()
+		return StateLoadFailure{}
 	}
 	f.messages[stateKey] = messages
 	f.cutoff[stateKey] = cutoff
@@ -214,10 +228,15 @@ func (f *FrozenStubs) MigrateLegacyState(logger *slog.Logger, sessionID, stateKe
 	f.rawTokens[stateKey] = rawTokens
 	f.lastAccess[stateKey] = lastAccess
 	f.loadedFromDB[stateKey] = true
-	if f.persistFn != nil {
-		f.persistFn("frozen:"+stateKey, string(persisted))
+	submitter, persistFn := f.submitter, f.persistFn
+	if submitter != nil || persistFn != nil {
 		f.stateFoundDB[stateKey] = true
 	}
+	f.mu.Unlock()
+
+	// 外部提交在组件锁之外完成；同 key 的顺序由 persistLock 保证。
+	f.submitFrozenState(submitter, persistFn, stateKey, string(persisted), nil)
+	return StateLoadFailure{}
 }
 
 // SetPersistFunc 设置持久化 frozen 状态到 DB 的回调函数。
@@ -227,11 +246,65 @@ func (f *FrozenStubs) SetPersistFunc(fn PersistFunc) {
 	f.persistFn = fn
 }
 
-// SetLoadFunc 设置冷启动时从 DB 加载 frozen 状态的回调函数。
+// SetLoadFunc 是 bool-only 加载回调的兼容入口，只供尚未迁移的测试使用。
+// 它把回调包装成永远不产生 Err 的 StateLoader；生产 wiring 必须用
+// SetStateLoader，否则查询失败会被当成"状态不存在"。
 func (f *FrozenStubs) SetLoadFunc(fn LoadFunc) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.loadFn = fn
+	f.stateLoader = stateLoaderFromLoadFunc(fn)
+}
+
+// SetStateLoader 设置生产使用的 error-aware 状态读取合同。
+func (f *FrozenStubs) SetStateLoader(loader StateLoader) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stateLoader = loader
+}
+
+// SetStateSubmitter 设置锁外 result-bearing 写入提交器。
+func (f *FrozenStubs) SetStateSubmitter(submitter StateSubmitter) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.submitter = submitter
+}
+
+// frozenPersistLock 让同一 stateKey 的"内存更新 + 提交"整体串行，
+// 从而在不持有组件 mutex 的前提下保持磁盘顺序与内存顺序一致。
+func (f *FrozenStubs) frozenPersistLock(stateKey string) *sync.Mutex {
+	f.mu.Lock()
+	lock := f.persistLocks[stateKey]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		f.persistLocks[stateKey] = lock
+	}
+	f.mu.Unlock()
+	return lock
+}
+
+// submitFrozenState 与 submitFrozenDelete 是仅有的两个外部写入口，
+// 两者都必须在 f.mu 之外调用。
+func (f *FrozenStubs) submitFrozenState(submitter StateSubmitter, persistFn PersistFunc, stateKey, value string, completion *outcomeCompletion) PersistenceReceipt {
+	key := "frozen:" + stateKey
+	var legacy func()
+	if persistFn != nil {
+		legacy = func() { persistFn(key, value) }
+	}
+	return submitStateOp(submitter, legacy, PersistenceOp{
+		Kind: PersistenceOpPut, OrderingKey: key, Key: key, Value: value, Completion: completion,
+	})
+}
+
+func (f *FrozenStubs) submitFrozenDelete(submitter StateSubmitter, deleteFn DeleteFunc, stateKey string, completion *outcomeCompletion) PersistenceReceipt {
+	key := "frozen:" + stateKey
+	var legacy func()
+	if deleteFn != nil {
+		legacy = func() { deleteFn(key) }
+	}
+	return submitStateOp(submitter, legacy, PersistenceOp{
+		Kind: PersistenceOpDelete, OrderingKey: key, Key: key, Completion: completion,
+	})
 }
 
 // SetDeleteFunc 设置 frozen 状态失效时的持久化删除回调。
@@ -250,21 +323,27 @@ func (f *FrozenStubs) Store(threadID string, stubbed []Message, cutoff int, boun
 }
 
 func (f *FrozenStubs) StoreWithLogger(logger *slog.Logger, threadID string, stubbed []Message, cutoff int, boundaryMsg Message, tokenEstimate int, rawTokenEstimate int, rawHistory ...[]Message) {
+	f.StoreWithResult(logger, threadID, stubbed, cutoff, boundaryMsg, tokenEstimate, rawTokenEstimate, nil, rawHistory...)
+}
+
+// StoreWithResult 是 result-bearing 的存储入口：内存与快照在组件锁内更新，
+// 外部提交在锁外完成，磁盘结果通过 completion 回到调用方的 request outcome。
+func (f *FrozenStubs) StoreWithResult(logger *slog.Logger, threadID string, stubbed []Message, cutoff int, boundaryMsg Message, tokenEstimate int, rawTokenEstimate int, completion *outcomeCompletion, rawHistory ...[]Message) PersistenceReceipt {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	if cutoff <= 0 || tokenEstimate < 0 || rawTokenEstimate < 0 {
 		logger.Debug("frozen 状态未存储", "reason", "metadata_invalid")
-		return
+		return completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
 	}
 	if ExtractPersistentUserContext(stubbed) != nil {
 		logger.Debug("frozen 状态未存储", "reason", "persistent_context")
-		return
+		return completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
 	}
 	frozen := deepCopyMessages(stubbed)
 	if frozen == nil {
 		logger.Debug("frozen 状态未存储", "reason", "copy_failed")
-		return
+		return completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
 	}
 
 	frozenJSON, _ := json.Marshal(frozen)
@@ -277,7 +356,7 @@ func (f *FrozenStubs) StoreWithLogger(logger *slog.Logger, threadID string, stub
 		rawHash = reuseSafetyPrefixHash(rawHistory[0], cutoff)
 		if rawHash == "" {
 			logger.Debug("frozen 状态未存储", "reason", "raw_prefix_unavailable")
-			return
+			return completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
 		}
 		rawMode = frozenRawPrefixModeFull
 	}
@@ -288,6 +367,10 @@ func (f *FrozenStubs) StoreWithLogger(logger *slog.Logger, threadID string, stub
 		Tokens: tokenEstimate, RawTokens: rawTokenEstimate,
 	}
 	persisted, _ := json.Marshal(fp)
+
+	persistLock := f.frozenPersistLock(threadID)
+	persistLock.Lock()
+	defer persistLock.Unlock()
 
 	f.mu.Lock()
 	f.messages[threadID] = frozen
@@ -301,17 +384,21 @@ func (f *FrozenStubs) StoreWithLogger(logger *slog.Logger, threadID string, stub
 	f.rawTokens[threadID] = rawTokenEstimate
 	f.lastAccess[threadID] = now
 	f.loadedFromDB[threadID] = true // 内存中的是最新权威数据
-	if f.persistFn != nil {
+	submitter, persistFn := f.submitter, f.persistFn
+	if submitter != nil || persistFn != nil {
 		f.stateFoundDB[threadID] = true
 	}
 	f.mirrorCurrentAliasesLocked(threadID)
-	// 持久化在同一临界区内执行，保证同一 thread 的内存与 SQLite 顺序一致。
-	if f.persistFn != nil && persisted != nil {
-		f.persistFn("frozen:"+threadID, string(persisted))
-	}
 	f.mu.Unlock()
 
+	// 提交在组件锁外执行；persistLock 保证同一 thread 的内存与磁盘顺序一致。
+	if persisted == nil {
+		return completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
+	}
+	receipt := f.submitFrozenState(submitter, persistFn, threadID, string(persisted), completion)
+
 	logger.Info("frozen prefix 已存储", "cutoff", cutoff, "tokens", tokenEstimate)
+	return receipt
 }
 
 // Get 返回指定 thread 的已验证 frozen stubs（若存在且有效）。
@@ -323,6 +410,13 @@ func (f *FrozenStubs) Get(threadID string, currentMessages []Message) *FrozenRes
 }
 
 func (f *FrozenStubs) GetWithLogger(logger *slog.Logger, threadID string, currentMessages []Message) *FrozenResult {
+	result, _ := f.GetWithLoadResult(logger, threadID, currentMessages)
+	return result
+}
+
+// GetWithLoadResult 在读取失败时返回 nil frozen prefix 与稳定失败事实：
+// 查询错误既不会被当成"没有 frozen 状态"，也不会让本请求复用任何旧前缀。
+func (f *FrozenStubs) GetWithLoadResult(logger *slog.Logger, threadID string, currentMessages []Message) (*FrozenResult, StateLoadFailure) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -334,7 +428,10 @@ func (f *FrozenStubs) GetWithLogger(logger *slog.Logger, threadID string, curren
 
 	// 冷启动 lazy-load：首次访问时尝试从 DB 恢复
 	if !ok && !loaded {
-		f.loadFrozenFromDB(logger, stateKey)
+		if failure := f.loadFrozenFromDB(logger, stateKey); failure.Failed {
+			logger.Debug("frozen prefix 未命中", "reason", "state_load_failed")
+			return nil, failure
+		}
 	}
 
 	f.mu.RLock()
@@ -343,7 +440,7 @@ func (f *FrozenStubs) GetWithLogger(logger *slog.Logger, threadID string, curren
 	if !ok {
 		f.mu.RUnlock()
 		logger.Debug("frozen prefix 未命中", "reason", "not_found")
-		return nil
+		return nil, StateLoadFailure{}
 	}
 	cutoff := f.cutoff[stateKey]
 	pHash := f.prefixHash[stateKey]
@@ -358,7 +455,7 @@ func (f *FrozenStubs) GetWithLogger(logger *slog.Logger, threadID string, curren
 	if cutoff <= 0 || cutoff > len(currentMessages) || bHash == "" || !validPressureFingerprint(rawHash) || (rawMode != frozenRawPrefixModeFull && rawMode != frozenRawPrefixModeLegacy) || tokens < 0 || rawTokens < 0 {
 		logger.Debug("frozen prefix 未命中", "reason", "metadata_invalid")
 		f.InvalidateWithLogger(logger, stateKey)
-		return nil
+		return nil, StateLoadFailure{}
 	}
 
 	// 验证 2：prefix hash 不匹配（内存被意外修改）
@@ -366,7 +463,7 @@ func (f *FrozenStubs) GetWithLogger(logger *slog.Logger, threadID string, curren
 	if sha256hex(frozenJSON) != pHash {
 		logger.Debug("frozen prefix 未命中", "reason", "stored_prefix_changed")
 		f.InvalidateWithLogger(logger, stateKey)
-		return nil
+		return nil, StateLoadFailure{}
 	}
 
 	// 验证 3：完整 raw cutoff 前缀 reuse-safety 证明。
@@ -375,12 +472,12 @@ func (f *FrozenStubs) GetWithLogger(logger *slog.Logger, threadID string, curren
 		if currentHash := reuseSafetyPrefixHash(currentMessages, cutoff); currentHash == "" || currentHash != rawHash {
 			logger.Debug("frozen prefix 未命中", "reason", "raw_prefix_changed")
 			f.InvalidateWithLogger(logger, stateKey)
-			return nil
+			return nil, StateLoadFailure{}
 		}
 	} else if legacyRawPrefixHash(cutoff, currentMessages[cutoff-1]) != rawHash {
 		logger.Debug("frozen prefix 未命中", "reason", "boundary_changed")
 		f.InvalidateWithLogger(logger, stateKey)
-		return nil
+		return nil, StateLoadFailure{}
 	}
 
 	// 验证 4：保留 boundary 双坐标检查，便于检测元数据损坏。
@@ -390,7 +487,7 @@ func (f *FrozenStubs) GetWithLogger(logger *slog.Logger, threadID string, curren
 		if currentBHash != bHash {
 			logger.Debug("frozen prefix 未命中", "reason", "boundary_changed")
 			f.InvalidateWithLogger(logger, stateKey)
-			return nil
+			return nil, StateLoadFailure{}
 		}
 	}
 
@@ -399,7 +496,7 @@ func (f *FrozenStubs) GetWithLogger(logger *slog.Logger, threadID string, curren
 	if copied == nil {
 		logger.Debug("frozen prefix 未命中", "reason", "copy_failed")
 		f.InvalidateWithLogger(logger, stateKey)
-		return nil
+		return nil, StateLoadFailure{}
 	}
 
 	// 更新最后访问时间
@@ -414,7 +511,7 @@ func (f *FrozenStubs) GetWithLogger(logger *slog.Logger, threadID string, curren
 		Cutoff:    cutoff,
 		Tokens:    tokens,
 		RawTokens: rawTokens,
-	}
+	}, StateLoadFailure{}
 }
 
 // LengthFor 返回 threadID 对应的 frozen prefix 消息数；条目不存在时返回 0。
@@ -428,23 +525,37 @@ func (f *FrozenStubs) LengthFor(threadID string) int {
 // 要求 newMsgs 长度与已有条目一致（防止同一管线内二次 sawtooth 触发）。
 // 返回是否成功更新。
 func (f *FrozenStubs) UpdateMessages(threadID string, newMsgs []Message) bool {
+	updated, _ := f.UpdateMessagesWithResult(threadID, newMsgs, nil)
+	return updated
+}
+
+// UpdateMessagesWithResult 是 result-bearing 的覆盖入口：内存更新在锁内，
+// 外部提交在锁外，磁盘结果通过 completion 回到调用方。
+func (f *FrozenStubs) UpdateMessagesWithResult(threadID string, newMsgs []Message, completion *outcomeCompletion) (bool, PersistenceReceipt) {
 	if ExtractPersistentUserContext(newMsgs) != nil {
-		return false
+		return false, completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
 	}
 	fresh := deepCopyMessages(newMsgs)
 	if fresh == nil {
-		return false
+		return false, completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
 	}
 
 	freshJSON, _ := json.Marshal(fresh)
 	pHash := sha256hex(freshJSON)
+
+	f.mu.RLock()
+	lockKey := f.resolveStateKeyLocked(threadID)
+	f.mu.RUnlock()
+	persistLock := f.frozenPersistLock(lockKey)
+	persistLock.Lock()
+	defer persistLock.Unlock()
 
 	f.mu.Lock()
 	stateKey := f.resolveStateKeyLocked(threadID)
 	existing, ok := f.messages[stateKey]
 	if !ok || len(fresh) != len(existing) {
 		f.mu.Unlock()
-		return false
+		return false, completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
 	}
 	f.messages[stateKey] = fresh
 	f.prefixHash[stateKey] = pHash
@@ -456,24 +567,26 @@ func (f *FrozenStubs) UpdateMessages(threadID string, newMsgs []Message) bool {
 	rawMode := f.rawPrefixMode[stateKey]
 	tokens := f.tokens[stateKey]
 	rawTokens := f.rawTokens[stateKey]
-	if f.persistFn != nil {
-		fp := frozenPersisted{
-			Messages:      fresh,
-			Cutoff:        cutoff,
-			BoundaryHash:  bHash,
-			PrefixHash:    pHash,
-			RawPrefixHash: rawHash,
-			RawPrefixMode: rawMode,
-			Tokens:        tokens,
-			RawTokens:     rawTokens,
-		}
-		if data, err := json.Marshal(fp); err == nil {
-			f.persistFn("frozen:"+stateKey, string(data))
-		}
-	}
+	submitter, persistFn := f.submitter, f.persistFn
 	f.mu.Unlock()
 
-	return true
+	if submitter == nil && persistFn == nil {
+		return true, completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
+	}
+	data, err := json.Marshal(frozenPersisted{
+		Messages:      fresh,
+		Cutoff:        cutoff,
+		BoundaryHash:  bHash,
+		PrefixHash:    pHash,
+		RawPrefixHash: rawHash,
+		RawPrefixMode: rawMode,
+		Tokens:        tokens,
+		RawTokens:     rawTokens,
+	})
+	if err != nil {
+		return true, completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
+	}
+	return true, f.submitFrozenState(submitter, persistFn, stateKey, string(data), completion)
 }
 
 // Invalidate 删除指定 thread 的 frozen stubs。
@@ -482,11 +595,24 @@ func (f *FrozenStubs) Invalidate(threadID string) {
 }
 
 func (f *FrozenStubs) InvalidateWithLogger(logger *slog.Logger, threadID string) {
+	f.InvalidateWithResult(logger, threadID, nil)
+}
+
+// InvalidateWithResult 是 result-bearing 的失效入口：删除同样锁外提交。
+func (f *FrozenStubs) InvalidateWithResult(logger *slog.Logger, threadID string, completion *outcomeCompletion) PersistenceReceipt {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	f.mu.RLock()
+	lockKey := f.resolveStateKeyLocked(threadID)
+	f.mu.RUnlock()
+	// 与 StoreWithResult 使用同一把 persistLock，保证 put/delete 的提交顺序
+	// 与内存顺序一致；加锁顺序始终是 persistLock → f.mu。
+	persistLock := f.frozenPersistLock(lockKey)
+	persistLock.Lock()
+	defer persistLock.Unlock()
+
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	stateKey := f.resolveStateKeyLocked(threadID)
 	delete(f.messages, stateKey)
 	delete(f.cutoff, stateKey)
@@ -514,10 +640,14 @@ func (f *FrozenStubs) InvalidateWithLogger(logger *slog.Logger, threadID string)
 	}
 	// 已知坏状态失效后保留“本进程已加载”标记，防止删除失败时反复恢复。
 	f.loadedFromDB[stateKey] = true
-	if f.deleteFn != nil {
-		f.deleteFn("frozen:" + stateKey)
-	}
+	submitter, deleteFn := f.submitter, f.deleteFn
+	f.mu.Unlock()
+
 	logger.Debug("frozen prefix 已失效", "reason", "state_invalidated")
+	if submitter == nil && deleteFn == nil {
+		return completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
+	}
+	return f.submitFrozenDelete(submitter, deleteFn, stateKey, completion)
 }
 
 // UpdateTTL 动态更新 FrozenStubs 的 eviction TTL。
@@ -548,6 +678,7 @@ func (f *FrozenStubs) Evict() int {
 			delete(f.lastAccess, tid)
 			delete(f.loadedFromDB, tid)
 			delete(f.stateFoundDB, tid)
+			delete(f.loadFailures, tid)
 			evicted++
 		}
 	}
@@ -559,48 +690,62 @@ func (f *FrozenStubs) Evict() int {
 
 // loadFrozenFromDB 尝试从 DB 恢复指定 thread 的 frozen stubs。
 // 每个 thread 在冷启动时仅调用一次（由 Get 触发 lazy-load）：并发调用方等待
-// 已在进行的加载，不重复查询。比照同文件 loadSawtoothFromDB。
-func (f *FrozenStubs) loadFrozenFromDB(logger *slog.Logger, threadID string) {
+// 已在进行的加载，不重复查询，并共享同一次读取结果。比照同文件 loadSawtoothFromDB。
+// 只有 ErrNoRows（Found=false 且 Err=nil）才算 missing；读取失败不设置任何
+// 已加载标记，允许下一次请求重试。
+func (f *FrozenStubs) loadFrozenFromDB(logger *slog.Logger, threadID string) (failure StateLoadFailure) {
 	f.mu.Lock()
 	stateKey := f.resolveStateKeyLocked(threadID)
 	if f.loadedFromDB[stateKey] {
 		f.mu.Unlock()
-		return
+		return StateLoadFailure{}
 	}
 	if loading := f.loadingFromDB[stateKey]; loading != nil {
 		f.mu.Unlock()
 		<-loading
-		return
+		f.mu.RLock()
+		shared := f.loadFailures[stateKey]
+		f.mu.RUnlock()
+		return shared
 	}
 	loading := make(chan struct{})
 	f.loadingFromDB[stateKey] = loading
-	loadFn := f.loadFn
+	loader := f.stateLoader
 	f.mu.Unlock()
 
-	// 本函数有 6 个出口（含三处 InvalidateWithLogger 分支），清理只能用 defer。
-	// 只碰 loadingFromDB：loadedFromDB 由各分支在 loadFn 结果已知之后自行置位
-	// （WR-03 特意后移的），InvalidateWithLogger 还会刻意把它置 true，
-	// 在这里覆盖会推翻那条设计。
+	// 本函数有多个出口（含三处 InvalidateWithLogger 分支），清理只能用 defer。
+	// 只碰 loadingFromDB 与共享失败事实：loadedFromDB 由各分支在读取结果已知
+	// 之后自行置位（WR-03 特意后移的），InvalidateWithLogger 还会刻意把它置
+	// true，在这里覆盖会推翻那条设计。
 	defer func() {
 		f.mu.Lock()
 		delete(f.loadingFromDB, stateKey)
+		if failure.Failed {
+			f.loadFailures[stateKey] = failure
+		} else {
+			delete(f.loadFailures, stateKey)
+		}
 		f.mu.Unlock()
 		close(loading)
 	}()
 
-	if loadFn == nil {
+	if loader == nil {
 		f.mu.Lock()
 		f.loadedFromDB[stateKey] = true
 		f.mu.Unlock()
-		return
+		return StateLoadFailure{}
 	}
 
-	raw, ok := loadFn("frozen:" + stateKey)
-	if !ok || raw == "" {
+	result := loader.LoadStateResult("frozen:" + stateKey)
+	if result.Err != nil {
+		// 查询失败不是"状态不存在"：不设置 loaded/found，也不写入任何状态。
+		return stateLoadFailureFrom(result)
+	}
+	if !result.Found || result.Value == "" {
 		f.mu.Lock()
 		f.loadedFromDB[stateKey] = true
 		f.mu.Unlock()
-		return
+		return StateLoadFailure{}
 	}
 	f.mu.Lock()
 	f.stateFoundDB[stateKey] = true
@@ -608,13 +753,13 @@ func (f *FrozenStubs) loadFrozenFromDB(logger *slog.Logger, threadID string) {
 	f.mu.Unlock()
 
 	var fp frozenPersisted
-	if err := json.Unmarshal([]byte(raw), &fp); err != nil {
+	if err := json.Unmarshal([]byte(result.Value), &fp); err != nil {
 		f.InvalidateWithLogger(logger, stateKey)
-		return
+		return StateLoadFailure{}
 	}
 	if len(fp.Messages) == 0 || fp.Cutoff <= 0 || fp.BoundaryHash == "" || fp.PrefixHash == "" || !validPressureFingerprint(fp.RawPrefixHash) || (fp.RawPrefixMode != frozenRawPrefixModeFull && fp.RawPrefixMode != frozenRawPrefixModeLegacy) || fp.Tokens < 0 || fp.RawTokens < 0 || ExtractPersistentUserContext(fp.Messages) != nil {
 		f.InvalidateWithLogger(logger, stateKey)
-		return
+		return StateLoadFailure{}
 	}
 
 	// 验证 prefix hash 与存储的消息一致
@@ -622,7 +767,7 @@ func (f *FrozenStubs) loadFrozenFromDB(logger *slog.Logger, threadID string) {
 	if sha256hex(frozenJSON) != fp.PrefixHash {
 		logger.Debug("frozen prefix 未命中", "reason", "stored_prefix_changed")
 		f.InvalidateWithLogger(logger, threadID)
-		return
+		return StateLoadFailure{}
 	}
 
 	now := time.Now()
@@ -630,7 +775,7 @@ func (f *FrozenStubs) loadFrozenFromDB(logger *slog.Logger, threadID string) {
 	defer f.mu.Unlock()
 	// 仅在仍为空时写入（Store() 可能在并发中被调用）
 	if _, exists := f.messages[stateKey]; exists {
-		return
+		return StateLoadFailure{}
 	}
 	f.messages[stateKey] = fp.Messages
 	f.cutoff[stateKey] = fp.Cutoff
@@ -645,6 +790,7 @@ func (f *FrozenStubs) loadFrozenFromDB(logger *slog.Logger, threadID string) {
 	f.mirrorCurrentAliasesLocked(stateKey)
 
 	logger.Info("从 SQLite 恢复 frozen 状态", "cutoff", fp.Cutoff, "tokens", fp.Tokens)
+	return StateLoadFailure{}
 }
 
 // deepCopyMessages 通过 JSON round-trip 创建消息切片的深拷贝。
@@ -773,6 +919,7 @@ type baselineResetReason string
 const (
 	baselineResetNone             baselineResetReason = "none"
 	baselineResetNoActual         baselineResetReason = "no_actual"
+	baselineResetStateLoadFailed  baselineResetReason = "state_load_failed"
 	baselineResetLegacyUnverified baselineResetReason = "legacy_unverified"
 	baselineResetMessageShrink    baselineResetReason = "message_shrink"
 	baselineResetMessagesChanged  baselineResetReason = "messages_changed"
@@ -796,27 +943,30 @@ type pressureBaseline struct {
 // SawtoothTrigger 根据 token 使用量和时间判断是否执行桩化周期。
 type SawtoothTrigger struct {
 	mu                          sync.RWMutex
-	lastTotalTokens             map[string]int           // threadID → 上次 API 响应 input tokens
-	lastMessageCount            map[string]int           // threadID → 上次响应时的消息数
-	systemFingerprints          map[string]string        // threadID → 上次主请求 system 的 SHA-256 指纹
-	toolsFingerprints           map[string]string        // threadID → 上次主请求 tools 的 SHA-256 指纹
-	messagesPrefixFingerprints  map[string]string        // threadID → 上次主请求消息前缀的 SHA-256 指纹
-	conservativeBaselines       map[string]bool          // threadID → actual 仅作为不得压低的 pressure floor
-	lastRequestTime             map[string]time.Time     // threadID → 上次 API 响应时间
-	loadedFromDB                map[string]bool          // threadID → DB 加载已完成
-	stateFoundDB                map[string]bool          // threadID → DB 中曾存在显式状态（即使内容无效）
-	loadingFromDB               map[string]chan struct{} // threadID → 正在进行的 DB 加载完成信号
-	baselineGeneration          map[string]uint64        // threadID → 响应写回版本，防止慢加载覆盖新状态
-	baselineRequestGeneration   map[string]uint64        // threadID → 请求进入有状态主管线时分配的代际
-	baselineCommittedGeneration map[string]uint64        // threadID → 最近接受的响应请求代际
-	baselinePersistLocks        map[string]*sync.Mutex   // threadID → 锁外持久化串行锁
-	requestSeq                  map[string]int           // threadID → 当前请求序号（Phase B: DecayTracker 用）
-	currentAlias                map[string]string        // legacy session key → 当前 epoch state key
-	pauseThreshold              time.Duration            // 暂停检测阈值（cache TTL - 安全边距）
-	tokenThreshold              int                      // 超过此值触发桩化周期（来自配置）
-	tokenMinimum                int                      // 桩化下限（来自配置）
-	persistFn                   PersistFunc              // 可选：更新时持久化 token 状态到 DB
-	loadFn                      LoadFunc                 // 可选：冷启动时从 DB 加载 token 状态
+	lastTotalTokens             map[string]int              // threadID → 上次 API 响应 input tokens
+	lastMessageCount            map[string]int              // threadID → 上次响应时的消息数
+	systemFingerprints          map[string]string           // threadID → 上次主请求 system 的 SHA-256 指纹
+	toolsFingerprints           map[string]string           // threadID → 上次主请求 tools 的 SHA-256 指纹
+	messagesPrefixFingerprints  map[string]string           // threadID → 上次主请求消息前缀的 SHA-256 指纹
+	conservativeBaselines       map[string]bool             // threadID → actual 仅作为不得压低的 pressure floor
+	lastRequestTime             map[string]time.Time        // threadID → 上次 API 响应时间
+	loadedFromDB                map[string]bool             // threadID → DB 加载已完成
+	stateFoundDB                map[string]bool             // threadID → DB 中曾存在显式状态（即使内容无效）
+	loadingFromDB               map[string]chan struct{}    // threadID → 正在进行的 DB 加载完成信号
+	loadFailures                map[string]StateLoadFailure // threadID → 最近一次读取失败事实
+	baselineGeneration          map[string]uint64           // threadID → 响应写回版本，防止慢加载覆盖新状态
+	baselineRequestGeneration   map[string]uint64           // threadID → 请求进入有状态主管线时分配的代际
+	baselineCommittedGeneration map[string]uint64           // threadID → 最近接受的响应请求代际
+	baselinePersistLocks        map[string]*sync.Mutex      // threadID → 锁外持久化串行锁
+	requestSeq                  map[string]int              // threadID → 当前请求序号（Phase B: DecayTracker 用）
+	currentAlias                map[string]string           // legacy session key → 当前 epoch state key
+	pauseThreshold              time.Duration               // 暂停检测阈值（cache TTL - 安全边距）
+	tokenThreshold              int                         // 超过此值触发桩化周期（来自配置）
+	tokenMinimum                int                         // 桩化下限（来自配置）
+	persistFn                   PersistFunc                 // 可选：更新时持久化 token 状态到 DB
+	loadFn                      LoadFunc                    // 兼容：旧 bool-only 加载回调（仅测试）
+	stateLoader                 StateLoader                 // 生产：error-aware 状态读取合同
+	submitter                   StateSubmitter              // 生产：锁外 result-bearing 写入提交
 }
 
 // NewSawtoothTrigger 创建新的触发状态跟踪器。
@@ -832,6 +982,7 @@ func NewSawtoothTrigger(pauseThreshold time.Duration, tokenThreshold, tokenMinim
 		loadedFromDB:                make(map[string]bool),
 		stateFoundDB:                make(map[string]bool),
 		loadingFromDB:               make(map[string]chan struct{}),
+		loadFailures:                make(map[string]StateLoadFailure),
 		baselineGeneration:          make(map[string]uint64),
 		baselineRequestGeneration:   make(map[string]uint64),
 		baselineCommittedGeneration: make(map[string]uint64),
@@ -942,17 +1093,20 @@ func (st *SawtoothTrigger) mirrorCurrentAliasesLocked(stateKey string) {
 
 // MigrateLegacyState 一次性把旧裸 session key 的 Sawtooth 状态复制到 epoch 1 key。
 // 若显式目标 key 已存在（包括无效后 fail-closed 的持久状态），绝不回退读取裸 key。
-func (st *SawtoothTrigger) MigrateLegacyState(sessionID, stateKey string) {
+// 目标 key 读取失败时同样立即终止：查询错误不是"目标没有状态"。
+func (st *SawtoothTrigger) MigrateLegacyState(sessionID, stateKey string) StateLoadFailure {
 	if st == nil || sessionID == "" || stateKey == "" || sessionID == stateKey {
-		return
+		return StateLoadFailure{}
 	}
-	st.loadSawtoothFromDB(stateKey)
+	if failure := st.loadSawtoothFromDB(stateKey); failure.Failed {
+		return failure
+	}
 	st.mu.RLock()
 	targetExists := st.hasStateLocked(stateKey)
 	targetFound := st.stateFoundDB[stateKey]
 	st.mu.RUnlock()
 	if targetExists || targetFound {
-		return
+		return StateLoadFailure{}
 	}
 
 	st.loadSawtoothFromDB(sessionID)
@@ -963,7 +1117,7 @@ func (st *SawtoothTrigger) MigrateLegacyState(sessionID, stateKey string) {
 	st.mu.Lock()
 	if st.hasStateLocked(stateKey) || st.stateFoundDB[stateKey] || !st.hasStateLocked(sessionID) {
 		st.mu.Unlock()
-		return
+		return StateLoadFailure{}
 	}
 	st.copyStateLocked(sessionID, stateKey)
 	st.loadedFromDB[stateKey] = true
@@ -975,8 +1129,8 @@ func (st *SawtoothTrigger) MigrateLegacyState(sessionID, stateKey string) {
 		MessagesPrefixFingerprint: st.messagesPrefixFingerprints[stateKey],
 		Conservative:              st.conservativeBaselines[stateKey],
 	}
-	persistFn := st.persistFn
-	shouldPersist := persistFn != nil && state.Tokens > 0 && state.MsgCount >= 0
+	submitter, persistFn := st.submitter, st.persistFn
+	shouldPersist := (submitter != nil || persistFn != nil) && state.Tokens > 0 && state.MsgCount >= 0
 	if shouldPersist {
 		st.stateFoundDB[stateKey] = true
 	}
@@ -984,14 +1138,24 @@ func (st *SawtoothTrigger) MigrateLegacyState(sessionID, stateKey string) {
 
 	if shouldPersist {
 		if data, err := json.Marshal(state); err == nil {
-			persistFn("sawtooth:"+stateKey, string(data))
+			st.submitSawtoothState(submitter, persistFn, stateKey, string(data), nil)
 		}
 	}
+	return StateLoadFailure{}
 }
 
 // PressureBaseline 返回指定 thread 的完整 pressure baseline 单次快照。
 // 首次访问会在不持锁的情况下尝试从 SQLite lazy-load，然后整体重读。
 func (st *SawtoothTrigger) PressureBaseline(threadID string) pressureBaseline {
+	baseline, _ := st.PressureBaselineWithLoadResult(threadID)
+	return baseline
+}
+
+// PressureBaselineWithLoadResult 在读取失败时明确 fail closed：
+// Available=false 且 ResetReason=state_load_failed，调用方因此会选择
+// local_full 而不是被误导成"这个 thread 从来没有 actual"。
+func (st *SawtoothTrigger) PressureBaselineWithLoadResult(threadID string) (pressureBaseline, StateLoadFailure) {
+	var failure StateLoadFailure
 	for {
 		st.mu.RLock()
 		stateKey := st.resolveStateKeyLocked(threadID)
@@ -1005,9 +1169,21 @@ func (st *SawtoothTrigger) PressureBaseline(threadID string) pressureBaseline {
 		}
 		if loading != nil {
 			<-loading
+			// 等待方共享同一次读取结果，不把 error 折叠成"状态不存在"。
+			st.mu.RLock()
+			failure = st.loadFailures[stateKey]
+			st.mu.RUnlock()
+			if failure.Failed {
+				break
+			}
 			continue
 		}
-		st.loadSawtoothFromDB(stateKey)
+		if failure = st.loadSawtoothFromDB(stateKey); failure.Failed {
+			break
+		}
+	}
+	if failure.Failed {
+		return pressureBaseline{Available: false, ResetReason: baselineResetStateLoadFailed}, failure
 	}
 
 	st.mu.RLock()
@@ -1028,7 +1204,7 @@ func (st *SawtoothTrigger) PressureBaseline(threadID string) pressureBaseline {
 		baseline.ResetReason = baselineResetNone
 	}
 	st.mu.RUnlock()
-	return baseline
+	return baseline, StateLoadFailure{}
 }
 
 func validPressureFingerprint(fingerprint string) bool {
@@ -1050,11 +1226,39 @@ func (st *SawtoothTrigger) SetPersistFunc(fn PersistFunc) {
 	st.persistFn = fn
 }
 
-// SetLoadFunc 设置冷启动时从 DB 加载 sawtooth 状态的回调函数。
+// SetLoadFunc 是 bool-only 加载回调的兼容入口，只供尚未迁移的测试使用。
+// 生产 wiring 必须用 SetStateLoader，否则查询失败会被当成"状态不存在"。
 func (st *SawtoothTrigger) SetLoadFunc(fn LoadFunc) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.loadFn = fn
+	st.stateLoader = stateLoaderFromLoadFunc(fn)
+}
+
+// SetStateLoader 设置生产使用的 error-aware 状态读取合同。
+func (st *SawtoothTrigger) SetStateLoader(loader StateLoader) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.stateLoader = loader
+}
+
+// SetStateSubmitter 设置锁外 result-bearing 写入提交器。
+func (st *SawtoothTrigger) SetStateSubmitter(submitter StateSubmitter) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.submitter = submitter
+}
+
+// submitSawtoothState 是 Sawtooth 唯一的外部写入口，必须在 st.mu 之外调用。
+func (st *SawtoothTrigger) submitSawtoothState(submitter StateSubmitter, persistFn PersistFunc, stateKey, value string, completion *outcomeCompletion) PersistenceReceipt {
+	key := "sawtooth:" + stateKey
+	var legacy func()
+	if persistFn != nil {
+		legacy = func() { persistFn(key, value) }
+	}
+	return submitStateOp(submitter, legacy, PersistenceOp{
+		Kind: PersistenceOpPut, OrderingKey: key, Key: key, Value: value, Completion: completion,
+	})
 }
 
 // Evaluate 返回本次触发判定实际使用的同锁快照。
@@ -1143,7 +1347,14 @@ func (st *SawtoothTrigger) UpdatePressureBaseline(threadID string, totalInputTok
 // UpdatePressureBaselineForRequest 在成功主响应后按请求代际原子写回完整 pressure baseline。
 // generation 为零时兼容直接构造 requestMeta 的测试/旧调用，并在写回时分配新代际。
 func (st *SawtoothTrigger) UpdatePressureBaselineForRequest(threadID string, generation uint64, totalInputTokens, messageCount int, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint string) bool {
-	return st.updatePressureBaselineForRequest(threadID, generation, totalInputTokens, messageCount, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint, false)
+	accepted, _ := st.updatePressureBaselineForRequest(threadID, generation, totalInputTokens, messageCount, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint, false, nil)
+	return accepted
+}
+
+// UpdatePressureBaselineWithResult 是 result-bearing 的 baseline 写回入口：
+// 内存在锁内更新，SQLite 提交在锁外完成，磁盘结果通过 completion 回到 outcome。
+func (st *SawtoothTrigger) UpdatePressureBaselineWithResult(threadID string, generation uint64, totalInputTokens, messageCount int, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint string, completion *outcomeCompletion) (bool, PersistenceReceipt) {
+	return st.updatePressureBaselineForRequest(threadID, generation, totalInputTokens, messageCount, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint, false, completion)
 }
 
 // UpdatePressureFloorForRequest 保留旧版本 conservative baseline 的兼容入口。
@@ -1151,10 +1362,11 @@ func (st *SawtoothTrigger) UpdatePressureBaselineForRequest(threadID string, gen
 // 再通过 UpdatePressureBaselineForRequest 写入 exact baseline。旧数据库中的
 // Conservative=true 记录只用于兼容读取，并会在 pressure 决策中被丢弃。
 func (st *SawtoothTrigger) UpdatePressureFloorForRequest(threadID string, generation uint64, pressureFloor, messageCount int, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint string) bool {
-	return st.updatePressureBaselineForRequest(threadID, generation, pressureFloor, messageCount, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint, true)
+	accepted, _ := st.updatePressureBaselineForRequest(threadID, generation, pressureFloor, messageCount, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint, true, nil)
+	return accepted
 }
 
-func (st *SawtoothTrigger) updatePressureBaselineForRequest(threadID string, generation uint64, totalInputTokens, messageCount int, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint string, conservative bool) bool {
+func (st *SawtoothTrigger) updatePressureBaselineForRequest(threadID string, generation uint64, totalInputTokens, messageCount int, systemFingerprint, toolsFingerprint, messagesPrefixFingerprint string, conservative bool, completion *outcomeCompletion) (bool, PersistenceReceipt) {
 	st.mu.RLock()
 	threadID = st.resolveStateKeyLocked(threadID)
 	st.mu.RUnlock()
@@ -1192,7 +1404,7 @@ func (st *SawtoothTrigger) updatePressureBaselineForRequest(threadID string, gen
 	}
 	if generation < st.baselineCommittedGeneration[threadID] {
 		st.mu.Unlock()
-		return false
+		return false, completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
 	}
 	st.baselineCommittedGeneration[threadID] = generation
 	if totalInputTokens > 0 {
@@ -1213,20 +1425,21 @@ func (st *SawtoothTrigger) updatePressureBaselineForRequest(threadID string, gen
 		delete(st.lastRequestTime, threadID)
 	}
 	st.loadedFromDB[threadID] = true
-	if st.persistFn != nil {
+	submitter, persistFn := st.submitter, st.persistFn
+	if submitter != nil || persistFn != nil {
 		st.stateFoundDB[threadID] = true
 	}
 	st.baselineGeneration[threadID]++
 	if st.loadingFromDB[threadID] != nil {
 		st.loadedFromDB[threadID] = false
 	}
-	persistFn := st.persistFn
 	st.mirrorCurrentAliasesLocked(threadID)
 	st.mu.Unlock()
-	if persistFn != nil && marshalErr == nil {
-		persistFn("sawtooth:"+threadID, string(data))
+	if marshalErr != nil {
+		return true, completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
 	}
-	return true
+	// 提交在 st.mu 之外执行；persistLock 保证同 thread 的磁盘顺序。
+	return true, st.submitSawtoothState(submitter, persistFn, threadID, string(data), completion)
 }
 
 func (st *SawtoothTrigger) pressurePersistLock(threadID string) *sync.Mutex {
@@ -1277,56 +1490,72 @@ func (st *SawtoothTrigger) SetPauseThreshold(pauseThreshold time.Duration) {
 
 // loadSawtoothFromDB 从 DB 加载指定 thread 的持久化 sawtooth 状态。
 // 每个 thread 在冷启动时仅调用一次（由 ShouldTrigger 触发 lazy-load）。
-func (st *SawtoothTrigger) loadSawtoothFromDB(threadID string) {
+// 只有 ErrNoRows 才算 missing：查询失败既不设置 loaded/found，也不应用任何
+// 状态，下一次请求可以重试。
+func (st *SawtoothTrigger) loadSawtoothFromDB(threadID string) StateLoadFailure {
 	st.mu.Lock()
 	threadID = st.resolveStateKeyLocked(threadID)
 	if st.loadedFromDB[threadID] {
 		st.mu.Unlock()
-		return
+		return StateLoadFailure{}
 	}
 	if loading := st.loadingFromDB[threadID]; loading != nil {
 		st.mu.Unlock()
 		<-loading
-		return
+		st.mu.RLock()
+		shared := st.loadFailures[threadID]
+		st.mu.RUnlock()
+		return shared
 	}
 	loading := make(chan struct{})
 	st.loadingFromDB[threadID] = loading
 	startGeneration := st.baselineGeneration[threadID]
-	loadFn := st.loadFn
+	loader := st.stateLoader
 	st.mu.Unlock()
 
 	var state persistedState
 	valid := false
-	if loadFn != nil {
-		raw, ok := loadFn("sawtooth:" + threadID)
-		if ok && raw != "" {
-			st.mu.Lock()
-			st.stateFoundDB[threadID] = true
-			st.mu.Unlock()
-		}
-		if ok && raw != "" && json.Unmarshal([]byte(raw), &state) == nil && state.Tokens > 0 && state.MsgCount >= 0 {
-			state.SystemFingerprint = sanitizePressureFingerprint(state.SystemFingerprint)
-			state.ToolsFingerprint = sanitizePressureFingerprint(state.ToolsFingerprint)
-			state.MessagesPrefixFingerprint = sanitizePressureFingerprint(state.MessagesPrefixFingerprint)
-			valid = true
+	var failure StateLoadFailure
+	found := false
+	if loader != nil {
+		result := loader.LoadStateResult("sawtooth:" + threadID)
+		switch {
+		case result.Err != nil:
+			failure = stateLoadFailureFrom(result)
+		case result.Found && result.Value != "":
+			found = true
+			if json.Unmarshal([]byte(result.Value), &state) == nil && state.Tokens > 0 && state.MsgCount >= 0 {
+				state.SystemFingerprint = sanitizePressureFingerprint(state.SystemFingerprint)
+				state.ToolsFingerprint = sanitizePressureFingerprint(state.ToolsFingerprint)
+				state.MessagesPrefixFingerprint = sanitizePressureFingerprint(state.MessagesPrefixFingerprint)
+				valid = true
+			}
 		}
 	}
 
 	st.mu.Lock()
 	applied := false
-	if valid && st.baselineGeneration[threadID] == startGeneration {
-		if _, exists := st.lastTotalTokens[threadID]; !exists {
-			st.lastTotalTokens[threadID] = state.Tokens
-			st.lastMessageCount[threadID] = state.MsgCount
-			st.systemFingerprints[threadID] = state.SystemFingerprint
-			st.toolsFingerprints[threadID] = state.ToolsFingerprint
-			st.messagesPrefixFingerprints[threadID] = state.MessagesPrefixFingerprint
-			st.conservativeBaselines[threadID] = state.Conservative
-			st.mirrorCurrentAliasesLocked(threadID)
-			applied = true
+	if failure.Failed {
+		st.loadFailures[threadID] = failure
+	} else {
+		delete(st.loadFailures, threadID)
+		if found {
+			st.stateFoundDB[threadID] = true
 		}
+		if valid && st.baselineGeneration[threadID] == startGeneration {
+			if _, exists := st.lastTotalTokens[threadID]; !exists {
+				st.lastTotalTokens[threadID] = state.Tokens
+				st.lastMessageCount[threadID] = state.MsgCount
+				st.systemFingerprints[threadID] = state.SystemFingerprint
+				st.toolsFingerprints[threadID] = state.ToolsFingerprint
+				st.messagesPrefixFingerprints[threadID] = state.MessagesPrefixFingerprint
+				st.conservativeBaselines[threadID] = state.Conservative
+				st.mirrorCurrentAliasesLocked(threadID)
+				applied = true
+			}
+		}
+		st.loadedFromDB[threadID] = true
 	}
-	st.loadedFromDB[threadID] = true
 	delete(st.loadingFromDB, threadID)
 	close(loading)
 	st.mu.Unlock()
@@ -1339,6 +1568,7 @@ func (st *SawtoothTrigger) loadSawtoothFromDB(threadID string) {
 			"msg_count", state.MsgCount,
 		)
 	}
+	return failure
 }
 
 // ── Cache TTL 自适应辅助函数 ──
