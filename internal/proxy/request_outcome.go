@@ -315,6 +315,14 @@ func (o *requestOutcomeCollector) SetDiskState(value persistenceState) {
 	o.setIfMutable(func(snapshot *requestOutcomeSnapshot) { snapshot.DiskState = normalizePersistenceState(value) })
 }
 
+// MergeDiskState 用于同步磁盘结果（例如 Archive commit）：它与异步 completion
+// 共用同一条单调聚合规则，因此后到的较轻结果不会抹掉已知的失败或不可用。
+func (o *requestOutcomeCollector) MergeDiskState(value persistenceState) {
+	o.setIfMutable(func(snapshot *requestOutcomeSnapshot) {
+		mergeOutcomePersistenceState(&snapshot.DiskState, normalizePersistenceState(value))
+	})
+}
+
 func (o *requestOutcomeCollector) SetFailureClass(value persistenceFailureClass) {
 	o.setIfMutable(func(snapshot *requestOutcomeSnapshot) { snapshot.FailureClass = normalizeFailureClass(value) })
 }

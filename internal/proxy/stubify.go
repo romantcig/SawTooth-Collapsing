@@ -307,7 +307,32 @@ func sanitizeBlocks(blocks []ContentBlock) []ContentBlock {
 // keepThinking 为 true 时保留 thinking blocks（1M 上下文模型建议开启）。
 // dt 非 nil 时在每条消息桩化后调用 MarkStubbed 记录衰减状态（Phase B）。
 // sessionID 用于 DecayTracker 的 session-scoped key（Phase F）。
-func stubifyMessages(messages []Message, tc *TokenCounter, pivotText string, keepRecent int, keepThinking bool, dt *DecayTracker, sessionID string, requestIdx int, intensity float64, threshold int) ([]Message, StubStats) {
+// fallbackWouldDestroyContent 复用 stubify 自身的阈值门控，判断本轮 fallback
+// 是否真的会改写正文。它是纯计算，不触碰 DecayTracker，因此可以在归档意图
+// 阶段安全调用一次。
+// decay 的 Stage-2/3 清空同样由 totalTokens/threshold >= 1.0 驱动，与这里的
+// 判据一致：token 数没过阈值时整条 fallback 链都不会破坏原文。
+func fallbackWouldDestroyContent(messages []Message, tc *TokenCounter, threshold int) bool {
+	if len(messages) < 2 || tc == nil {
+		return false
+	}
+	if threshold <= 0 {
+		return true
+	}
+	return tc.CountMessagesTokens(messages) > threshold
+}
+
+// stubifyMessages 的最后一个可变参数是已落库 Archive 的 canonical ID。
+// 只有拿到它时，破坏性桩化才会写下确定性的可恢复引用；为空时保持
+// 既有桩化文本不变，绝不承诺一个不存在的归档。
+func stubifyMessages(messages []Message, tc *TokenCounter, pivotText string, keepRecent int, keepThinking bool, dt *DecayTracker, sessionID string, requestIdx int, intensity float64, threshold int, recoveryRefs ...string) ([]Message, StubStats) {
+	recoveryRef := ""
+	for _, ref := range recoveryRefs {
+		if ref != "" {
+			recoveryRef = ref
+			break
+		}
+	}
 	// T-02-01: 防止恶意超大消息数组导致内存耗尽
 	const maxMessages = 10000
 	if len(messages) > maxMessages {
@@ -416,7 +441,7 @@ func stubifyMessages(messages []Message, tc *TokenCounter, pivotText string, kee
 				toolBlocksBefore++
 			}
 		}
-		blocks = stubToolResults(blocks, toolKWMap)
+		blocks = stubToolResults(blocks, toolKWMap, recoveryRef)
 
 		// Phase B: 桩化前提取文件路径（供 DecayTracker.SetFilePath 用）
 		var stubbedFilePath string
@@ -469,11 +494,16 @@ func removeThinking(blocks []ContentBlock) []ContentBlock {
 
 // stubToolResults 将 tool_result block 替换为桩化文本（STUB-02）。
 // Phase D: 通过 toolKWMap 查找匹配 tool_use 的关键词，追加 deep_search 提示。
-func stubToolResults(blocks []ContentBlock, toolKWMap map[string]string) []ContentBlock {
+func stubToolResults(blocks []ContentBlock, toolKWMap map[string]string, recoveryRef string) []ContentBlock {
 	result := make([]ContentBlock, 0, len(blocks))
 	for _, block := range blocks {
 		if block.Type == "tool_result" {
 			stub := "[tool result archived]"
+			// 确定性恢复引用紧跟“已归档”声明，排在关键词提示之前：
+			// 前者是可精确查回的承诺，后者只是尽力而为的搜索线索。
+			if marker := formatArchiveRecoveryMarker(recoveryRef); marker != "" {
+				stub += " " + marker
+			}
 			// Phase D: 追加 deep_search 提示
 			if kw, ok := toolKWMap[block.ToolUseID]; ok && kw != "" {
 				stub += fmt.Sprintf(" → deep_search('%s')", sanitizeDSKeyword(kw))

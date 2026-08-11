@@ -226,6 +226,73 @@ type Server struct {
 	// outcomeSink 是生产 wiring 注入的唯一 nonblocking dispatcher；每个请求的
 	// collector 共享同一个实例，不为请求创建 sink、goroutine 或队列。
 	outcomeSink outcomeDispatcher
+	// archiveCommitter 是同步 durable-before-reference 的提交口。
+	// 它刻意不是普通 PersistenceWriter：Archive 属于 correctness gate，
+	// 必须在有损替换发生之前拿到确定结果，不能进 best-effort 队列。
+	archiveCommitter archiveCommitter
+	// archiveHealth 把同步 Archive commit 结果送进 sqlite_archive scope。
+	archiveHealth ArchiveCommitObserver
+}
+
+// archiveCommitter 是同步 Archive 提交合同。*SQLiteStore 满足它。
+type archiveCommitter interface {
+	SaveArchiveResult(ArchiveBlock) (ArchiveCommitResult, error)
+}
+
+// ArchiveCommitObserver 是同步 Archive commit 结果的 typed health 出口。
+// *PersistenceWriter 满足它，因此 sqlite_state 与 sqlite_archive 共用同一
+// tracker/reporter，但 Archive 永远不进入 writer 队列。
+type ArchiveCommitObserver interface {
+	ObserveArchiveCommit(ArchiveCommitResult) HealthTransition
+}
+
+// maxPrimaryRequestMessages 是主请求允许携带的消息条数上限。
+// 超限时必须在任何状态副作用之前拒绝，而不是静默截取一段窗口。
+const maxPrimaryRequestMessages = 10000
+
+func (s *Server) archiveCommitTarget() archiveCommitter {
+	if s.archiveCommitter != nil {
+		return s.archiveCommitter
+	}
+	if s.Store != nil {
+		return s.Store
+	}
+	return nil
+}
+
+// commitArchiveIntent 同步提交一次 Archive commit，并把 typed 结果直接写进
+// 本请求 closure 与 sqlite_archive health。
+// 它不调用 BeginAsyncResult、不占用普通 state 队列，也不因 state queue full
+// 改变行为。只有返回 ok=true 时调用方才允许物化破坏性替换与恢复 marker。
+func (s *Server) commitArchiveIntent(meta *requestMeta, block ArchiveBlock) (string, bool) {
+	committer := s.archiveCommitTarget()
+	if committer == nil {
+		return "", false
+	}
+	if meta != nil {
+		block.HistoryEpoch = meta.HistoryEpoch
+	}
+	result, err := committer.SaveArchiveResult(block)
+	outcome := requestOutcome(meta)
+	if outcome != nil {
+		outcome.MergeDiskState(result.State)
+		if result.State != persistenceStateSaved || result.ID == "" {
+			outcome.SetFailureClass(persistenceFailureArchive)
+		}
+	}
+	if s.archiveHealth != nil {
+		s.archiveHealth.ObserveArchiveCommit(result)
+	}
+	if result.State != persistenceStateSaved || result.ID == "" {
+		if meta != nil {
+			meta.Logger.Error("归档同步提交失败，破坏性压缩已放弃",
+				"failure_class", string(result.FailureClass),
+				"error", err,
+			)
+		}
+		return "", false
+	}
+	return result.ID, true
 }
 
 func (s *Server) nextRequestMeta(requestSessionID string) *requestMeta {
@@ -761,6 +828,27 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		// 到这里请求已被显式分类为可跟踪主请求：终端 ST 结果行只对它启用。
 		outcome.SetTerminalEligible(true)
 
+		// 消息数上限必须在 HistoryEpoch.Begin、request sequence 以及任何
+		// Decay/Frozen/Archive 读写之前判定。超限只拒绝，绝不静默取窗口——
+		// 静默截断会让后续所有状态都建立在一段不完整历史上。
+		if len(rawMessages) > maxPrimaryRequestMessages {
+			meta.Logger.Warn("主请求消息数超限，已拒绝",
+				"message_count", len(rawMessages),
+				"limit", maxPrimaryRequestMessages,
+			)
+			outcome.SetTriggerReason(TriggerUnknown)
+			outcome.SetAction(outcomeActionFailClosed)
+			outcome.SetIntervention(interventionRequired)
+			recordUpstreamOutcome(meta, upstreamStateNotStarted, 0)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": "too_many_messages",
+				"limit": maxPrimaryRequestMessages,
+			})
+			return
+		}
+
 		// History epoch gate：detach persistent context、清理已知 reminder 后，
 		// 在任何 request sequence、pressure、Frozen、Archive 或 Decay
 		// 状态读取前证明当前 raw history 的连续性。
@@ -1019,18 +1107,27 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 			// Phase A: CompressContext — 预压缩 keepRecent 外的 thinking block 和
 			// 超过 500 token 的 tool_result block，回收已被模型"消化"的上下文空间。
-			var compressResult CompressResult
-			messages, compressResult = CompressContext(messages, s.Config.Stubify.KeepRecent, s.TokenCounter)
-			if compressResult.ThinkingCompressed > 0 || compressResult.ToolResultsCompressed > 0 {
-				meta.Logger.Debug("compress_context 完成",
-					"thinkingCompressed", compressResult.ThinkingCompressed,
-					"toolResultsCompressed", compressResult.ToolResultsCompressed,
-					"tokensSaved", compressResult.TokensSaved,
-				)
-				// 更新 totalTokens，使下游衰减/折叠决策反映压缩后的实际压力
-				totalTokens -= compressResult.TokensSaved
-				if totalTokens < 0 {
-					totalTokens = 0
+			// D-22：这条路径会清空原文并写下"已压缩"提示，因此必须先把原文
+			// 同步落库，拿到 canonical ID 后才允许物化。
+			archiveBlocked := false
+			compressPlan := PlanCompressContext(messages, s.Config.Stubify.KeepRecent, s.TokenCounter)
+			if compressPlan.Destructive() {
+				intent := buildArchiveBlock(compressPlan.ArchiveMessages(), compressPlan.ArchiveCount(), s.TokenCounter, sessionID)
+				canonicalID, committed := s.commitArchiveIntent(meta, intent)
+				if !committed {
+					archiveBlocked = true
+				} else if compressed, compressResult, ok := compressPlan.Materialize(canonicalID); ok {
+					messages = compressed
+					meta.Logger.Debug("compress_context 完成",
+						"thinkingCompressed", compressResult.ThinkingCompressed,
+						"toolResultsCompressed", compressResult.ToolResultsCompressed,
+						"tokensSaved", compressResult.TokensSaved,
+					)
+					// 更新 totalTokens，使下游衰减/折叠决策反映压缩后的实际压力
+					totalTokens -= compressResult.TokensSaved
+					if totalTokens < 0 {
+						totalTokens = 0
+					}
 				}
 			}
 
@@ -1044,43 +1141,56 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			if tokenFloor < 10000 {
 				tokenFloor = 10000
 			}
-			cutoffIdx := CalcCollapseCutoff(messages, tokenFloor, s.TokenCounter, s.Config.Stubify.KeepRecent)
-			if cutoffIdx >= len(messages) {
-				meta.Logger.Warn("collapse cutoff 越界，回退到 stubify",
-					"cutoff", cutoffIdx, "message_count", len(messages))
-				cutoffIdx = -1
+			cutoffIdx := -1
+			switch {
+			case archiveBlocked:
+				// 归档不可用时不做任何破坏性替换。
+			case !s.Config.Collapse.Enabled:
+				// collapse.enabled 只关闭主 Collapse；fallback 压缩链保持可用。
+				meta.Logger.Debug("collapse 已按配置关闭，使用备用压缩链")
+			default:
+				cutoffIdx = CalcCollapseCutoff(messages, tokenFloor, s.TokenCounter, s.Config.Stubify.KeepRecent)
+				if cutoffIdx >= len(messages) {
+					meta.Logger.Warn("collapse cutoff 越界，回退到 stubify",
+						"cutoff", cutoffIdx, "message_count", len(messages))
+					cutoffIdx = -1
+				}
 			}
 
 			if cutoffIdx > 0 {
 				// ── PRIMARY PATH: Collapse ──
 
-				// 折叠消息：266 条 → blank[0] + archive block[1] + tail[cutoffIdx:]
-				// CollapseOldMessages 内部调用 buildArchiveBlock，返回 (messages, archiveBlock)
-				collapsedMessages, archiveBlock := CollapseOldMessages(
+				// 折叠意图：266 条 → blank[0] + archive block[1] + tail[cutoffIdx:]。
+				// 摘要里的恢复引用只有在 archive block 真正落库后才写入。
+				collapsePlan := PlanCollapse(
 					messages,         // CompressContext 后的消息（modified）
 					originalMessages, // 桩化前的原始消息（供 archive 提取完整摘要）
 					cutoffIdx,
 					s.TokenCounter,
 					sessionID,
 				)
-				if archiveBlock.ID == "" {
+				canonicalID := ""
+				committed := false
+				if collapsePlan.Valid() {
+					canonicalID, committed = s.commitArchiveIntent(meta, collapsePlan.Block)
+					if !committed {
+						archiveBlocked = true
+					}
+				}
+				collapsedMessages, materialized := []Message(nil), false
+				if committed {
+					collapsedMessages, materialized = collapsePlan.Materialize(canonicalID)
+				}
+				if !collapsePlan.Valid() {
 					meta.Logger.Warn("collapse 未生成有效存档，回退到 stubify",
 						"cutoff", cutoffIdx, "message_count", len(messages))
-				} else {
-
-					// 持久化到 SQLite（graceful degradation：失败不阻断请求）
-					if s.Store != nil {
-						archiveBlock.HistoryEpoch = meta.HistoryEpoch
-						if err := s.Store.SaveArchive(archiveBlock); err != nil {
-							meta.Logger.Error("保存存档失败", "error", err)
-						}
-					}
+				} else if materialized {
 
 					meta.Logger.Info("collapse 完成",
 						"before", len(messages),
 						"after", len(collapsedMessages),
 						"cutoff", cutoffIdx,
-						"archived_tokens", archiveBlock.EstimatedTokens,
+						"archived_tokens", collapsePlan.Block.EstimatedTokens,
 						LogGreen,
 					)
 
@@ -1136,11 +1246,51 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// ── FALLBACK PATH: stubify+decay（cutoffIdx <= 0，对标 YesMem StubifyWithTotal） ──
-			// 以下代码与当前 stubify+decay+compact 流程完全一致，不变。
+			// D-22：fallback 会桩化并清空正文、写下"已归档"提示，因此同样先把
+			// 本轮原文同步落库，拿到 canonical ID 之后才执行破坏性替换。
+			fallbackRecoveryRef := ""
+			if !archiveBlocked && fallbackWouldDestroyContent(messages, s.TokenCounter, threshold) {
+				intent := buildArchiveBlock(originalMessages, len(originalMessages), s.TokenCounter, sessionID)
+				canonicalID, committed := s.commitArchiveIntent(meta, intent)
+				if !committed {
+					archiveBlocked = true
+				} else {
+					fallbackRecoveryRef = canonicalID
+				}
+			}
+			if archiveBlocked {
+				// 归档不可用：所有破坏性压缩一律放弃。
+				outcome.SetAction(outcomeActionFailClosed)
+				outcome.SetFailureClass(persistenceFailureArchive)
+				if decision.SelectedPressure > triggerEvaluation.EmergencyThreshold {
+					// 不压缩必然超出必须满足的上下文限制，且压缩又无法保证可恢复：
+					// 只能返回稳定本地错误，绝不发送已损失信息的上游请求。
+					meta.Logger.Error("归档不可用且不压缩必然超限，拒绝发送已损失信息的请求",
+						"selected_pressure", decision.SelectedPressure,
+					)
+					outcome.SetIntervention(interventionRequired)
+					recordUpstreamOutcome(meta, upstreamStateNotStarted, 0)
+					writeGatewayJSON(w, http.StatusServiceUnavailable, "archive_persistence_unavailable")
+					return
+				}
+				meta.Logger.Warn("归档不可用，本轮保留原文不压缩",
+					"selected_pressure", decision.SelectedPressure,
+				)
+				s.applyCacheControl(messages, frozenPrefixLen, sessionID)
+				s.recordOutcomeSizes(meta, rawCutoff, rawEstimate, messages)
+				if newBody, err := rebuildBody(messages); err == nil {
+					r.Body = io.NopCloser(bytes.NewReader(newBody))
+				} else {
+					meta.Logger.Warn("归档不可用路径重建请求体失败", "error", err)
+					r.Body = io.NopCloser(bytes.NewReader(body))
+				}
+				s.forwardRaw(w, r, meta)
+				return
+			}
 
 			// 步骤 1: stubify（保护 messages[0] 和最近 keepRecent 条消息）
 			intensity := estimateIntensity(messages)
-			stubbedMessages, stats := stubifyMessages(messages, s.TokenCounter, pivotText, s.Config.Stubify.KeepRecent, s.Config.Stubify.KeepThinking, s.DecayTracker, stateKey, requestSeq, intensity, threshold)
+			stubbedMessages, stats := stubifyMessages(messages, s.TokenCounter, pivotText, s.Config.Stubify.KeepRecent, s.Config.Stubify.KeepThinking, s.DecayTracker, stateKey, requestSeq, intensity, threshold, fallbackRecoveryRef)
 
 			// 步骤 2: 在 stubify 的登记完成后复制 request-local pinned/state
 			// snapshot，并一次性预检唯一 CompactionPlan。生产链不再调用

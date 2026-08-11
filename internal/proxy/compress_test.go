@@ -792,16 +792,16 @@ func TestCompressContextArchiveCoverage(t *testing.T) {
 	if result.ToolResultsCompressed != 0 {
 		t.Fatalf("未落库仍统计了压缩: %+v", result)
 	}
-	if !strings.Contains(allText(t, preserved[2]), "compressible tool output line") {
-		t.Fatalf("Archive 未落库时原文被破坏: %s", allText(t, preserved[2]))
+	if !bytes.Contains(preserved[2].Content, []byte("compressible tool output line")) {
+		t.Fatalf("Archive 未落库时原文被破坏: %s", preserved[2].Content)
 	}
 
 	compressed, result, ok := plan.Materialize("canonical-compress-id")
 	if !ok || result.ToolResultsCompressed == 0 {
 		t.Fatalf("落库后应物化压缩: ok=%v result=%+v", ok, result)
 	}
-	text := allText(t, compressed[2])
-	if strings.Contains(text, "compressible tool output line\ncompressible") {
+	text := string(compressed[2].Content)
+	if strings.Contains(text, "compressible tool output line\\ncompressible") {
 		t.Fatalf("tool_result 未被压缩: %s", text)
 	}
 	if !strings.Contains(text, "recover('canonical-compress-id')") {

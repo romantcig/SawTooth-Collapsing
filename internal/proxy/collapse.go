@@ -130,6 +130,60 @@ func CollapseOldMessages(modified, original []Message, cutoffIdx int, tc *TokenC
 	return result, block
 }
 
+// archiveRecoveryMarkerPrefix 是确定性恢复引用的唯一前缀。
+// marker 只携带不透明 canonical ID，不含 session、路径、正文或关键词，
+// 因此它既能被精确查回原文，也不会把身份信息带进 wire。
+const archiveRecoveryMarkerPrefix = "→ recover('"
+
+// formatArchiveRecoveryMarker 只对已经落库的 canonical ID 生成引用。
+// 传入空 ID 返回空串——绝不生成指向未落库内容的“可恢复”承诺。
+func formatArchiveRecoveryMarker(canonicalID string) string {
+	if canonicalID == "" {
+		return ""
+	}
+	return archiveRecoveryMarkerPrefix + canonicalID + "')"
+}
+
+// CollapsePlan 是 Collapse 的破坏性意图：它已经算好了 archive block 与折叠后的
+// 消息形状，但还没有任何“已归档/可恢复”承诺。调用方必须先把 Block 同步落库、
+// 取得 canonical ID，才能 Materialize 出最终消息。
+type CollapsePlan struct {
+	Block        ArchiveBlock
+	messages     []Message
+	archiveIndex int
+	valid        bool
+}
+
+// PlanCollapse 生成折叠意图；cutoff 非法或摘要不可用时返回无效 plan。
+func PlanCollapse(modified, original []Message, cutoffIdx int, tc *TokenCounter, sessionID string) CollapsePlan {
+	collapsed, block := CollapseOldMessages(modified, original, cutoffIdx, tc, sessionID)
+	if block.ID == "" || len(collapsed) < 2 {
+		return CollapsePlan{}
+	}
+	// 索引 1 是折叠后的归档摘要消息本体：它位于 blank 首条之后、tail 之前，
+	// Stage-1/2 截断窗口都不会裁掉它，因此是恢复引用的受保护位置。
+	return CollapsePlan{Block: block, messages: collapsed, archiveIndex: 1, valid: true}
+}
+
+func (p CollapsePlan) Valid() bool { return p.valid }
+
+// Materialize 只在拿到已落库 canonical ID 后才产出折叠结果。
+func (p CollapsePlan) Materialize(canonicalID string) ([]Message, bool) {
+	if !p.valid || canonicalID == "" {
+		return nil, false
+	}
+	if p.archiveIndex < 0 || p.archiveIndex >= len(p.messages) {
+		return nil, false
+	}
+	content, err := json.Marshal(p.Block.SummaryText + "\n\n" + formatArchiveRecoveryMarker(canonicalID))
+	if err != nil {
+		return nil, false
+	}
+	result := append([]Message(nil), p.messages...)
+	result[p.archiveIndex] = Message{Role: "user", Content: content}
+	return result, true
+}
+
 // buildArchiveBlock 从消息数组创建 ArchiveBlock 结构，不格式化文本。
 // COLLAPSE-04, D-04
 func buildArchiveBlock(messages []Message, cutoffIdx int, tc *TokenCounter, sessionID string) ArchiveBlock {

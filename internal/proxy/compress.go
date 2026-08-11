@@ -68,10 +68,73 @@ func buildToolUseInfoExtended(messages []Message) map[string]toolUseInfoExtended
 //
 // The function returns a new Message slice (the input is not mutated).
 func CompressContext(messages []Message, keepRecent int, tc *TokenCounter) ([]Message, CompressResult) {
+	return compressContextWithRecovery(messages, keepRecent, tc, "")
+}
+
+// CompressContextPlan 是 CompressContext 的破坏性意图。
+// 预压缩会删除/清空 thinking 与大 tool_result 原文并写下“已压缩”提示，
+// 因此它必须先把原文落库，拿到 canonical ID 之后才允许物化替换与恢复引用。
+type CompressContextPlan struct {
+	Result     CompressResult
+	original   []Message
+	keepRecent int
+	tc         *TokenCounter
+	archive    []Message
+	scanEnd    int
+}
+
+// PlanCompressContext 只做纯计算：它试压一次以判断是否真的会破坏原文，
+// 并给出需要落库的原文范围。它不修改输入，也不产生任何恢复承诺。
+func PlanCompressContext(messages []Message, keepRecent int, tc *TokenCounter) CompressContextPlan {
+	_, result := compressContextWithRecovery(messages, keepRecent, tc, "")
+	plan := CompressContextPlan{Result: result, original: messages, keepRecent: keepRecent, tc: tc}
+	if result.ThinkingCompressed == 0 && result.ToolResultsCompressed == 0 {
+		return plan
+	}
+	scanEnd := compressScanEnd(messages, keepRecent)
+	plan.scanEnd = scanEnd
+	plan.archive = messages[:scanEnd]
+	return plan
+}
+
+// Destructive 表示本次预压缩确实会删除或清空原文。
+func (p CompressContextPlan) Destructive() bool { return len(p.archive) > 0 }
+
+// ArchiveMessages 返回需要在物化之前落库的权威原文。
+func (p CompressContextPlan) ArchiveMessages() []Message { return p.archive }
+
+// ArchiveCount 返回待归档原文的条数。
+func (p CompressContextPlan) ArchiveCount() int { return p.scanEnd }
+
+// Materialize 只在拿到已落库 canonical ID 后才执行破坏性替换。
+// canonicalID 为空时原样返回输入：宁可不压缩，也不写指向空处的恢复提示。
+func (p CompressContextPlan) Materialize(canonicalID string) ([]Message, CompressResult, bool) {
+	if !p.Destructive() || canonicalID == "" {
+		return p.original, CompressResult{}, false
+	}
+	compressed, result := compressContextWithRecovery(p.original, p.keepRecent, p.tc, canonicalID)
+	return compressed, result, true
+}
+
+// compressScanEnd 返回预压缩扫描窗口的右边界（不含）。
+func compressScanEnd(messages []Message, keepRecent int) int {
+	scanEnd := len(messages) - keepRecent
+	if scanEnd < 1 {
+		scanEnd = 1
+	}
+	return scanEnd
+}
+
+func compressContextWithRecovery(messages []Message, keepRecent int, tc *TokenCounter, canonicalID string) ([]Message, CompressResult) {
 	var result CompressResult
 
 	if len(messages) == 0 {
 		return messages, result
+	}
+
+	recovery := ""
+	if marker := formatArchiveRecoveryMarker(canonicalID); marker != "" {
+		recovery = " " + marker
 	}
 
 	// Pass 1: build tool_use_id → {name, keywords} index.
@@ -85,10 +148,7 @@ func CompressContext(messages []Message, keepRecent int, tc *TokenCounter) ([]Me
 
 	// Determine the scan window: [1, len(messages)-keepRecent).
 	// Never touch messages[0] (system message or equivalent).
-	scanEnd := len(messages) - keepRecent
-	if scanEnd < 1 {
-		scanEnd = 1
-	}
+	scanEnd := compressScanEnd(messages, keepRecent)
 
 	// Work on a copy to avoid mutating the input.
 	compressed := make([]Message, len(messages))
@@ -131,7 +191,7 @@ func CompressContext(messages []Message, keepRecent int, tc *TokenCounter) ([]Me
 						continue
 					}
 					// 无签名 thinking 沿用 YesMem 的可见占位符。
-					block.Thinking = "[context compressed: thinking block]"
+					block.Thinking = "[context compressed: thinking block]" + recovery
 					result.ThinkingCompressed++
 					modified = true
 				}
@@ -147,7 +207,7 @@ func CompressContext(messages []Message, keepRecent int, tc *TokenCounter) ([]Me
 					summary := buildToolResultSummary(block, info)
 
 					// 浅拷贝保留所有未知字段（对标 YesMem shallowCopyMap）
-					block.Content = summary
+					block.Content = summary + recovery
 					result.ToolResultsCompressed++
 					modified = true
 				}

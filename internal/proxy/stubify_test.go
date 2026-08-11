@@ -183,7 +183,7 @@ func TestStubToolResultsWithDeepSearch(t *testing.T) {
 		{Type: "text", Text: "plain text"},
 	}
 
-	result := stubToolResults(blocks, toolKWMap)
+	result := stubToolResults(blocks, toolKWMap, "")
 
 	if len(result) != 4 {
 		t.Fatalf("expected 4 blocks, got %d", len(result))
@@ -216,7 +216,7 @@ func TestStubToolResultsNilMap(t *testing.T) {
 	blocks := []ContentBlock{
 		{Type: "tool_result", ToolUseID: "tool_1", Content: "data"},
 	}
-	result := stubToolResults(blocks, nil)
+	result := stubToolResults(blocks, nil, "")
 	if !strings.Contains(result[0].Text, "[tool result archived]") {
 		t.Errorf("should work with nil map, got: %s", result[0].Text)
 	}
