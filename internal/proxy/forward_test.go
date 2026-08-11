@@ -1898,3 +1898,251 @@ func assertLogFields(t *testing.T, output string, fields ...string) {
 		}
 	}
 }
+
+// ── Plan 06 Task 1：upstream 生命周期终态矩阵 ──
+
+func newForwardOutcomeServer(t *testing.T, upstreamURL string) *Server {
+	t.Helper()
+	cfg := DefaultConfig()
+	cfg.Proxy.Target = upstreamURL
+	cfg.Proxy.Deflation = 1
+	cfg.Debug.Enabled = false
+	cfg.Transport.HardTimeout = 0
+	return NewServer(cfg)
+}
+
+func forwardOutcomeRequest(t *testing.T, server *Server, body string) (requestOutcomeSnapshot, *httptest.ResponseRecorder) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	meta := newRequestMeta(1, "forward-outcome-session")
+	sink := &recordingOutcomeDispatcher{}
+	meta.Outcome.SetDispatcher(sink)
+	recorder := httptest.NewRecorder()
+	server.forwardRaw(recorder, req, meta)
+	if err := meta.Outcome.SealProducers(); err != nil {
+		t.Fatalf("SealProducers: %v", err)
+	}
+	return sink.sole(t), recorder
+}
+
+func TestForwardOutcomeJSONAndSSEMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		contentType string
+		payload     string
+		stream      bool
+		wantStatus  int
+	}{
+		{
+			name: "json_2xx", contentType: "application/json",
+			payload: `{"type":"message","usage":{"input_tokens":42,"output_tokens":1}}`,
+		},
+		{
+			name: "json_no_usage", contentType: "application/json",
+			payload: `{"type":"message"}`,
+		},
+		{
+			name: "json_malformed", contentType: "application/json",
+			payload: `not json at all`,
+		},
+		{
+			name: "sse_complete", contentType: "text/event-stream", stream: true,
+			payload: "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"type\":\"message\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n" +
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+		},
+		{
+			name: "sse_no_usage", contentType: "text/event-stream", stream: true,
+			payload: "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				_, _ = io.WriteString(w, tc.payload)
+			}))
+			defer upstream.Close()
+			server := newForwardOutcomeServer(t, upstream.URL)
+			body := `{"model":"m","messages":[]}`
+			if tc.stream {
+				body = `{"model":"m","stream":true,"messages":[]}`
+			}
+			snapshot, recorder := forwardOutcomeRequest(t, server, body)
+			if snapshot.UpstreamState != upstreamStateSuccess {
+				t.Fatalf("upstream_state=%s, want success", snapshot.UpstreamState)
+			}
+			if snapshot.UpstreamStatus != http.StatusOK {
+				t.Fatalf("upstream_status=%d, want 200", snapshot.UpstreamStatus)
+			}
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("下游 status=%d, want 200", recorder.Code)
+			}
+		})
+	}
+}
+
+func TestForwardOutcomeFailureMatrix(t *testing.T) {
+	t.Run("non_2xx", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = io.WriteString(w, `{"error":"rate limited"}`)
+		}))
+		defer upstream.Close()
+		server := newForwardOutcomeServer(t, upstream.URL)
+		snapshot, _ := forwardOutcomeRequest(t, server, `{"model":"m","messages":[]}`)
+		if snapshot.UpstreamState != upstreamStateNon2xx || snapshot.UpstreamStatus != http.StatusTooManyRequests {
+			t.Fatalf("upstream=%s/%d, want non_2xx/429", snapshot.UpstreamState, snapshot.UpstreamStatus)
+		}
+		if snapshot.FailureClass != persistenceFailureUpstream {
+			t.Fatalf("failure_class=%s, want upstream", snapshot.FailureClass)
+		}
+	})
+
+	t.Run("transport_failure", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		url := upstream.URL
+		upstream.Close()
+		server := newForwardOutcomeServer(t, url)
+		snapshot, recorder := forwardOutcomeRequest(t, server, `{"model":"m","messages":[]}`)
+		if snapshot.UpstreamState != upstreamStateTransportFailure {
+			t.Fatalf("upstream_state=%s, want transport_failure", snapshot.UpstreamState)
+		}
+		if recorder.Code != http.StatusBadGateway {
+			t.Fatalf("下游 status=%d, want 502", recorder.Code)
+		}
+		if strings.Contains(recorder.Body.String(), "127.0.0.1") && strings.Contains(recorder.Body.String(), "@") {
+			t.Fatalf("网关响应泄漏凭证: %s", recorder.Body.String())
+		}
+	})
+
+	t.Run("header_timeout", func(t *testing.T) {
+		release := make(chan struct{})
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			<-release
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{}`)
+		}))
+		defer func() {
+			close(release)
+			upstream.Close()
+		}()
+		server := newForwardOutcomeServer(t, upstream.URL)
+		server.Config.Transport.NonStreamHeaderTimeout = 40 * time.Millisecond
+		server.HTTPClient = newUpstreamHTTPClient(server.Config.Transport)
+		snapshot, recorder := forwardOutcomeRequest(t, server, `{"model":"m","messages":[]}`)
+		if snapshot.UpstreamState != upstreamStateHeaderTimeout {
+			t.Fatalf("upstream_state=%s, want header_timeout", snapshot.UpstreamState)
+		}
+		if recorder.Code != http.StatusGatewayTimeout {
+			t.Fatalf("下游 status=%d, want 504", recorder.Code)
+		}
+	})
+
+	t.Run("hard_timeout", func(t *testing.T) {
+		release := make(chan struct{})
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			<-release
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{}`)
+		}))
+		defer func() {
+			close(release)
+			upstream.Close()
+		}()
+		server := newForwardOutcomeServer(t, upstream.URL)
+		server.Config.Transport.HardTimeout = 40 * time.Millisecond
+		server.HTTPClient = newUpstreamHTTPClient(server.Config.Transport)
+		snapshot, _ := forwardOutcomeRequest(t, server, `{"model":"m","messages":[]}`)
+		if snapshot.UpstreamState != upstreamStateHardTimeout {
+			t.Fatalf("upstream_state=%s, want hard_timeout", snapshot.UpstreamState)
+		}
+	})
+
+	t.Run("committed_stream_failure", func(t *testing.T) {
+		server := NewServer(Config{Proxy: ProxyConfig{Deflation: 1}})
+		meta := newRequestMeta(1, "forward-committed-session")
+		sink := &recordingOutcomeDispatcher{}
+		meta.Outcome.SetDispatcher(sink)
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body: &readThenErrorCloser{
+				reader: strings.NewReader("event: message_start\n" +
+					"data: {\"type\":\"message_start\",\"message\":{\"type\":\"message\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n"),
+				err: errors.New("upstream stream reset"),
+			},
+		}
+		recorder := httptest.NewRecorder()
+		result := server.handleSSE(recorder, resp, meta, time.Now(), "model", 1)
+		if result.err == nil {
+			t.Fatal("被中断的 SSE 应返回错误")
+		}
+		if err := meta.Outcome.SealProducers(); err != nil {
+			t.Fatalf("SealProducers: %v", err)
+		}
+		snapshot := sink.sole(t)
+		if snapshot.UpstreamState != upstreamStateCommittedFailure {
+			t.Fatalf("upstream_state=%s, want committed_failure", snapshot.UpstreamState)
+		}
+	})
+
+	t.Run("json_body_read_failure", func(t *testing.T) {
+		server := NewServer(Config{Proxy: ProxyConfig{Deflation: 1}})
+		meta := newRequestMeta(1, "forward-body-read-session")
+		sink := &recordingOutcomeDispatcher{}
+		meta.Outcome.SetDispatcher(sink)
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"application/json"}, "Content-Encoding": {"gzip"}},
+			Body:       io.NopCloser(strings.NewReader("not gzip at all")),
+		}
+		recorder := httptest.NewRecorder()
+		if result := server.handleJSON(recorder, resp, meta, time.Now(), "model", 1); result.err == nil {
+			t.Fatal("gzip 解压失败应返回错误")
+		}
+		if err := meta.Outcome.SealProducers(); err != nil {
+			t.Fatalf("SealProducers: %v", err)
+		}
+		if got := sink.sole(t).UpstreamState; got != upstreamStateBodyReadFailure {
+			t.Fatalf("upstream_state=%s, want body_read_failure", got)
+		}
+	})
+
+	t.Run("downstream_write_failure", func(t *testing.T) {
+		server := NewServer(Config{Proxy: ProxyConfig{Deflation: 1}})
+		meta := newRequestMeta(1, "forward-downstream-session")
+		sink := &recordingOutcomeDispatcher{}
+		meta.Outcome.SetDispatcher(sink)
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"type":"message"}`)),
+		}
+		writer := &failingResponseWriter{header: http.Header{}}
+		if result := server.handleJSON(writer, resp, meta, time.Now(), "model", 1); result.failureClass != downstreamWriteFailureClass {
+			t.Fatalf("failure_class=%q, want %q", result.failureClass, downstreamWriteFailureClass)
+		}
+		if err := meta.Outcome.SealProducers(); err != nil {
+			t.Fatalf("SealProducers: %v", err)
+		}
+		if got := sink.sole(t).UpstreamState; got != upstreamStateCommittedFailure {
+			t.Fatalf("upstream_state=%s, want committed_failure", got)
+		}
+	})
+}
+
+// failingResponseWriter 在 WriteHeader 之后让 Write 失败，用于证明下游写失败
+// 不会被伪装成 upstream success。
+type failingResponseWriter struct {
+	header http.Header
+	status int
+}
+
+func (w *failingResponseWriter) Header() http.Header { return w.header }
+
+func (w *failingResponseWriter) WriteHeader(status int) { w.status = status }
+
+func (w *failingResponseWriter) Write([]byte) (int, error) {
+	return 0, errors.New("downstream connection reset")
+}

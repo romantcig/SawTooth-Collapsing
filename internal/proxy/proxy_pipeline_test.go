@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -2021,4 +2022,470 @@ func pipelineMessages(count, words int) []Message {
 		messages[i] = Message{Role: role, Content: mustMarshal(text)}
 	}
 	return messages
+}
+
+// ── Plan 06 Task 1：request / upstream / persistence outcome 生命周期 ──
+
+// recordingOutcomeDispatcher 记录每个请求最终 dispatch 的 immutable snapshot。
+// 它不做任何投影，只证明「每个 return 都恰好汇合一次真实终态」。
+type recordingOutcomeDispatcher struct {
+	mu        sync.Mutex
+	snapshots []requestOutcomeSnapshot
+	admission outcomeDispatchResult
+}
+
+func (d *recordingOutcomeDispatcher) TryDispatch(snapshot requestOutcomeSnapshot) outcomeDispatchResult {
+	d.mu.Lock()
+	d.snapshots = append(d.snapshots, snapshot)
+	result := d.admission
+	d.mu.Unlock()
+	result.Accepted = true
+	return result
+}
+
+func (d *recordingOutcomeDispatcher) all() []requestOutcomeSnapshot {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]requestOutcomeSnapshot(nil), d.snapshots...)
+}
+
+func (d *recordingOutcomeDispatcher) count() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.snapshots)
+}
+
+func (d *recordingOutcomeDispatcher) sole(t *testing.T) requestOutcomeSnapshot {
+	t.Helper()
+	got := d.all()
+	if len(got) != 1 {
+		t.Fatalf("dispatch 次数=%d, want 1: %+v", len(got), got)
+	}
+	return got[0]
+}
+
+func (d *recordingOutcomeDispatcher) waitFor(t *testing.T, want int) []requestOutcomeSnapshot {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if d.count() >= want {
+			return d.all()
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("等待 %d 次 dispatch 超时，实际 %d", want, d.count())
+	return nil
+}
+
+// blockingStateBackend 是不依赖具体 state key 的可阻塞/可失败 backend。
+type blockingStateBackend struct {
+	mu      sync.Mutex
+	gate    chan struct{}
+	started chan struct{}
+	once    sync.Once
+	calls   int
+	failAll bool
+}
+
+func newBlockingStateBackend() *blockingStateBackend {
+	return &blockingStateBackend{started: make(chan struct{})}
+}
+
+func (b *blockingStateBackend) block() {
+	b.mu.Lock()
+	if b.gate == nil {
+		b.gate = make(chan struct{})
+	}
+	b.mu.Unlock()
+}
+
+func (b *blockingStateBackend) release() {
+	b.mu.Lock()
+	gate := b.gate
+	b.gate = nil
+	b.mu.Unlock()
+	if gate != nil {
+		close(gate)
+	}
+}
+
+func (b *blockingStateBackend) callCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.calls
+}
+
+func (b *blockingStateBackend) run() error {
+	b.mu.Lock()
+	b.calls++
+	gate := b.gate
+	shouldFail := b.failAll
+	b.mu.Unlock()
+	if gate != nil {
+		b.once.Do(func() { close(b.started) })
+		<-gate
+	}
+	if shouldFail {
+		return errors.New("forced state backend failure")
+	}
+	return nil
+}
+
+func (b *blockingStateBackend) PersistState(string, string) error { return b.run() }
+
+func (b *blockingStateBackend) DeleteState(string) error { return b.run() }
+
+func newOutcomePipelineServer(t *testing.T, upstreamURL string) (*Server, *recordingOutcomeDispatcher) {
+	t.Helper()
+	server := newPipelineTestServer(t, upstreamURL)
+	sink := &recordingOutcomeDispatcher{}
+	server.outcomeSink = sink
+	return server, sink
+}
+
+// jsonOutcomeUpstream 返回一个稳定的 2xx JSON 上游，带合法 Anthropic usage。
+func jsonOutcomeUpstream(t *testing.T) *httptest.Server {
+	t.Helper()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":1200,"output_tokens":7}}`))
+	}))
+	t.Cleanup(upstream.Close)
+	return upstream
+}
+
+func serveOutcomeBody(t *testing.T, server *Server, sessionID string, body []byte, headers map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Claude-Code-Session-Id", sessionID)
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+	recorder := httptest.NewRecorder()
+	server.HandleMessages(recorder, req)
+	return recorder
+}
+
+func serveOutcomeMessages(t *testing.T, server *Server, sessionID string, messages []Message) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"model": "deepseek-v4-pro", "messages": messages})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	return serveOutcomeBody(t, server, sessionID, body, nil)
+}
+
+func assertOutcome(t *testing.T, snapshot requestOutcomeSnapshot, eligibility, terminal outcomeEligibility, action outcomeAction, upstream upstreamState) {
+	t.Helper()
+	if snapshot.Eligibility != eligibility {
+		t.Errorf("eligibility=%s, want %s", snapshot.Eligibility, eligibility)
+	}
+	if snapshot.TerminalEligibility != terminal {
+		t.Errorf("terminal_eligibility=%s, want %s", snapshot.TerminalEligibility, terminal)
+	}
+	if snapshot.Action != action {
+		t.Errorf("action=%s, want %s", snapshot.Action, action)
+	}
+	if snapshot.UpstreamState != upstream {
+		t.Errorf("upstream_state=%s, want %s", snapshot.UpstreamState, upstream)
+	}
+	if snapshot.FinishedAt.IsZero() {
+		t.Error("finalized snapshot 缺少 finished_at")
+	}
+}
+
+func TestRequestOutcomeAllEarlyReturns(t *testing.T) {
+	upstream := jsonOutcomeUpstream(t)
+	titleBody, err := os.ReadFile(filepath.Join("testdata", "auxiliary", "session-title.json"))
+	if err != nil {
+		t.Fatalf("读取 session title fixture: %v", err)
+	}
+	normalBody, err := json.Marshal(map[string]any{"model": "m", "messages": pipelineMessages(4, 3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name        string
+		body        []byte
+		headers     map[string]string
+		disable     bool
+		eligibility outcomeEligibility
+		terminal    outcomeEligibility
+		action      outcomeAction
+		upstream    upstreamState
+	}{
+		{
+			name: "stateless", body: normalBody, disable: true,
+			eligibility: outcomeEligibilityNotEvaluable, terminal: outcomeEligibilityNotApplicable,
+			action: outcomeActionPassthrough, upstream: upstreamStateSuccess,
+		},
+		{
+			name: "invalid_json", body: []byte(`{"model":`),
+			eligibility: outcomeEligibilityNotEvaluable, terminal: outcomeEligibilityNotApplicable,
+			action: outcomeActionPassthrough, upstream: upstreamStateSuccess,
+		},
+		{
+			name: "missing_messages", body: []byte(`{"model":"m"}`),
+			eligibility: outcomeEligibilityNotEvaluable, terminal: outcomeEligibilityNotApplicable,
+			action: outcomeActionPassthrough, upstream: upstreamStateSuccess,
+		},
+		{
+			name: "malformed_messages", body: []byte(`{"model":"m","messages":{"role":"user"}}`),
+			eligibility: outcomeEligibilityNotEvaluable, terminal: outcomeEligibilityNotApplicable,
+			action: outcomeActionPassthrough, upstream: upstreamStateSuccess,
+		},
+		{
+			name: "session_title", body: titleBody,
+			eligibility: outcomeEligibilityNotEvaluable, terminal: outcomeEligibilityTerminalIneligible,
+			action: outcomeActionPassthrough, upstream: upstreamStateSuccess,
+		},
+		{
+			name: "subagent", body: normalBody, headers: map[string]string{"X-Claude-Code-Agent-Id": "agent-1"},
+			eligibility: outcomeEligibilityNotEvaluable, terminal: outcomeEligibilityTerminalIneligible,
+			action: outcomeActionPassthrough, upstream: upstreamStateSuccess,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, sink := newOutcomePipelineServer(t, upstream.URL)
+			if tc.disable {
+				server.TokenCounter = nil
+				server.DecayTracker = nil
+			}
+			serveOutcomeBody(t, server, "outcome-early-"+tc.name, tc.body, tc.headers)
+			assertOutcome(t, sink.sole(t), tc.eligibility, tc.terminal, tc.action, tc.upstream)
+		})
+	}
+
+	t.Run("oversized_body", func(t *testing.T) {
+		server, sink := newOutcomePipelineServer(t, upstream.URL)
+		oversized := make([]byte, 10*1024*1024+16)
+		for index := range oversized {
+			oversized[index] = 'x'
+		}
+		recorder := serveOutcomeBody(t, server, "outcome-oversized", oversized, nil)
+		if recorder.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("status=%d, want 413", recorder.Code)
+		}
+		snapshot := sink.sole(t)
+		assertOutcome(t, snapshot, outcomeEligibilityNotEvaluable, outcomeEligibilityNotApplicable,
+			outcomeActionUnavailable, upstreamStateNotStarted)
+		if snapshot.Intervention != interventionRequired {
+			t.Fatalf("intervention=%s, want required", snapshot.Intervention)
+		}
+	})
+}
+
+func TestRequestOutcomeActionMatrix(t *testing.T) {
+	upstream := jsonOutcomeUpstream(t)
+
+	t.Run("direct", func(t *testing.T) {
+		server, sink := newOutcomePipelineServer(t, upstream.URL)
+		serveOutcomeMessages(t, server, "outcome-direct", pipelineMessages(4, 3))
+		snapshot := sink.sole(t)
+		assertOutcome(t, snapshot, outcomeEligibilityEvaluable, outcomeEligibilityTerminalEligible,
+			outcomeActionDirect, upstreamStateSuccess)
+		if snapshot.TriggerReason != TriggerNone {
+			t.Fatalf("trigger=%s, want none", snapshot.TriggerReason)
+		}
+		if snapshot.BeforeMessages == 0 || snapshot.AfterMessages == 0 {
+			t.Fatalf("before/after messages=%d/%d, want 非零", snapshot.BeforeMessages, snapshot.AfterMessages)
+		}
+	})
+
+	t.Run("collapse", func(t *testing.T) {
+		server, sink := newOutcomePipelineServer(t, upstream.URL)
+		serveOutcomeMessages(t, server, "outcome-collapse", pipelineMessages(80, 260))
+		snapshot := sink.sole(t)
+		assertOutcome(t, snapshot, outcomeEligibilityEvaluable, outcomeEligibilityTerminalEligible,
+			outcomeActionCollapse, upstreamStateSuccess)
+		if snapshot.TriggerReason == TriggerNone || snapshot.TriggerReason == TriggerUnknown {
+			t.Fatalf("trigger=%s, want 明确触发原因", snapshot.TriggerReason)
+		}
+		if snapshot.AfterMessages >= snapshot.BeforeMessages {
+			t.Fatalf("collapse 后消息数=%d, want < %d", snapshot.AfterMessages, snapshot.BeforeMessages)
+		}
+	})
+
+	t.Run("fallback", func(t *testing.T) {
+		server, sink := newOutcomePipelineServer(t, upstream.URL)
+		server.Config.Collapse.Enabled = false
+		serveOutcomeMessages(t, server, "outcome-fallback", pipelineMessages(80, 260))
+		snapshot := sink.sole(t)
+		if snapshot.Action != outcomeActionFallback && snapshot.Action != outcomeActionCompact {
+			t.Fatalf("action=%s, want fallback 或 compact", snapshot.Action)
+		}
+		if snapshot.Eligibility != outcomeEligibilityEvaluable ||
+			snapshot.TerminalEligibility != outcomeEligibilityTerminalEligible {
+			t.Fatalf("eligibility=%s/%s", snapshot.Eligibility, snapshot.TerminalEligibility)
+		}
+	})
+}
+
+func TestRequestOutcomeLoadFailureMatrix(t *testing.T) {
+	upstream := jsonOutcomeUpstream(t)
+	failing := stateLoaderFunc(func(string) StateLoadResult {
+		return StateLoadResult{Err: ErrStateLoadClosed, FailureClass: StateLoadFailureSQLiteClosed}
+	})
+
+	t.Run("history", func(t *testing.T) {
+		server, sink := newOutcomePipelineServer(t, upstream.URL)
+		server.HistoryEpoch.SetStateLoader(failing)
+		searchCalls := 0
+		server.searchAndExpandFn = func(messages []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, _ *requestMeta) RecallOutcome {
+			searchCalls++
+			return RecallOutcome{Messages: messages}
+		}
+		serveOutcomeMessages(t, server, "outcome-history-load-fail", pipelineMessages(6, 4))
+		snapshot := sink.sole(t)
+		assertOutcome(t, snapshot, outcomeEligibilityNotEvaluable, outcomeEligibilityTerminalEligible,
+			outcomeActionFailClosed, upstreamStateSuccess)
+		if snapshot.FailureClass != persistenceFailureSQLite {
+			t.Fatalf("failure_class=%s, want sqlite", snapshot.FailureClass)
+		}
+		if snapshot.TriggerReason != TriggerUnknown {
+			t.Fatalf("trigger=%s, want unknown", snapshot.TriggerReason)
+		}
+		if searchCalls != 0 {
+			t.Fatalf("history fail-closed 仍读取了派生状态: %d 次召回", searchCalls)
+		}
+	})
+
+	for _, tc := range []struct {
+		name      string
+		configure func(*Server)
+	}{
+		{"frozen", func(s *Server) { s.Frozen.SetStateLoader(failing) }},
+		{"sawtooth", func(s *Server) { s.Sawtooth.SetStateLoader(failing) }},
+		{"decay", func(s *Server) { s.DecayTracker.SetStateLoader(failing) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, sink := newOutcomePipelineServer(t, upstream.URL)
+			tc.configure(server)
+			serveOutcomeMessages(t, server, "outcome-load-"+tc.name, pipelineMessages(80, 260))
+			snapshot := sink.sole(t)
+			if snapshot.FailureClass != persistenceFailureSQLite {
+				t.Fatalf("failure_class=%s, want sqlite", snapshot.FailureClass)
+			}
+			if snapshot.TerminalEligibility != outcomeEligibilityTerminalEligible {
+				t.Fatalf("terminal_eligibility=%s, want terminal_eligible", snapshot.TerminalEligibility)
+			}
+			if snapshot.UpstreamState != upstreamStateSuccess {
+				t.Fatalf("upstream=%s, want success", snapshot.UpstreamState)
+			}
+		})
+	}
+}
+
+func TestRequestOutcomePersistenceCompletion(t *testing.T) {
+	upstream := jsonOutcomeUpstream(t)
+
+	t.Run("fast_receipt", func(t *testing.T) {
+		server, sink := newOutcomePipelineServer(t, upstream.URL)
+		backend := newBlockingStateBackend()
+		writer, _, _ := newPersistenceWriterTest(t, backend)
+		defer writer.CloseAndDrain()
+		server.Frozen.SetStateSubmitter(writer)
+		server.DecayTracker.SetStateSubmitter(writer)
+
+		serveOutcomeMessages(t, server, "outcome-persist-fast", pipelineMessages(80, 260))
+		snapshots := sink.waitFor(t, 1)
+		if got := snapshots[0].DiskState; got != persistenceStateSaved {
+			t.Fatalf("disk_state=%s, want saved", got)
+		}
+	})
+
+	t.Run("blocked_receipt", func(t *testing.T) {
+		server, sink := newOutcomePipelineServer(t, upstream.URL)
+		backend := newBlockingStateBackend()
+		backend.block()
+		writer, _, _ := newPersistenceWriterTest(t, backend)
+		defer func() {
+			backend.release()
+			_ = writer.CloseAndDrain()
+		}()
+		server.Frozen.SetStateSubmitter(writer)
+		server.DecayTracker.SetStateSubmitter(writer)
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			serveOutcomeMessages(t, server, "outcome-persist-blocked", pipelineMessages(80, 260))
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("HTTP handler 被 blocked persistence receipt 拖住")
+		}
+		<-backend.started
+		if sink.count() != 0 {
+			t.Fatalf("pending receipt 未解析就已 dispatch: %d", sink.count())
+		}
+		backend.release()
+		snapshots := sink.waitFor(t, 1)
+		if got := snapshots[0].DiskState; got != persistenceStateSaved {
+			t.Fatalf("释放后 disk_state=%s, want saved", got)
+		}
+	})
+
+	t.Run("queue_full", func(t *testing.T) {
+		server, sink := newOutcomePipelineServer(t, upstream.URL)
+		backend := newBlockingStateBackend()
+		backend.block()
+		writer, _, reporter := newPersistenceWriterTest(t, backend)
+		for index := 0; index <= PersistenceWriterQueueCapacity; index++ {
+			if _, err := writer.TrySubmit(PersistenceOp{
+				Target: PersistenceTargetState, Kind: PersistenceOpPut,
+				OrderingKey: "frozen:saturate", Key: "frozen:saturate", Value: "v",
+			}); err != nil {
+				t.Fatalf("预填充 queue: %v", err)
+			}
+		}
+		defer func() {
+			backend.release()
+			_ = writer.CloseAndDrain()
+		}()
+		server.Frozen.SetStateSubmitter(writer)
+		server.DecayTracker.SetStateSubmitter(writer)
+
+		serveOutcomeMessages(t, server, "outcome-persist-full", pipelineMessages(80, 260))
+		snapshots := sink.waitFor(t, 1)
+		if got := snapshots[0].DiskState; got != persistenceStateUnavailable {
+			t.Fatalf("disk_state=%s, want unavailable", got)
+		}
+		if got := snapshots[0].FailureClass; got != persistenceFailureQueueFull {
+			t.Fatalf("failure_class=%s, want queue_full", got)
+		}
+		if reporter.count(HealthScopeSQLiteState, HealthTransitionKindEntered) != 0 {
+			t.Fatal("queue full 被伪装成 SQLite 故障")
+		}
+	})
+}
+
+func TestPressureAndUsageFactsRemain(t *testing.T) {
+	upstream := jsonOutcomeUpstream(t)
+	server, sink := newOutcomePipelineServer(t, upstream.URL)
+	dataDir := t.TempDir()
+	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, FullBody: false, DataDir: dataDir})
+
+	const sessionID = "outcome-facts-session"
+	serveOutcomeMessages(t, server, sessionID, pipelineMessages(6, 4))
+
+	facts := debugFactsByStage(t, dataDir, sessionID)
+	pressure, hasPressure := facts[debugStagePressureDecision]
+	usage, hasUsage := facts[debugStageResponseUsage]
+	if !hasPressure || !hasUsage {
+		t.Fatalf("Phase 10 技术事实被 collector 吞掉: pressure=%v usage=%v", hasPressure, hasUsage)
+	}
+	snapshot := sink.sole(t)
+	if snapshot.RequestID == 0 {
+		t.Fatal("outcome 未携带请求 ID")
+	}
+	for name, fact := range map[string]map[string]any{"pressure": pressure, "usage": usage} {
+		id, _ := fact["request_id"].(float64)
+		if uint64(id) != snapshot.RequestID {
+			t.Fatalf("%s facts request_id=%v, want %d", name, fact["request_id"], snapshot.RequestID)
+		}
+	}
 }
