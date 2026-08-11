@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"strconv"
@@ -106,25 +107,130 @@ func TestStartupTerminalOmitsWaitDetailsForEphemeralAndOneHour(t *testing.T) {
 	}
 }
 
-func TestStartupDoesNotEnableAsyncObservability(t *testing.T) {
+func TestProductionPersistenceOutcomeWiring(t *testing.T) {
+	text := readMainSource(t)
+
+	for literal, want := range map[string]int{
+		"proxy.NewHealthTracker(":            1,
+		"proxy.NewTerminalHealthReporter(":   1,
+		"proxy.NewPersistenceWriterChecked(": 1,
+		"proxy.NewOutcomeDispatcherChecked(": 1,
+		"proxy.NewOutcomeGapAccumulator(":    1,
+		"proxy.NewSessionOutcomeWriter(":     1,
+		"srv.SetOutcomeDispatcher(":          1,
+		"srv.SetArchiveHealthObserver(":      1,
+	} {
+		if got := strings.Count(text, literal); got != want {
+			t.Errorf("main.go 中 %s 出现 %d 次, want %d", literal, got, want)
+		}
+	}
+	// 同一个 tracker/reporter 实例必须同时注入 writer 与 dispatcher。
+	if !strings.Contains(text, "healthTracker, healthReporter") {
+		t.Error("writer 未收到与 dispatcher 相同的 tracker/reporter 实例")
+	}
+	if !strings.Contains(text, "HealthTracker:     healthTracker") ||
+		!strings.Contains(text, "Reporter:          healthReporter") {
+		t.Error("dispatcher 未收到共享 tracker/reporter")
+	}
+	// History transition 与 Archive committer 均不得进入普通 writer。
+	if strings.Contains(text, "SetStateSubmitter") && !strings.Contains(text, "persistenceWriter") {
+		t.Error("state submitter 未接到全局 writer")
+	}
+	if strings.Contains(text, "HistoryEpoch.SetStateSubmitter") {
+		t.Error("history transition 被放进了普通 writer")
+	}
+	if !strings.Contains(text, "SetTransitionFunc(store.CommitHistoryTransition)") {
+		t.Error("history transition 未保持同步 Store 直连")
+	}
+	for _, forbidden := range []string{"nil, nil, nil", "no-op reporter"} {
+		if strings.Contains(text, forbidden) {
+			t.Errorf("main.go 出现 nil/no-op wiring: %s", forbidden)
+		}
+	}
+}
+
+func TestProductionHealthReporterIsTerminalOnly(t *testing.T) {
+	text := readMainSource(t)
+	index := strings.Index(text, "proxy.NewTerminalHealthReporter(")
+	if index < 0 {
+		t.Fatal("main.go 未构造 terminal health reporter")
+	}
+	call := text[index : index+strings.Index(text[index:], ")")+1]
+	if !strings.Contains(call, "terminalHandler") {
+		t.Fatalf("health reporter 未直接绑定终端 handler: %s", call)
+	}
+	for _, forbidden := range []string{"fileHandler", "combined", "Combined", "SessionLog", "slog.Default"} {
+		if strings.Contains(call, forbidden) {
+			t.Fatalf("health reporter 被 file-capable logger 适配: %s", call)
+		}
+	}
+}
+
+func TestProductionUsesErrorAwareLoadersOnly(t *testing.T) {
+	text := readMainSource(t)
+	if got := strings.Count(text, "SetStateLoader(store)"); got != 4 {
+		t.Fatalf("error-aware loader 接线=%d 处, want 4", got)
+	}
+	for _, forbidden := range []string{"SetLoadFunc(store.LoadState)", "store.LoadState)", ".LoadState("} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("main.go 仍引用 bool-only loader: %s", forbidden)
+		}
+	}
+}
+
+func TestProductionDoesNotDiscardStoreErrors(t *testing.T) {
+	text := readMainSource(t)
+	for _, forbidden := range []string{
+		"_ = store.PersistState(",
+		"_ = store.DeleteState(",
+		"_ = store.SaveArchive",
+		"_ = srv.Store.PersistState(",
+	} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("main.go 用忽略返回值的闭包包装 Store 写入: %s", forbidden)
+		}
+	}
+	if strings.Contains(text, "os.Exit(0)") {
+		t.Fatal("signal 路径仍直接 os.Exit")
+	}
+}
+
+func TestShutdownStrictDrainOrder(t *testing.T) {
+	var recorded []lifecycleStage
+	record := func(stage lifecycleStage) { recorded = append(recorded, stage) }
+
+	steps := productionShutdownSteps(
+		func() error { return errors.New("http shutdown failed") },
+		func() error { return nil },
+		func() error { return nil },
+		func() error { return nil },
+	)
+	errs := runShutdown(steps, record)
+
+	want := []lifecycleStage{stageHTTPStopped, stagePersistenceDrained, stageOutcomeDrained, stageStoreClosed}
+	if len(recorded) != len(want) {
+		t.Fatalf("关闭阶段=%v, want %v", recorded, want)
+	}
+	for index := range want {
+		if recorded[index] != want[index] {
+			t.Fatalf("关闭顺序=%v, want %v", recorded, want)
+		}
+	}
+	if len(errs) != 1 {
+		t.Fatalf("阶段错误数=%d, want 1（前置失败不得中断后续安全阶段）", len(errs))
+	}
+	if !strings.Contains(errs[0].Error(), string(stageHTTPStopped)) {
+		t.Fatalf("阶段错误未标注来源: %v", errs[0])
+	}
+}
+
+func readMainSource(t *testing.T) string {
+	t.Helper()
 	source, err := os.ReadFile("main.go")
 	if err != nil {
 		t.Fatalf("读取 main.go: %v", err)
 	}
-	text := string(source)
-	for _, forbidden := range []string{"NewPersistenceWriter(", "NewOutcomeDispatcher("} {
-		if strings.Contains(text, forbidden) {
-			t.Fatalf("Task 2 不得提前启用异步组件: %s", forbidden)
-		}
-	}
-	if !strings.Contains(text, "proxy.CacheGapForTTL(cfg.Cache.CacheTTL)") {
-		t.Fatal("main 必须继续用 CacheGapForTTL 初始化真实 trigger")
-	}
-	signalIndex := strings.Index(text, "signal.Notify(sigCh, os.Interrupt)")
-	storeCloseIndex := strings.Index(text, "srv.Store.Close()")
-	if signalIndex < 0 || storeCloseIndex < 0 || storeCloseIndex < signalIndex {
-		t.Fatal("既有 signal/Store.Close shutdown 顺序被改动")
-	}
+	return string(source)
 }
 
 func assertStartupTextOmitsWaitDetails(t *testing.T, source, text string, runtimeTokens []string) {
