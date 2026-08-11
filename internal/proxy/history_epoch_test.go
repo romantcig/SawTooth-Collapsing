@@ -585,6 +585,184 @@ func TestHandleMessagesTransitionFailureForwardsRawWithoutDerivedReads(t *testin
 	}
 }
 
+// ── Plan 12.1-05 Task 2：HistoryEpochManager 的 error-aware 加载与 raw fail-closed ──
+
+func TestHistoryStateLoaderMissingVsError(t *testing.T) {
+	const sessionID = "history-loader-truth"
+	base := historyTextMessages("zero", "one")
+
+	t.Run("missing", func(t *testing.T) {
+		manager := NewHistoryEpochManager()
+		calls := 0
+		manager.SetStateLoader(stateLoaderFunc(func(string) StateLoadResult {
+			calls++
+			return StateLoadResult{}
+		}))
+		manager.SetPersistFunc(func(string, string) {})
+		decision := manager.Begin(sessionID, base)
+		if decision.LoadFailed || decision.Epoch != 1 || decision.Reason != HistoryEpochReasonInitial {
+			t.Fatalf("missing 应进入 initial epoch: %+v", decision)
+		}
+		if calls != 1 {
+			t.Fatalf("missing 是终态，却查询了 %d 次", calls)
+		}
+	})
+
+	for name, failureResult := range stateLoadErrorCases() {
+		t.Run(name, func(t *testing.T) {
+			manager := NewHistoryEpochManager()
+			var persistCalls, transitionCalls int
+			manager.SetStateLoader(stateLoaderFunc(func(string) StateLoadResult { return failureResult }))
+			manager.SetPersistFunc(func(string, string) { persistCalls++ })
+			manager.SetTransitionFunc(func(HistoryTransition) error { transitionCalls++; return nil })
+
+			decision := manager.Begin(sessionID, base)
+			if !decision.LoadFailed || decision.LoadFailure.Class != failureResult.FailureClass {
+				t.Fatalf("读取失败未上报: %+v", decision)
+			}
+			if decision.Reason != HistoryEpochReasonLoadFailed {
+				t.Fatalf("读取失败 reason=%q, want state_load_failed", decision.Reason)
+			}
+			if decision.ReuseSafe || decision.TransitionFailed || decision.EpochChanged {
+				t.Fatalf("读取失败必须 fail closed 且与 transition 失败区分: %+v", decision)
+			}
+			if decision.Epoch != 0 || decision.StateKey != "" {
+				t.Fatalf("读取失败仍发布了 epoch: %+v", decision)
+			}
+			if persistCalls != 0 || transitionCalls != 0 {
+				t.Fatalf("读取失败仍写入状态: persist=%d transition=%d", persistCalls, transitionCalls)
+			}
+			if manager.IsCurrent(sessionID, 1) {
+				t.Fatal("读取失败后仍声称某个 epoch 是当前 epoch")
+			}
+		})
+	}
+}
+
+func TestHistoryLoadFailureRetries(t *testing.T) {
+	const sessionID = "history-load-retry"
+	state, err := json.Marshal(historyEpochPersisted{
+		Version: historyEpochStateVersion,
+		Epoch:   5,
+		Valid:   false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+	manager := NewHistoryEpochManager()
+	manager.SetStateLoader(stateLoaderFunc(func(string) StateLoadResult {
+		calls++
+		if calls == 1 {
+			return StateLoadResult{Err: ErrStateLoadQueryFailed, FailureClass: StateLoadFailureQueryFailed}
+		}
+		return StateLoadResult{Value: string(state), Found: true}
+	}))
+	manager.SetPersistFunc(func(string, string) {})
+
+	base := historyTextMessages("zero", "one")
+	first := manager.Begin(sessionID, base)
+	if !first.LoadFailed {
+		t.Fatalf("首次读取失败未上报: %+v", first)
+	}
+
+	second := manager.Begin(sessionID, base)
+	if second.LoadFailed {
+		t.Fatalf("读取失败后不可重试: %+v", second)
+	}
+	// 已持久化的 epoch 5 必须被承认；退回 initial epoch 1 会让旧派生状态复活。
+	if second.Epoch != 6 || !second.EpochChanged || second.Reason != HistoryEpochReasonInvalid {
+		t.Fatalf("重试未沿用已持久化 epoch: %+v", second)
+	}
+}
+
+func TestHistoryTransitionStillBypassesWriter(t *testing.T) {
+	const sessionID = "history-transition-bypass"
+	manager := NewHistoryEpochManager()
+	var persistCalls, transitionCalls int
+	manager.SetStateLoader(stateLoaderFunc(func(string) StateLoadResult { return StateLoadResult{} }))
+	manager.SetPersistFunc(func(string, string) { persistCalls++ })
+	manager.SetTransitionFunc(func(HistoryTransition) error {
+		transitionCalls++
+		return fmt.Errorf("forced transition failure")
+	})
+
+	base := historyTextMessages("zero", "one")
+	if initial := manager.Begin(sessionID, base); initial.Epoch != 1 {
+		t.Fatalf("initial=%+v", initial)
+	}
+	branched := deepCopyMessages(base)
+	branched[0].Content = mustMarshal("changed")
+	failed := manager.Begin(sessionID, branched)
+
+	if !failed.TransitionFailed || failed.LoadFailed {
+		t.Fatalf("transition 失败与 load 失败被混为一谈: %+v", failed)
+	}
+	if failed.Reason != HistoryEpochReasonTransitionFailed {
+		t.Fatalf("transition 失败 reason=%q", failed.Reason)
+	}
+	if transitionCalls != 1 {
+		t.Fatalf("transition 调用数=%d, want 1（同步事务）", transitionCalls)
+	}
+	if persistCalls != 1 {
+		t.Fatalf("persist 调用数=%d, want 1（仅 initial），transition 不得走普通 writer", persistCalls)
+	}
+	// transition 必须保持同步：manager 上不得出现异步 state submitter 接口。
+	if _, ok := interface{}(manager).(interface{ SetStateSubmitter(StateSubmitter) }); ok {
+		t.Fatal("HistoryEpochManager 暴露了 StateSubmitter，transition 可能被放入普通 writer")
+	}
+}
+
+func TestHistoryLoadFailureRawFailClosed(t *testing.T) {
+	var forwarded []Message
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []Message `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		forwarded = body.Messages
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	manager := NewHistoryEpochManager()
+	var persistCalls, transitionCalls int
+	manager.SetStateLoader(stateLoaderFunc(func(string) StateLoadResult {
+		return StateLoadResult{Err: ErrStateLoadClosed, FailureClass: StateLoadFailureSQLiteClosed}
+	}))
+	manager.SetPersistFunc(func(string, string) { persistCalls++ })
+	manager.SetTransitionFunc(func(HistoryTransition) error { transitionCalls++; return nil })
+	server.HistoryEpoch = manager
+
+	var searchCalls, derivedLoadCalls int
+	server.searchAndExpandFn = func(messages []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, _ *requestMeta) RecallOutcome {
+		searchCalls++
+		return RecallOutcome{Messages: messages}
+	}
+	server.Frozen.SetLoadFunc(func(string) (string, bool) { derivedLoadCalls++; return "", false })
+	server.Sawtooth.SetLoadFunc(func(string) (string, bool) { derivedLoadCalls++; return "", false })
+	server.DecayTracker.SetLoadFunc(func(string) (string, bool) { derivedLoadCalls++; return "", false })
+
+	messages := historyTextMessages("zero", "one", "two")
+	servePipelineRequest(t, server, "history-load-failure-pipeline", messages)
+
+	if persistCalls != 0 || transitionCalls != 0 {
+		t.Fatalf("读取失败仍发布 epoch: persist=%d transition=%d", persistCalls, transitionCalls)
+	}
+	if searchCalls != 0 || derivedLoadCalls != 0 {
+		t.Fatalf("读取失败仍读取派生状态: search=%d loads=%d", searchCalls, derivedLoadCalls)
+	}
+	if !reflect.DeepEqual(forwarded, messages) {
+		t.Fatalf("读取失败未按 raw history 直通:\ngot=%+v\nwant=%+v", forwarded, messages)
+	}
+}
+
 func currentHistoryFingerprint(messages []Message) string {
 	return reuseSafetyPrefixHash(messages, len(messages))
 }
