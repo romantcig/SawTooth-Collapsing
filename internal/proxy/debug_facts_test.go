@@ -603,6 +603,191 @@ func readDebugFactFiles(t *testing.T, dataDir, sessionID string) [][]byte {
 	return files
 }
 
+// ── Plan 08 Task 1：普通日志只保留唯一最终结果 ──
+
+// supersededOrdinarySummaries 列出被 request_outcome 取代的旧普通最终摘要。
+// 它们的诊断数值仍进入 collector 与 Debug facts，但不得再作为普通日志重复出现。
+var supersededOrdinarySummaries = []string{
+	"pressure 摘要",
+	"SawtoothTrigger 触发",
+	"collapse 完成",
+	"stubify+decay 完成",
+	"compact 完成",
+	"Archive 召回汇总",
+}
+
+// captureOrdinaryLogs 把默认 logger 换成只接收 >= Info 的普通日志缓冲。
+// 缓冲里出现任何 superseded 摘要，就说明它仍然是普通日志而不是 Debug 事实。
+func captureOrdinaryLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(NewLogHandler(buf, slog.LevelInfo)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return buf
+}
+
+func assertNoSupersededOrdinarySummary(t *testing.T, output string) {
+	t.Helper()
+	for _, message := range supersededOrdinarySummaries {
+		if strings.Contains(output, message) {
+			t.Fatalf("旧普通最终摘要 %q 仍在普通日志中:\n%s", message, output)
+		}
+	}
+}
+
+// recallRequestMessages 在正常主请求尾部追加一条明确恢复意图的 user 消息，
+// 关键词与 seedRecallArchive 播种的归档同 session 命中。
+func recallRequestMessages(count, words int) []Message {
+	messages := pipelineMessages(count, words)
+	return append(messages, Message{
+		Role:    "user",
+		Content: mustMarshal("restore archive about flimflam details parser"),
+	})
+}
+
+func TestRequestOutcomeIsOnlyNormalFinalSummary(t *testing.T) {
+	logs := captureOrdinaryLogs(t)
+	upstream := jsonOutcomeUpstream(t)
+	failingUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"type":"error"}`))
+	}))
+	t.Cleanup(failingUpstream.Close)
+
+	for _, tc := range []struct {
+		name    string
+		url     string
+		prepare func(t *testing.T, server *Server, sessionID string)
+		rounds  [][]Message
+	}{
+		{
+			name:   "no_trigger",
+			url:    upstream.URL,
+			rounds: [][]Message{pipelineMessages(4, 3)},
+		},
+		{
+			name:   "collapse",
+			url:    upstream.URL,
+			rounds: [][]Message{pipelineMessages(80, 260)},
+		},
+		{
+			name:    "fallback",
+			url:     upstream.URL,
+			prepare: func(_ *testing.T, server *Server, _ string) { server.Config.Collapse.Enabled = false },
+			rounds:  [][]Message{pipelineMessages(80, 260)},
+		},
+		{
+			name:   "frozen_reuse",
+			url:    upstream.URL,
+			rounds: [][]Message{pipelineMessages(80, 260), pipelineMessages(80, 260)},
+		},
+		{
+			name: "archive_recall",
+			url:  upstream.URL,
+			prepare: func(t *testing.T, server *Server, sessionID string) {
+				seedRecallArchive(t, server.Store, sessionID)
+			},
+			rounds: [][]Message{recallRequestMessages(4, 3)},
+		},
+		{
+			name:   "upstream_failure",
+			url:    failingUpstream.URL,
+			rounds: [][]Message{pipelineMessages(80, 260)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs.Reset()
+			server, sink := newOutcomePipelineServer(t, tc.url)
+			sessionID := "only-summary-" + tc.name
+			if tc.prepare != nil {
+				tc.prepare(t, server, sessionID)
+			}
+			for _, messages := range tc.rounds {
+				serveOutcomeMessages(t, server, sessionID, messages)
+			}
+
+			snapshots := sink.all()
+			if len(snapshots) != len(tc.rounds) {
+				t.Fatalf("authoritative outcome 数=%d，want %d", len(snapshots), len(tc.rounds))
+			}
+			seen := make(map[uint64]int, len(snapshots))
+			for _, snapshot := range snapshots {
+				seen[snapshot.RequestID]++
+				closure := formatRequestOutcomeClosure(snapshot)
+				if !strings.Contains(closure, "event="+sessionOutcomeEvent) {
+					t.Fatalf("最终摘要不是 request_outcome: %q", closure)
+				}
+			}
+			for id, count := range seen {
+				if count != 1 {
+					t.Fatalf("request %d 的普通最终摘要数=%d，want 1", id, count)
+				}
+			}
+			assertNoSupersededOrdinarySummary(t, logs.String())
+		})
+	}
+}
+
+func TestPressureDecisionFactRemains(t *testing.T) {
+	logs := captureOrdinaryLogs(t)
+	upstream := jsonOutcomeUpstream(t)
+	server, sink := newOutcomePipelineServer(t, upstream.URL)
+	dataDir := t.TempDir()
+	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, DataDir: dataDir})
+
+	const sessionID = "pressure-fact-remains"
+	serveOutcomeMessages(t, server, sessionID, pipelineMessages(80, 260))
+
+	facts := debugFactsByStage(t, dataDir, sessionID)
+	pressure, ok := facts[debugStagePressureDecision]
+	if !ok {
+		t.Fatalf("pressure_decision 技术事实被去噪删除: %v", facts)
+	}
+	snapshot := sink.sole(t)
+	if pressure["request_id"] != float64(snapshot.RequestID) {
+		t.Fatalf("pressure_decision request_id=%v，want %d", pressure["request_id"], snapshot.RequestID)
+	}
+	for _, key := range []string{
+		"selected_pressure_tokens", "pressure_threshold_tokens",
+		"pressure_source", "trigger_reason", "compress_decision",
+	} {
+		if _, ok := pressure[key]; !ok {
+			t.Fatalf("pressure_decision 缺少 Phase 10 字段 %q: %v", key, pressure)
+		}
+	}
+	assertNoSupersededOrdinarySummary(t, logs.String())
+}
+
+func TestResponseUsageFactRemains(t *testing.T) {
+	logs := captureOrdinaryLogs(t)
+	upstream := jsonOutcomeUpstream(t)
+	server, sink := newOutcomePipelineServer(t, upstream.URL)
+	dataDir := t.TempDir()
+	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, DataDir: dataDir})
+
+	const sessionID = "usage-fact-remains"
+	serveOutcomeMessages(t, server, sessionID, pipelineMessages(80, 260))
+
+	facts := debugFactsByStage(t, dataDir, sessionID)
+	usage, ok := facts[debugStageResponseUsage]
+	if !ok {
+		t.Fatalf("response_usage 技术事实被去噪删除: %v", facts)
+	}
+	snapshot := sink.sole(t)
+	if usage["request_id"] != float64(snapshot.RequestID) {
+		t.Fatalf("response_usage request_id=%v，want %d", usage["request_id"], snapshot.RequestID)
+	}
+	if _, ok := usage["total_input_tokens"]; !ok {
+		t.Fatalf("response_usage 缺少 total_input_tokens: %v", usage)
+	}
+	if facts[debugStagePressureDecision]["request_id"] != usage["request_id"] {
+		t.Fatalf("pressure/usage 不再共享同一 request ID: %v", facts)
+	}
+	assertNoSupersededOrdinarySummary(t, logs.String())
+}
+
 func debugFactsByStage(t *testing.T, dataDir, sessionID string) map[debugStage]map[string]any {
 	t.Helper()
 	result := make(map[debugStage]map[string]any)

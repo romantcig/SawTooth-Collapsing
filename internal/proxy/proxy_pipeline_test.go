@@ -587,7 +587,9 @@ func TestConcurrentRequestLogsReconstructable(t *testing.T) {
 	defer upstream.Close()
 
 	server := newPipelineTestServer(t, upstream.URL)
-	seedRecallArchive(t, server.Store)
+	for _, sessionID := range []string{"concurrent-a", "concurrent-b"} {
+		seedRecallArchive(t, server.Store, sessionID)
+	}
 	var logs bytes.Buffer
 	previous := slog.Default()
 	slog.SetDefault(slog.New(NewLogHandler(&logs, slog.LevelDebug)))
@@ -1773,7 +1775,7 @@ func TestHandleMessagesSearchOnceAcrossFrozenPaths(t *testing.T) {
 			defer upstream.Close()
 
 			server := newPipelineTestServer(t, upstream.URL)
-			seedRecallArchive(t, server.Store)
+			seedRecallArchive(t, server.Store, "thread-search-once")
 			raw := pipelineMessages(3, 10)
 			raw[2].Content = mustMarshal("restore archive about flimflam details parser")
 			if tc.setupFrozen != nil {
@@ -1818,10 +1820,10 @@ func TestHandleMessagesSearchOnceAcrossFrozenPaths(t *testing.T) {
 	}
 }
 
-func seedRecallArchive(t *testing.T, store *SQLiteStore) {
+func seedRecallArchive(t *testing.T, store *SQLiteStore, sessionID string) {
 	t.Helper()
 	block := ArchiveBlock{
-		ID: "pipeline-recall", SessionID: "archive-session",
+		ID: "pipeline-recall-" + sessionID, SessionID: sessionID, HistoryEpoch: 1,
 		BlockRangeStart: 1, BlockRangeEnd: 2,
 		MessageCount: 2, EstimatedTokens: 80,
 		SummaryText: "flimflam archive details",

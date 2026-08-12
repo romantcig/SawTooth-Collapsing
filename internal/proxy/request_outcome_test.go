@@ -8,6 +8,7 @@ import (
 	"go/token"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -323,6 +324,98 @@ func TestRequestOutcomeRejectsLateProducer(t *testing.T) {
 
 func errorsIsOutcomeSealed(err error) bool {
 	return err == ErrOutcomeProducersSealed
+}
+
+// ── Plan 08 Task 1：召回事实进入 closure，且不另发普通摘要 ──
+
+func TestRecallOutcomeFeedsClosureWithoutSummary(t *testing.T) {
+	logs := captureOrdinaryLogs(t)
+	upstream := jsonOutcomeUpstream(t)
+	server, sink := newOutcomePipelineServer(t, upstream.URL)
+
+	const sessionID = "recall-closure-session"
+	seedRecallArchive(t, server.Store, sessionID)
+	serveOutcomeMessages(t, server, sessionID, recallRequestMessages(4, 3))
+
+	snapshot := sink.sole(t)
+	if snapshot.RecallAttempted == 0 {
+		t.Fatalf("closure 未记录召回尝试: %+v", snapshot)
+	}
+	if snapshot.RecallCandidates == 0 || snapshot.RecallInjected == 0 {
+		t.Fatalf("closure 丢失召回候选/注入事实: %+v", snapshot)
+	}
+	assertNoSupersededOrdinarySummary(t, logs.String())
+}
+
+// TestNoEagerOrStateContractDrift 防止去噪顺手改动已锁定的 ST 与状态合同。
+func TestNoEagerOrStateContractDrift(t *testing.T) {
+	t.Run("eager 保持不存在", func(t *testing.T) {
+		for _, dir := range []string{".", filepath.Join("..", "..", "cmd", "proxy")} {
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				name := entry.Name()
+				if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+					continue
+				}
+				data, err := os.ReadFile(filepath.Join(dir, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if strings.Contains(strings.ToLower(string(data)), "eager") {
+					t.Fatalf("%s 重新引入了 eager 机制", filepath.Join(dir, name))
+				}
+			}
+		}
+	})
+
+	t.Run("TriggerReason 集合未扩张", func(t *testing.T) {
+		want := map[TriggerReason]bool{
+			TriggerNone: true, TriggerTokens: true, TriggerPause: true,
+			TriggerEmergency: true, TriggerUnknown: true,
+		}
+		for _, reason := range []TriggerReason{TriggerNone, TriggerTokens, TriggerPause, TriggerEmergency, TriggerUnknown} {
+			if !want[reason] {
+				t.Fatalf("未知 TriggerReason: %q", reason)
+			}
+		}
+		if TriggerNone != "" || TriggerTokens != "tokens" || TriggerPause != "pause" ||
+			TriggerEmergency != "emergency" || TriggerUnknown != "unknown" {
+			t.Fatalf("TriggerReason 取值漂移: %q/%q/%q/%q/%q",
+				TriggerNone, TriggerTokens, TriggerPause, TriggerEmergency, TriggerUnknown)
+		}
+	})
+
+	t.Run("边界比较保持严格大于", func(t *testing.T) {
+		const threshold = 16000
+		st := NewSawtoothTrigger(time.Minute, threshold, threshold/2)
+		now := time.Unix(1_700_000_000, 0).UTC()
+		st.mu.Lock()
+		st.lastRequestTime["strict"] = now.Add(-time.Minute)
+		st.mu.Unlock()
+
+		if got := st.Evaluate("strict", threshold, now).Reason; got != TriggerNone {
+			t.Fatalf("压力等于阈值且等待恰好等于 required wait 时 reason=%q，want none", got)
+		}
+		if got := st.Evaluate("strict", threshold+1, now).Reason; got != TriggerTokens {
+			t.Fatalf("压力超过阈值时 reason=%q，want tokens", got)
+		}
+		emergency := st.Evaluate("strict", threshold, now).EmergencyThreshold
+		if got := st.Evaluate("strict", emergency, now).Reason; got != TriggerTokens {
+			t.Fatalf("压力等于 emergency 阈值时 reason=%q，want tokens", got)
+		}
+		if got := st.Evaluate("strict", emergency+1, now).Reason; got != TriggerEmergency {
+			t.Fatalf("压力超过 emergency 阈值时 reason=%q，want emergency", got)
+		}
+		if got := st.Evaluate("strict", threshold/2, now.Add(time.Minute)).Reason; got != TriggerNone {
+			t.Fatalf("压力等于 token minimum 时 reason=%q，want none", got)
+		}
+		if got := st.Evaluate("strict", threshold/2+1, now.Add(time.Nanosecond)).Reason; got != TriggerPause {
+			t.Fatalf("等待超过 required wait 时 reason=%q，want pause", got)
+		}
+	})
 }
 
 func TestRequestOutcomeHasNoDirectSinkOrGoroutine(t *testing.T) {
