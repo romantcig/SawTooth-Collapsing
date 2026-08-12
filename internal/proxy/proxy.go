@@ -1205,12 +1205,11 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 						"cutoff", cutoffIdx, "message_count", len(messages))
 				} else if materialized {
 
-					meta.Logger.Info("collapse 完成",
+					meta.Logger.Debug("collapse 完成",
 						"before", len(messages),
 						"after", len(collapsedMessages),
 						"cutoff", cutoffIdx,
 						"archived_tokens", collapsePlan.Block.EstimatedTokens,
-						LogGreen,
 					)
 
 					// DecayTracker: 清理被折叠的旧消息索引。
@@ -1234,10 +1233,9 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 					if s.Sawtooth != nil && s.Frozen != nil {
 						if pressureTrigger != TriggerNone {
-							meta.Logger.Info("SawtoothTrigger 触发",
+							meta.Logger.Debug("SawtoothTrigger 触发",
 								"reason", pressureTrigger,
 								"raw_estimate", rawEstimate,
-								LogGreen,
 							)
 							frozenPrefixLen = len(messages)
 							s.applyCacheControl(messages, frozenPrefixLen, sessionID)
@@ -1325,7 +1323,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			// 步骤 3: decay 只消费同一份 plan；plan 外 Stage-3 自动退回 Stage-2。
 			decayedMessages, phase := s.DecayTracker.ApplyDecayBatch(stubbedMessages, stateKey, totalTokens, threshold, s.TokenCounter, pivotText, requestSeq, plan)
 
-			meta.Logger.Info("stubify+decay 完成",
+			meta.Logger.Debug("stubify+decay 完成",
 				"original_tokens", stats.OriginalTokens,
 				"stubbed_tokens", stats.StubbedTokens,
 				"messages_stubbed", stats.MessagesStubbed,
@@ -1333,18 +1331,16 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				"tools_processed", stats.ToolsProcessed,
 				"decay_phase", phase,
 				"pressure", fmt.Sprintf("%.2f", float64(totalTokens)/float64(threshold)),
-				LogGreen,
 			)
 
 			// 步骤 4: 只物化预检 replacement；失败时恢复 plan 保存的 Stage-2。
 			beforeCompact := len(decayedMessages)
 			decayedMessages, compactedBlocks := CompactMessagesWithPlan(decayedMessages, originalMessages, plan)
 			if len(compactedBlocks) > 0 {
-				meta.Logger.Info("compact 完成",
+				meta.Logger.Debug("compact 完成",
 					"before", beforeCompact,
 					"after", len(decayedMessages),
 					"blocks", len(compactedBlocks),
-					LogGreen,
 				)
 			}
 
@@ -1362,10 +1358,9 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			// 持久化的 prefix bytes 与本次实际上游 wire prefix 完全一致。
 			if s.Sawtooth != nil && s.Frozen != nil {
 				if pressureTrigger != TriggerNone {
-					meta.Logger.Info("SawtoothTrigger 触发",
+					meta.Logger.Debug("SawtoothTrigger 触发",
 						"reason", pressureTrigger,
 						"raw_estimate", rawEstimate,
-						LogGreen,
 					)
 					frozenPrefixLen = len(messages)
 					s.applyCacheControl(messages, frozenPrefixLen, sessionID)
@@ -1451,13 +1446,14 @@ func formatApproxTokens(tokens int) string {
 
 // logPressureSummary 每条可跟踪主请求最多输出一次脱敏摘要。
 // 使用只绑定 request_id 的审计 logger，避免把 session 身份带入 pressure 日志。
+// 它保持 Debug 级：普通最终摘要唯一由 request_outcome 承担，这里只留诊断数值。
 func logPressureSummary(meta *requestMeta) {
 	if meta == nil || !meta.tracksSawtoothState() || !meta.PressureDecision.Available {
 		return
 	}
 	meta.pressureSummaryOnce.Do(func() {
 		decision := meta.PressureDecision
-		meta.auxiliaryLogger().Info("pressure 摘要",
+		meta.auxiliaryLogger().Debug("pressure 摘要",
 			"pressure", formatApproxTokens(decision.SelectedPressure),
 			"threshold", formatApproxTokens(decision.Threshold),
 			"source", decision.Source,

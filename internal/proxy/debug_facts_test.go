@@ -219,7 +219,7 @@ func TestFormatApproxTokens(t *testing.T) {
 func TestPressureSummarySingleMainOnly(t *testing.T) {
 	var logs bytes.Buffer
 	previous := slog.Default()
-	slog.SetDefault(slog.New(NewLogHandler(&logs, slog.LevelInfo)))
+	slog.SetDefault(slog.New(NewLogHandler(&logs, slog.LevelDebug)))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 
 	mainMeta := newRequestMeta(401, "SUMMARY-SESSION-MUST-NOT-LEAK")
@@ -250,6 +250,10 @@ func TestPressureSummarySingleMainOnly(t *testing.T) {
 		t.Fatalf("pressure 摘要条数=%d, want 1:\n%s", len(summaryLines), logs.String())
 	}
 	line := summaryLines[0]
+	// pressure 摘要已降为 Debug：普通日志面上的最终摘要唯一由 request_outcome 承担。
+	if !strings.Contains(line, "[DEBUG]") {
+		t.Fatalf("pressure 摘要不是 Debug 级: %s", line)
+	}
 	for _, want := range []string{
 		"request_id=401", "pressure=17.5k", "threshold=16k",
 		"source=actual_plus_delta", "trigger_reason=tokens",

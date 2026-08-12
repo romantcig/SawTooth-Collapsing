@@ -26,8 +26,12 @@ func TestRecallLoggingFinalSummaryAndSourceSession(t *testing.T) {
 		t.Fatalf("injected=%d，期望 1", outcome.Injected)
 	}
 	output := logs.String()
-	if got := strings.Count(output, "[INFO]  Archive 召回汇总"); got != 1 {
-		t.Fatalf("Info 汇总数=%d，期望 1:\n%s", got, output)
+	// 召回汇总已降为 Debug：普通日志不再重复第二条最终结果。
+	if got := strings.Count(output, "[DEBUG] Archive 召回汇总"); got != 1 {
+		t.Fatalf("Debug 汇总数=%d，期望 1:\n%s", got, output)
+	}
+	if strings.Contains(output, "[INFO]  Archive 召回汇总") {
+		t.Fatalf("Archive 召回汇总仍是普通日志:\n%s", output)
 	}
 	for _, want := range []string{
 		"request_id=23",

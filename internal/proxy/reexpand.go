@@ -212,7 +212,9 @@ func searchAndExpandWithMeta(messages []Message, store *SQLiteStore, tokenThresh
 	}
 	outcome.Attempted = true
 	defer func() {
-		logger.Info("Archive 召回汇总",
+		// 召回结果的权威去处是 request_outcome 的 RecallCounts；这里只保留
+		// Debug 级诊断细节，不再作为第二条普通最终摘要重复出现。
+		logger.Debug("Archive 召回汇总",
 			"candidates", outcome.Candidates,
 			"selected", outcome.Selected,
 			"injected", outcome.Injected,
