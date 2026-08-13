@@ -15,6 +15,7 @@ type RecallSignalKind string
 const (
 	RecallSignalDeepSearch RecallSignalKind = "deep_search"
 	RecallSignalRecovery   RecallSignalKind = "recovery_intent"
+	RecallSignalRecoverID  RecallSignalKind = "recover_id"
 	maxRecallSignals                        = 3
 )
 
@@ -24,6 +25,7 @@ type RecallSignal struct {
 	Query      string
 	Terms      []string
 	ExactPath  string
+	ArchiveID  string
 	MessageIdx int
 	StubText   string
 }
@@ -62,20 +64,30 @@ func extractRecallSignals(messages []Message) []RecallSignal {
 		signals = append(signals, signal)
 	}
 
-	for msgIdx, msg := range messages {
-		var texts []string
-		var plain string
-		if err := json.Unmarshal(msg.Content, &plain); err == nil {
-			texts = append(texts, plain)
-		} else {
-			blocks, _ := parseContent(msg.Content)
-			for _, block := range blocks {
-				if block.Type == "text" && block.Text != "" {
-					texts = append(texts, block.Text)
+	lower := strings.ToLower(latest)
+	explicitRecovery := false
+	for _, phrase := range recallIntentPhrases {
+		if strings.Contains(lower, phrase) {
+			explicitRecovery = true
+			break
+		}
+	}
+
+	// 确定性恢复引用排在所有关键词线索之前：它能被精确查回，可信度最高。
+	// marker 本身只是"可恢复"的承诺，必须配合明确恢复意图才允许重新注入原文，
+	// 否则每一轮请求都会把刚折叠掉的历史原样塞回去。
+	if explicitRecovery {
+		for _, msg := range messages {
+			for _, text := range messageTextBlocks(msg) {
+				for _, id := range extractArchiveRecoveryIDs(text) {
+					add(RecallSignal{Kind: RecallSignalRecoverID, Query: id, ArchiveID: id, MessageIdx: -1})
 				}
 			}
 		}
-		for _, text := range texts {
+	}
+
+	for msgIdx, msg := range messages {
+		for _, text := range messageTextBlocks(msg) {
 			for _, hint := range extractDeepSearchHints(text) {
 				hintTerms := effectiveRecallTerms(hint)
 				path := exactPathInText(hint)
@@ -90,19 +102,51 @@ func extractRecallSignals(messages []Message) []RecallSignal {
 		}
 	}
 
-	lower := strings.ToLower(latest)
-	for _, phrase := range recallIntentPhrases {
-		if !strings.Contains(lower, phrase) {
-			continue
-		}
+	if explicitRecovery {
 		if path := exactPathInText(latest); path != "" {
 			add(RecallSignal{Kind: RecallSignalRecovery, Query: path, Terms: []string{path}, ExactPath: path, MessageIdx: -1})
 		} else if len(queryTerms) > 0 {
 			add(RecallSignal{Kind: RecallSignalRecovery, Query: strings.Join(queryTerms, " "), Terms: queryTerms, MessageIdx: -1})
 		}
-		break
 	}
 	return signals
+}
+
+// messageTextBlocks 返回一条消息里全部可读文本（纯字符串或 text block）。
+func messageTextBlocks(msg Message) []string {
+	var texts []string
+	var plain string
+	if err := json.Unmarshal(msg.Content, &plain); err == nil {
+		return append(texts, plain)
+	}
+	blocks, _ := parseContent(msg.Content)
+	for _, block := range blocks {
+		if block.Type == "text" && block.Text != "" {
+			texts = append(texts, block.Text)
+		}
+	}
+	return texts
+}
+
+// extractArchiveRecoveryIDs 复用生产 marker 前缀提取全部 canonical 恢复引用。
+func extractArchiveRecoveryIDs(text string) []string {
+	var ids []string
+	rest := text
+	for {
+		index := strings.Index(rest, archiveRecoveryMarkerPrefix)
+		if index < 0 {
+			return ids
+		}
+		rest = rest[index+len(archiveRecoveryMarkerPrefix):]
+		end := strings.Index(rest, "')")
+		if end < 0 {
+			return ids
+		}
+		if id := rest[:end]; id != "" {
+			ids = append(ids, id)
+		}
+		rest = rest[end+2:]
+	}
 }
 
 func effectiveRecallTerms(text string) []string {
@@ -227,6 +271,20 @@ func searchAndExpandWithMeta(messages []Message, store *SQLiteStore, tokenThresh
 	seenCandidates := make(map[string]bool)
 	var candidates []recallCandidate
 	for _, signal := range signals {
+		// 确定性引用只做 exact lookup：不退化成 FTS Top-1 或关键词相似度。
+		if signal.ArchiveID != "" {
+			summary, found, err := store.GetVisibleArchiveByID(requestSessionID, signal.ArchiveID)
+			if err != nil {
+				logger.Warn("archive 精确查询失败", "error", err)
+				continue
+			}
+			if !found || seenCandidates[summary.ID] {
+				continue
+			}
+			seenCandidates[summary.ID] = true
+			candidates = append(candidates, recallCandidate{Signal: signal, Summary: summary, SameSession: true})
+			continue
+		}
 		terms := signal.Terms
 		if signal.ExactPath != "" {
 			terms = []string{signal.ExactPath}
@@ -235,7 +293,8 @@ func searchAndExpandWithMeta(messages []Message, store *SQLiteStore, tokenThresh
 		if query == "" {
 			continue
 		}
-		summaries, err := store.SearchArchives(query, 1)
+		// 关键词召回同样受 session/当前分支/isolated 三道门禁约束。
+		summaries, err := store.SearchVisibleArchives(requestSessionID, query, 1)
 		if err != nil {
 			logger.Warn("archive 搜索失败", "query", query, "error", err)
 			continue
@@ -465,6 +524,10 @@ func candidateMeetsRecallThreshold(signal RecallSignal, summary ArchiveSummary, 
 }
 
 func recallCandidateLess(a, b recallCandidate) bool {
+	// 确定性 canonical 引用永远排在关键词线索之前：前者可精确查回，后者只是尽力而为。
+	if (a.Signal.ArchiveID != "") != (b.Signal.ArchiveID != "") {
+		return a.Signal.ArchiveID != ""
+	}
 	if a.SameSession != b.SameSession {
 		return a.SameSession
 	}
