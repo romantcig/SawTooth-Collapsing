@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -15,7 +16,7 @@ import (
 func TestRecallLoggingFinalSummaryAndSourceSession(t *testing.T) {
 	store, _, messages, tc := seedBudgetStore(t)
 	var logs bytes.Buffer
-	meta := newRequestMeta(23, "request-session")
+	meta := newRequestMeta(23, "s1")
 	meta.Logger = slog.New(NewLogHandler(&logs, slog.LevelDebug)).With(
 		"request_id", meta.ID,
 		"request_session_id", meta.RequestSessionID,
@@ -35,7 +36,7 @@ func TestRecallLoggingFinalSummaryAndSourceSession(t *testing.T) {
 	}
 	for _, want := range []string{
 		"request_id=23",
-		"request_session_id=request-session",
+		"request_session_id=s1",
 		"source_session_id=s1",
 		"block_id=block-budget",
 		"candidates=1",
@@ -406,7 +407,7 @@ func seedExactPathRecallStore(t *testing.T) (*SQLiteStore, *TokenCounter, string
 	t.Cleanup(func() { _ = store.Close() })
 	path := `C:\work\src\proxy.go`
 	block := ArchiveBlock{
-		ID: "exact-path", SessionID: "archive-session", BlockRangeStart: 1, BlockRangeEnd: 2,
+		ID: "exact-path", SessionID: "request-session", HistoryEpoch: 1, BlockRangeStart: 1, BlockRangeEnd: 2,
 		MessageCount: 2, EstimatedTokens: 80, SummaryText: "exact path archive",
 		Keywords: []KeywordEntry{{Word: path, Source: "file_path"}},
 	}
@@ -416,7 +417,130 @@ func seedExactPathRecallStore(t *testing.T) (*SQLiteStore, *TokenCounter, string
 	return store, tc, path
 }
 
-func TestSearchAndExpandTriggerCrossSessionNeedsThreeTerms(t *testing.T) {
+// ── Plan 08 Task 2：召回入口的 session/branch 可见性门禁 ──
+
+// seedRecoverableArchive 播种一条带原文、可按 canonical ID 精确找回的归档。
+func seedRecoverableArchive(t *testing.T, store *SQLiteStore, sessionID, id string) {
+	t.Helper()
+	block := ArchiveBlock{
+		ID: id, SessionID: sessionID, HistoryEpoch: 1,
+		BlockRangeStart: 1, BlockRangeEnd: 40, MessageCount: 40, EstimatedTokens: 200,
+		Messages:    []Message{{Role: "user", Content: mustMarshal("canonical raw detail " + id)}},
+		SummaryText: "canonical archive " + id,
+		Keywords:    recallTestKeywords(),
+	}
+	if err := store.SaveArchive(block); err != nil {
+		t.Fatalf("SaveArchive(%s): %v", id, err)
+	}
+}
+
+func recoveryMarkerMessages(t *testing.T, canonicalID string) []Message {
+	t.Helper()
+	return []Message{
+		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{
+			{Type: "text", Text: "历史已折叠 " + formatArchiveRecoveryMarker(canonicalID)},
+		})},
+		{Role: "user", Content: mustRawJSON(t, "请恢复存档")},
+	}
+}
+
+// TestProductionRecallUsesVisibleLookupsOnly 锁死召回入口：生产代码只能走
+// session-visible FTS 与 exact ID lookup，绝不能回退到跨 session 的全库查询。
+func TestProductionRecallUsesVisibleLookupsOnly(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	visibleSearch, exactLookup := 0, 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		data, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		source := string(data)
+		if strings.Contains(source, ".SearchArchives(") {
+			t.Fatalf("%s 仍使用无 session 的全库 Archive 查询", name)
+		}
+		visibleSearch += strings.Count(source, ".SearchVisibleArchives(")
+		exactLookup += strings.Count(source, ".GetVisibleArchiveByID(")
+	}
+	if visibleSearch == 0 || exactLookup == 0 {
+		t.Fatalf("生产召回缺少可见性入口: SearchVisibleArchives=%d GetVisibleArchiveByID=%d", visibleSearch, exactLookup)
+	}
+}
+
+func TestSearchAndExpandExactRecoveryIDVisibilityGate(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "exact-id.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	tc, err := NewTokenCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedRecoverableArchive(t, store, "owner-session", "canonical-owner")
+
+	messages := recoveryMarkerMessages(t, "canonical-owner")
+
+	t.Run("同 session 可按 exact ID 找回原文", func(t *testing.T) {
+		outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "owner-session")
+		if !outcome.Attempted || outcome.Candidates != 1 || outcome.Injected != 1 {
+			t.Fatalf("exact ID 恢复 outcome=%+v", outcome)
+		}
+		payload := singleRecallPayload(t, outcome.Messages)
+		if !strings.Contains(payload, "canonical archive canonical-owner") {
+			t.Fatalf("exact ID 未注入对应归档: %q", payload)
+		}
+	})
+
+	t.Run("跨 session 不可召回", func(t *testing.T) {
+		outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "stranger-session")
+		if outcome.Candidates != 0 || outcome.Injected != 0 {
+			t.Fatalf("exact ID 跨 session 泄漏: %+v", outcome)
+		}
+	})
+
+	t.Run("无 session 身份时 fail closed", func(t *testing.T) {
+		outcome := SearchAndExpand(messages, store, 100000, tc, &Budget{ReExpansion: 100000})
+		if outcome.Candidates != 0 || outcome.Injected != 0 {
+			t.Fatalf("缺少 session 身份仍执行召回: %+v", outcome)
+		}
+	})
+
+	t.Run("没有恢复意图时 marker 不自动召回", func(t *testing.T) {
+		silent := []Message{
+			{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{
+				{Type: "text", Text: "历史已折叠 " + formatArchiveRecoveryMarker("canonical-owner")},
+			})},
+			{Role: "user", Content: mustRawJSON(t, "继续实现下一个函数")},
+		}
+		outcome := searchAndExpandForSession(silent, store, 100000, tc, &Budget{ReExpansion: 100000}, "owner-session")
+		if outcome.Attempted || outcome.Injected != 0 {
+			t.Fatalf("marker 在无意图时自动召回: %+v", outcome)
+		}
+	})
+
+	t.Run("旧分支归档不可按 exact ID 找回", func(t *testing.T) {
+		if err := store.CommitHistoryTransition(HistoryTransition{
+			SessionID: "owner-session", StateKey: "history_epoch:owner", StateValue: `{"epoch":2}`, CommonPrefix: 2,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "owner-session")
+		if outcome.Candidates != 0 || outcome.Injected != 0 {
+			t.Fatalf("旧分支归档仍可按 exact ID 找回: %+v", outcome)
+		}
+	})
+}
+
+// TestSearchAndExpandKeywordRecallIsSessionScoped 取代旧的"跨 session 需要三个词"
+// 门槛：D-22 之后跨 session 关键词召回不再存在宽严之分，一律不可见。
+func TestSearchAndExpandKeywordRecallIsSessionScoped(t *testing.T) {
 	tc, err := NewTokenCounter()
 	if err != nil {
 		t.Fatalf("NewTokenCounter: %v", err)
@@ -427,25 +551,29 @@ func TestSearchAndExpandTriggerCrossSessionNeedsThreeTerms(t *testing.T) {
 	}
 	defer store.Close()
 	block := ArchiveBlock{
-		ID: "two-terms", SessionID: "source-session", BlockRangeStart: 10, BlockRangeEnd: 20,
-		MessageCount: 11, EstimatedTokens: 50, SummaryText: "two term archive",
-		Keywords: []KeywordEntry{{Word: "flimflam", Source: "user_message"}, {Word: "warbler", Source: "user_message"}},
+		ID: "three-terms", SessionID: "source-session", HistoryEpoch: 1,
+		BlockRangeStart: 10, BlockRangeEnd: 20,
+		MessageCount: 11, EstimatedTokens: 50, SummaryText: "three term archive",
+		Keywords: recallTestKeywords(),
 	}
 	if err := store.SaveArchive(block); err != nil {
 		t.Fatalf("SaveArchive: %v", err)
 	}
 	messages := []Message{
-		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "text", Text: "deep_search('flimflam warbler')"}})},
-		{Role: "user", Content: json.RawMessage(`"explain flimflam warbler"`)},
+		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "text", Text: "deep_search('flimflam warbler parser')"}})},
+		{Role: "user", Content: json.RawMessage(`"explain flimflam warbler parser"`)},
 	}
 
 	cross := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "other-session")
-	if cross.Candidates != 1 || cross.Selected != 0 || cross.Injected != 0 {
-		t.Fatalf("cross-session two-term result=%+v, want candidate rejected", cross)
+	if cross.Candidates != 0 || cross.Selected != 0 || cross.Injected != 0 {
+		t.Fatalf("跨 session 关键词召回结果=%+v，want 完全不可见", cross)
+	}
+	if !reflect.DeepEqual(cross.Messages, messages) {
+		t.Fatalf("跨 session 召回改写了 messages: %+v", cross.Messages)
 	}
 	same := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "source-session")
 	if same.Injected != 1 {
-		t.Fatalf("same-session two-term result=%+v, want injected", same)
+		t.Fatalf("同 session 三词召回结果=%+v，want injected", same)
 	}
 }
 
@@ -467,7 +595,7 @@ func TestSearchAndExpandTop3Stable(t *testing.T) {
 	}
 	for i, terms := range termSets {
 		block := ArchiveBlock{
-			ID: fmt.Sprintf("top3-%d", i), SessionID: fmt.Sprintf("source-%d", i),
+			ID: fmt.Sprintf("top3-%d", i), SessionID: "top3-session", HistoryEpoch: 1,
 			BlockRangeStart: i * 10, BlockRangeEnd: i*10 + 4, MessageCount: 5, EstimatedTokens: 50,
 			SummaryText: fmt.Sprintf("summary %d", i),
 			Messages:    []Message{{Role: "user", Content: mustMarshal(fmt.Sprintf("top3 content %d", i))}},
@@ -484,7 +612,7 @@ func TestSearchAndExpandTop3Stable(t *testing.T) {
 	}
 	var first []string
 	for run := 0; run < 3; run++ {
-		outcome := SearchAndExpand(messages, store, 100000, tc, &Budget{ReExpansion: 100000})
+		outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "top3-session")
 		if outcome.Selected > 3 || outcome.Injected > 3 {
 			t.Fatalf("run %d selected/injected=%d/%d, want <=3", run, outcome.Selected, outcome.Injected)
 		}
@@ -643,7 +771,7 @@ func TestSearchAndExpandToolPairsAppendToLatestUser(t *testing.T) {
 	}
 	defer store.Close()
 	path := `C:\work\src\proxy.go`
-	block := ArchiveBlock{ID: "path", SessionID: "other", BlockRangeStart: 1, BlockRangeEnd: 2, MessageCount: 2, EstimatedTokens: 50, SummaryText: "path archive", Keywords: []KeywordEntry{{Word: path, Source: "file_path"}}}
+	block := ArchiveBlock{ID: "path", SessionID: "current", HistoryEpoch: 1, BlockRangeStart: 1, BlockRangeEnd: 2, MessageCount: 2, EstimatedTokens: 50, SummaryText: "path archive", Keywords: []KeywordEntry{{Word: path, Source: "file_path"}}}
 	if err := store.SaveArchive(block); err != nil {
 		t.Fatalf("SaveArchive: %v", err)
 	}
@@ -1190,8 +1318,8 @@ func seedBudgetCandidates(t *testing.T, count int) (*SQLiteStore, []Message, *To
 	for i := 0; i < count; i++ {
 		terms := termSets[i]
 		block := ArchiveBlock{
-			ID: fmt.Sprintf("budget-candidate-%d", i), SessionID: fmt.Sprintf("session-%d", i),
-			BlockRangeStart: 1, BlockRangeEnd: 2,
+			ID: fmt.Sprintf("budget-candidate-%d", i), SessionID: "budget-session", HistoryEpoch: 1,
+			BlockRangeStart: 1 + i*2, BlockRangeEnd: 2 + i*2,
 			MessageCount: 2, EstimatedTokens: 80,
 			SummaryText: summary,
 			Messages:    []Message{{Role: "user", Content: mustMarshal(fmt.Sprintf("budget content %d", i))}},
@@ -1216,11 +1344,11 @@ func seedBudgetCandidates(t *testing.T, count int) (*SQLiteStore, []Message, *To
 
 func TestSearchAndExpandBudgetTracksOnlyInjectedPayload(t *testing.T) {
 	store, messages, tc, summary := seedBudgetCandidates(t, 2)
-	prefix := fmt.Sprintf("[Retrieved archive #%d — source=%s, range=%d-%d, ~%d tokens]\n\n", 1, "session-0", 1, 2, 80)
+	prefix := fmt.Sprintf("[Retrieved archive #%d — source=%s, range=%d-%d, ~%d tokens]\n\n", 1, "budget-session", 1, 2, 80)
 	oneCost := tc.CountTokens(prefix + summary)
 	budget := &Budget{ReExpansion: oneCost}
 
-	outcome := SearchAndExpand(messages, store, 100000, tc, budget)
+	outcome := searchAndExpandForSession(messages, store, 100000, tc, budget, "budget-session")
 	if outcome.Candidates != 2 || outcome.Selected != 2 {
 		t.Fatalf("candidates/selected = %d/%d, want 2/2", outcome.Candidates, outcome.Selected)
 	}
@@ -1242,10 +1370,10 @@ func TestSearchAndExpandBudgetTracksOnlyInjectedPayload(t *testing.T) {
 
 func TestSearchAndExpandBudgetNilUsesHardLimit(t *testing.T) {
 	store, messages, tc, summary := seedBudgetCandidates(t, 2)
-	prefix := fmt.Sprintf("[Retrieved archive #%d — source=%s, range=%d-%d, ~%d tokens]\n\n", 1, "session-0", 1, 2, 80)
+	prefix := fmt.Sprintf("[Retrieved archive #%d — source=%s, range=%d-%d, ~%d tokens]\n\n", 1, "budget-session", 1, 2, 80)
 	oneCost := tc.CountTokens(prefix + summary)
 
-	outcome := SearchAndExpand(messages, store, oneCost*10, tc, nil)
+	outcome := searchAndExpandForSession(messages, store, oneCost*10, tc, nil, "budget-session")
 	if outcome.BudgetLimit != oneCost {
 		t.Fatalf("budget limit = %d, want %d", outcome.BudgetLimit, oneCost)
 	}
