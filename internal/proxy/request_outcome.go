@@ -323,6 +323,29 @@ func (o *requestOutcomeCollector) MergeDiskState(value persistenceState) {
 	})
 }
 
+// MergeMemoryState 是内存维度的同步登记入口：与 MergeDiskState 共用同一条单调
+// 聚合规则，因此同一请求内多次登记与顺序无关，后到的较轻结果也不会抹掉更重的。
+func (o *requestOutcomeCollector) MergeMemoryState(value persistenceState) {
+	o.setIfMutable(func(snapshot *requestOutcomeSnapshot) {
+		mergeOutcomePersistenceState(&snapshot.MemoryState, normalizePersistenceState(value))
+	})
+}
+
+// noteMemorySaved 供状态组件在内存状态更新成功之后登记一次内存事实。
+//
+//  1. 状态组件手上只有 *outcomeCompletion，这里只把它当作触达 owning collector
+//     的句柄，与该 completion 自身的 kind（SQLite 磁盘维）无关。
+//  2. 内存维度是同步事实：刻意不走 BeginAsyncResult，不占用 pending 计数，
+//     SealProducers 与 tryFinalize 的时序完全不变。
+//  3. 只有真的发生了成功的内存状态更新才允许调用它——在未发生写入的路径上调用
+//     等于给闭环编造一条与事实相反的内存事实。
+func (c *outcomeCompletion) noteMemorySaved() {
+	if c == nil || c.collector == nil {
+		return
+	}
+	c.collector.MergeMemoryState(persistenceStateSaved)
+}
+
 func (o *requestOutcomeCollector) SetFailureClass(value persistenceFailureClass) {
 	o.setIfMutable(func(snapshot *requestOutcomeSnapshot) { snapshot.FailureClass = normalizeFailureClass(value) })
 }

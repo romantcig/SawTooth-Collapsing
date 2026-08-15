@@ -391,6 +391,9 @@ func (f *FrozenStubs) StoreWithResult(logger *slog.Logger, threadID string, stub
 	f.mirrorCurrentAliasesLocked(threadID)
 	f.mu.Unlock()
 
+	// 内存已落定，磁盘结果仍由 completion 异步补齐，两个维度自此分离。
+	completion.noteMemorySaved()
+
 	// 提交在组件锁外执行；persistLock 保证同一 thread 的内存与磁盘顺序一致。
 	if persisted == nil {
 		return completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
