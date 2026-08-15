@@ -2871,3 +2871,51 @@ func TestCompactDisabledUsesSafePlan(t *testing.T) {
 		}
 	}
 }
+
+// ── Plan 10 Task 1：闭环的内存维度必须反映真实的内存写入 ──
+
+// TestProductionMemoryDimensionReflectsRealInMemoryWrite 断言的是生产链路，
+// 不是 formatter：两个子用例的 snapshot 都由生产 dispatcher 捕获，测试内不出现
+// 任何对 requestOutcomeSnapshot 字段的直接赋值。
+func TestProductionMemoryDimensionReflectsRealInMemoryWrite(t *testing.T) {
+	upstream := jsonOutcomeUpstream(t)
+
+	t.Run("collapse_writes_memory", func(t *testing.T) {
+		server, sink := newOutcomePipelineServer(t, upstream.URL)
+		backend := newBlockingStateBackend()
+		writer, _, _ := newPersistenceWriterTest(t, backend)
+		defer writer.CloseAndDrain()
+		server.Frozen.SetStateSubmitter(writer)
+		server.DecayTracker.SetStateSubmitter(writer)
+
+		serveOutcomeMessages(t, server, "memory-dimension-collapse", pipelineMessages(80, 260))
+		snapshot := sink.waitFor(t, 1)[0]
+		if got := snapshot.MemoryState; got != persistenceStateSaved {
+			t.Fatalf("memory_state=%s, want saved（Frozen 内存写入确已成功）", got)
+		}
+		if got := snapshot.DiskState; got != persistenceStateSaved {
+			t.Fatalf("disk_state=%s, want saved", got)
+		}
+		closure := formatRequestOutcomeClosure(snapshot)
+		for _, want := range []string{"memory=saved", "disk=saved"} {
+			if !strings.Contains(closure, want) {
+				t.Fatalf("闭环缺少 %q: %s", want, closure)
+			}
+		}
+	})
+
+	// 对照用例：不发生内存写入的直通请求必须保持 not_attempted，且仍恰好
+	// dispatch 一次——证明内存维度不适用时既不谎报，也不会让 closure 悬挂。
+	t.Run("no_state_write_stays_not_attempted", func(t *testing.T) {
+		server, sink := newOutcomePipelineServer(t, upstream.URL)
+
+		serveOutcomeMessages(t, server, "memory-dimension-passthrough", pipelineMessages(4, 3))
+		snapshot := sink.sole(t)
+		if got := snapshot.MemoryState; got != persistenceStateNotAttempted {
+			t.Fatalf("未发生内存写入的请求 memory_state=%s, want not_attempted", got)
+		}
+		if got := sink.count(); got != 1 {
+			t.Fatalf("dispatch 次数=%d, want 1", got)
+		}
+	})
+}
