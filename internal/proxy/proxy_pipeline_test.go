@@ -2118,6 +2118,14 @@ func (b *blockingStateBackend) callCount() int {
 	return b.calls
 }
 
+// failAlways 启用既有的 failAll 字段。必须在 b.mu 下写：run() 也在 b.mu 下读它，
+// 裸写会与 worker goroutine 形成数据竞争。
+func (b *blockingStateBackend) failAlways() {
+	b.mu.Lock()
+	b.failAll = true
+	b.mu.Unlock()
+}
+
 func (b *blockingStateBackend) run() error {
 	b.mu.Lock()
 	b.calls++
@@ -2918,4 +2926,38 @@ func TestProductionMemoryDimensionReflectsRealInMemoryWrite(t *testing.T) {
 			t.Fatalf("dispatch 次数=%d, want 1", got)
 		}
 	})
+}
+
+// ── Plan 10 Task 2：内存成功 + 磁盘失败必须能被分别读出（CONTEXT D-11） ──
+
+// TestProductionMemorySavedWithDiskFailedIsReadable 用必失败 backend 做真实故障
+// 注入，snapshot 同样由生产 dispatcher 捕获。
+func TestProductionMemorySavedWithDiskFailedIsReadable(t *testing.T) {
+	upstream := jsonOutcomeUpstream(t)
+	server, sink := newOutcomePipelineServer(t, upstream.URL)
+	backend := newBlockingStateBackend()
+	backend.failAlways()
+	writer, _, _ := newPersistenceWriterTest(t, backend)
+	defer writer.CloseAndDrain()
+	server.Frozen.SetStateSubmitter(writer)
+	server.DecayTracker.SetStateSubmitter(writer)
+
+	serveOutcomeMessages(t, server, "memory-saved-disk-failed", pipelineMessages(80, 260))
+	snapshot := sink.waitFor(t, 1)[0]
+	if got := snapshot.MemoryState; got != persistenceStateSaved {
+		t.Fatalf("memory_state=%s, want saved（内存写入先于磁盘且确已成功）", got)
+	}
+	if got := snapshot.DiskState; got != persistenceStateFailed {
+		t.Fatalf("disk_state=%s, want failed", got)
+	}
+	if got := snapshot.FailureClass; got != persistenceFailureSQLite {
+		t.Fatalf("failure_class=%s, want sqlite", got)
+	}
+
+	closure := formatRequestOutcomeClosure(snapshot)
+	for _, want := range []string{"memory=saved", "disk=failed", "failure=sqlite"} {
+		if !strings.Contains(closure, want) {
+			t.Fatalf("闭环缺少 %q（两个维度必须可分别读出）: %s", want, closure)
+		}
+	}
 }
