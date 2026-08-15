@@ -646,6 +646,9 @@ func (f *FrozenStubs) InvalidateWithResult(logger *slog.Logger, threadID string,
 	submitter, deleteFn := f.submitter, f.deleteFn
 	f.mu.Unlock()
 
+	// 失效同样是一次成功的内存状态更新，按 D-11 与写入路径同权。
+	completion.noteMemorySaved()
+
 	logger.Debug("frozen prefix 已失效", "reason", "state_invalidated")
 	if submitter == nil && deleteFn == nil {
 		return completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)

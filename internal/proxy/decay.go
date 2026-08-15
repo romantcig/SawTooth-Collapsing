@@ -722,6 +722,9 @@ func (d *DecayTracker) ClearSessionWithResult(sessionID string, completion *outc
 	submitter, persistFn := d.submitter, d.persistFn
 	d.mu.Unlock()
 
+	// 三张 map 的前缀条目已删除，内存状态更新已落定。
+	completion.noteMemorySaved()
+
 	if submitter == nil && persistFn == nil {
 		return completeStateOp(completion, persistenceStateNotAttempted, persistenceFailureNone)
 	}
