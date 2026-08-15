@@ -644,3 +644,103 @@ func TestLogHandlerRequestAttrsSharedAcrossLines(t *testing.T) {
 		}
 	}
 }
+
+// ── Plan 10 Task 3：终端 sink 的 session 身份脱敏（LOG-03 Gap 3） ──
+
+// TestTerminalSinkRedactsSessionIdentityAttrs 同时覆盖 WithAttrs 与 record attrs
+// 两条路径：meta.Logger 的 request_session_id 是经 WithAttrs 进来的，只过滤
+// record attrs 会漏掉真实生产形态。
+func TestTerminalSinkRedactsSessionIdentityAttrs(t *testing.T) {
+	const (
+		secretRequestSession = "SECRET-REQ-SESSION-9f1c"
+		secretSession        = "SECRET-SESSION-2b7e"
+		secretSourceSession  = "SECRET-SOURCE-SESSION-4d0a"
+		secretGroupedSession = "SECRET-GROUPED-SESSION-77aa"
+	)
+
+	t.Run("with_attrs_path", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(NewLogHandler(&buf, slog.LevelInfo)).With(
+			"request_id", uint64(11),
+			"request_session_id", secretRequestSession,
+			"session_id", secretSession,
+			"source_session_id", secretSourceSession,
+			"model", "deepseek-v4-pro",
+		)
+		logger.WithGroup("recall").Info("上游请求发送", "origin_session_id", secretGroupedSession, "candidates", 3)
+		got := buf.String()
+
+		assertNoSessionIdentityInTerminal(t, got, secretRequestSession, secretSession, secretSourceSession, secretGroupedSession)
+		for _, want := range []string{"request_id=11", "model=deepseek-v4-pro", "recall.candidates=3"} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("脱敏误伤普通属性，缺少 %q: %q", want, got)
+			}
+		}
+	})
+
+	t.Run("record_attrs_path", func(t *testing.T) {
+		var buf bytes.Buffer
+		h := NewLogHandler(&buf, slog.LevelInfo)
+		got := emitLogRecord(t, h, &buf, slog.LevelInfo, "frozen prefix 已存储",
+			slog.String("request_session_id", secretRequestSession),
+			slog.String("session_id", secretSession),
+			slog.String("source_session_id", secretSourceSession),
+			slog.String("upstream_session_id", secretGroupedSession),
+			slog.Int("original_message_count", 80),
+			slog.Int("cutoff", 40),
+			slog.Int("tokens", 10903),
+		)
+
+		assertNoSessionIdentityInTerminal(t, got, secretRequestSession, secretSession, secretSourceSession, secretGroupedSession)
+		for _, want := range []string{"original_message_count=80", "cutoff=40", "tokens=10903"} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("脱敏误伤普通属性，缺少 %q: %q", want, got)
+			}
+		}
+		// 终端时间格式未被本次改动波及。
+		if !strings.HasPrefix(got, logTestPrefix) {
+			t.Fatalf("终端时间格式被改动: %q", got)
+		}
+	})
+
+	// 两个 sink 必须共用同一判定——各写一份正是 Gap 3 的根因。
+	t.Run("both_sinks_agree", func(t *testing.T) {
+		for _, key := range []string{
+			requestSessionIDAttr, sessionIDAttr, sourceSessionIDAttr,
+			"origin_session_id", "upstream_session_id", "Request_Session_ID",
+		} {
+			if !isSessionIdentityLogAttr(key) {
+				t.Fatalf("%q 未被判为 session 身份属性", key)
+			}
+			if isVisibleFileLogAttr(key) {
+				t.Fatalf("%q 被终端判为 session 身份，却在文件侧可见（两个 sink 判定漂移）", key)
+			}
+		}
+		for _, key := range []string{
+			"request_id", "model", "cutoff", "tokens", "original_message_count", "session_hash",
+		} {
+			if isSessionIdentityLogAttr(key) {
+				t.Fatalf("%q 被误判为 session 身份属性", key)
+			}
+			if !isVisibleFileLogAttr(key) {
+				t.Fatalf("%q 在文件侧的既有可见性被改动", key)
+			}
+		}
+	})
+}
+
+// assertNoSessionIdentityInTerminal 同时否定属性键与属性值：只删值不删键仍会
+// 暴露「这条日志属于某个 session」的结构，且与文件侧行为不一致。
+func assertNoSessionIdentityInTerminal(t *testing.T, output string, secrets ...string) {
+	t.Helper()
+	for _, key := range []string{"request_session_id", "session_id", "source_session_id", "_session_id"} {
+		if strings.Contains(output, key) {
+			t.Fatalf("终端输出含 session 身份属性键 %q: %q", key, output)
+		}
+	}
+	for _, secret := range secrets {
+		if strings.Contains(output, secret) {
+			t.Fatalf("终端输出含完整 session ID %q: %q", secret, output)
+		}
+	}
+}

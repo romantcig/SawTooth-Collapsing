@@ -2961,3 +2961,39 @@ func TestProductionMemorySavedWithDiskFailedIsReadable(t *testing.T) {
 		}
 	}
 }
+
+// ── Plan 10 Task 3：真实主请求的终端输出不得出现完整 session ID ──
+
+// terminalProbeSessionID 是醒目的探针 session ID：一旦出现在终端输出里就是
+// LOG-03 违例，取值不与任何其他 fixture 冲突。
+const terminalProbeSessionID = "SECRET-FULL-SESSION-ID-terminal-probe-3c9d"
+
+func TestProductionTerminalNeverPrintsFullSessionID(t *testing.T) {
+	logs := captureOrdinaryLogs(t)
+	upstream := jsonOutcomeUpstream(t)
+	server, sink := newOutcomePipelineServer(t, upstream.URL)
+
+	serveOutcomeMessages(t, server, terminalProbeSessionID, pipelineMessages(80, 260))
+	output := logs.String()
+
+	// 正向（范围围栏）先断言：脱敏不得靠降级 Info 进度行来换取。
+	// 放在负向之前，使实现前的红也能证明这三条行本来就在。
+	for _, want := range []string{"请求进入", "frozen prefix 已存储", "上游请求发送", "[INFO]"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("终端丢失请求进行中的进度反馈 %q:\n%s", want, output)
+		}
+	}
+
+	// 负向：完整 session ID 与属性键都不得进终端。
+	if strings.Contains(output, terminalProbeSessionID) {
+		t.Fatalf("终端输出泄漏完整 session ID:\n%s", output)
+	}
+	if strings.Contains(output, "request_session_id") {
+		t.Fatalf("终端输出含 request_session_id 属性键:\n%s", output)
+	}
+
+	// 关联性：脱敏后仍可用短哈希关联到落盘记录。
+	if got, want := sink.sole(t).SessionHash, stableSessionHash(terminalProbeSessionID); got != want {
+		t.Fatalf("session_hash=%s, want %s", got, want)
+	}
+}

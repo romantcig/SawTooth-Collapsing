@@ -295,6 +295,15 @@ func requestIDFromLogAttrs(attrs []sessionLogAttr) (uint64, bool) {
 	return 0, false
 }
 
+// isSessionIdentityLogAttr 是终端与文件两个 sink 共用的 session 身份判定。
+// 它是 Gap 3 的单一真源：两个 sink 各写一份判定正是这次不一致的根因。
+func isSessionIdentityLogAttr(key string) bool {
+	if key == requestSessionIDAttr || key == sessionIDAttr || key == sourceSessionIDAttr {
+		return true
+	}
+	return strings.HasSuffix(strings.ToLower(key), "_session_id")
+}
+
 func isVisibleFileLogAttr(key string) bool {
 	if key == logColorKey || key == requestSessionIDAttr || key == sessionIDAttr || key == sourceSessionIDAttr {
 		return false
