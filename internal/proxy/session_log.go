@@ -305,7 +305,7 @@ func isSessionIdentityLogAttr(key string) bool {
 }
 
 func isVisibleFileLogAttr(key string) bool {
-	if key == logColorKey || key == requestSessionIDAttr || key == sessionIDAttr || key == sourceSessionIDAttr {
+	if key == logColorKey || isSessionIdentityLogAttr(key) {
 		return false
 	}
 	lower := strings.ToLower(key)
@@ -313,7 +313,7 @@ func isVisibleFileLogAttr(key string) bool {
 		"authorization", "proxy-authorization", "api-key", "cookie", "set-cookie",
 		"body", "messages", "system", "tools", "prompt", "payload", "base64", "fingerprint",
 	} {
-		if strings.Contains(lower, denied) || strings.HasSuffix(lower, "_session_id") {
+		if strings.Contains(lower, denied) {
 			return false
 		}
 	}

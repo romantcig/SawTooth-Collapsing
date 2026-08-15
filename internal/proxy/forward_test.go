@@ -1337,12 +1337,16 @@ func TestForwardRawRequestLogFields(t *testing.T) {
 
 	output := logs.String()
 	for _, want := range []string{
-		"请求进入 request_id=17 request_session_id=request-session original_message_count=2 model=test-model",
-		"上游请求发送 request_id=17 request_session_id=request-session forwarded_message_count=2 model=test-model",
+		"请求进入 request_id=17 original_message_count=2 model=test-model",
+		"上游请求发送 request_id=17 forwarded_message_count=2 model=test-model",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("日志缺少 %q:\n%s", want, output)
 		}
+	}
+	// LOG-03：session 身份不进终端渲染，关联改由 request_id 承担。
+	if strings.Contains(output, "request-session") || strings.Contains(output, "request_session_id") {
+		t.Fatalf("终端日志泄漏 session 身份:\n%s", output)
 	}
 	if strings.Contains(output, "请求已接收") || strings.Contains(output, "Authorization") {
 		t.Fatalf("日志包含旧事件名或敏感 header:\n%s", output)

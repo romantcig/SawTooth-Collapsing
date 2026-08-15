@@ -639,8 +639,13 @@ func TestLogHandlerRequestAttrsSharedAcrossLines(t *testing.T) {
 		t.Fatalf("日志行数=%d，期望 2: %q", len(lines), buf.String())
 	}
 	for _, line := range lines {
-		if !strings.Contains(line, "request_id=9") || !strings.Contains(line, "request_session_id=current-session") {
+		// LOG-03：request_session_id 只用于文件路由，不再渲染到终端；
+		// 贯穿各行的固定关联字段因此只剩 request_id。
+		if !strings.Contains(line, "request_id=9") {
 			t.Fatalf("请求固定字段未贯穿日志行: %q", line)
+		}
+		if strings.Contains(line, "current-session") || strings.Contains(line, "request_session_id") {
+			t.Fatalf("终端日志行泄漏 session 身份: %q", line)
 		}
 	}
 }

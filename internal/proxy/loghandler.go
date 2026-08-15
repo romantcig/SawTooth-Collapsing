@@ -87,6 +87,10 @@ func (h *LogHandler) Handle(_ context.Context, r slog.Record) error {
 			semColor = a.Value.String()
 			return true
 		}
+		// LOG-03：session 身份只进文件路由，不进终端渲染。
+		if isSessionIdentityLogAttr(a.Key) {
+			return true
+		}
 		attrBuf.WriteByte(' ')
 		attrBuf.WriteString(h.groups)
 		attrBuf.WriteString(a.Key)
@@ -158,6 +162,10 @@ func (h *LogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	for _, a := range attrs {
 		if a.Key == logColorKey {
 			h2.withColor = a.Value.String()
+			continue
+		}
+		// meta.Logger 的 request_session_id 走的正是这条路径。
+		if isSessionIdentityLogAttr(a.Key) {
 			continue
 		}
 		h2.preAttrs += " " + h2.groups + a.Key + "=" + a.Value.String()

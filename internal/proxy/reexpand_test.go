@@ -36,8 +36,6 @@ func TestRecallLoggingFinalSummaryAndSourceSession(t *testing.T) {
 	}
 	for _, want := range []string{
 		"request_id=23",
-		"request_session_id=s1",
-		"source_session_id=s1",
 		"block_id=block-budget",
 		"candidates=1",
 		"selected=1",
@@ -50,6 +48,10 @@ func TestRecallLoggingFinalSummaryAndSourceSession(t *testing.T) {
 		if !strings.Contains(output, want) {
 			t.Fatalf("日志缺少 %q:\n%s", want, output)
 		}
+	}
+	// LOG-03：request_session_id / source_session_id 只进文件路由，终端不渲染。
+	if strings.Contains(output, "request_session_id") || strings.Contains(output, "source_session_id") {
+		t.Fatalf("终端日志泄漏 session 身份属性:\n%s", output)
 	}
 	if strings.Contains(output, "[INFO]  注入存档块") || strings.Contains(output, " session_id=") {
 		t.Fatalf("Info 逐块日志未清除或 session_id 仍含糊:\n%s", output)

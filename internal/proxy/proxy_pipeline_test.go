@@ -633,26 +633,23 @@ func TestConcurrentRequestLogsReconstructable(t *testing.T) {
 	}
 
 	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
-	requestIDs := make(map[string]string)
+	// LOG-03 之后终端不再渲染 session 身份，因此并发日志的还原键只剩 request_id：
+	// 每条并发主请求必须有自己的入口行与完整事件链，且互不串号。
+	requestIDs := make(map[string]bool)
 	for _, line := range lines {
 		if !strings.Contains(line, "请求进入") {
 			continue
 		}
-		for _, sessionID := range []string{"concurrent-a", "concurrent-b"} {
-			if !strings.Contains(line, "request_session_id="+sessionID) {
-				continue
-			}
-			for _, field := range strings.Fields(line) {
-				if strings.HasPrefix(field, "request_id=") {
-					requestIDs[sessionID] = strings.TrimPrefix(field, "request_id=")
-				}
+		for _, field := range strings.Fields(line) {
+			if strings.HasPrefix(field, "request_id=") {
+				requestIDs[strings.TrimPrefix(field, "request_id=")] = true
 			}
 		}
 	}
-	if len(requestIDs) != 2 || requestIDs["concurrent-a"] == requestIDs["concurrent-b"] {
-		t.Fatalf("无法从入口日志还原唯一 request_id: %v\n%s", requestIDs, logs.String())
+	if len(requestIDs) != 2 {
+		t.Fatalf("无法从入口日志还原 2 个唯一 request_id: %v\n%s", requestIDs, logs.String())
 	}
-	for sessionID, requestID := range requestIDs {
+	for requestID := range requestIDs {
 		var chain strings.Builder
 		for _, line := range lines {
 			if strings.Contains(line, "request_id="+requestID+" ") || strings.HasSuffix(line, "request_id="+requestID) {
@@ -663,12 +660,14 @@ func TestConcurrentRequestLogsReconstructable(t *testing.T) {
 		got := chain.String()
 		for _, event := range []string{"请求进入", "agent_features", "frozen prefix 未命中", "Archive 召回汇总", "上游请求发送"} {
 			if !strings.Contains(got, event) {
-				t.Fatalf("%s(request_id=%s) 缺少 %s:\n%s", sessionID, requestID, event, got)
+				t.Fatalf("request_id=%s 缺少 %s:\n%s", requestID, event, got)
 			}
 		}
-		if !strings.Contains(got, "request_session_id="+sessionID) {
-			t.Fatalf("request_id=%s 混入其他 session:\n%s", requestID, got)
-		}
+	}
+	// 只否定 session 身份属性本身：本用例的 block_id fixture 刻意把 session 名
+	// 编进了存档块 ID，那是测试命名而非生产身份泄漏。
+	if strings.Contains(logs.String(), "request_session_id") {
+		t.Fatalf("终端日志泄漏 session 身份属性:\n%s", logs.String())
 	}
 	for _, line := range lines {
 		if (strings.Contains(line, "agent_features") || strings.Contains(line, "frozen prefix")) && !strings.Contains(line, "request_id=") {
