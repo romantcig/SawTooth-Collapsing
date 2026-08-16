@@ -2996,3 +2996,116 @@ func TestProductionTerminalNeverPrintsFullSessionID(t *testing.T) {
 		t.Fatalf("session_hash=%s, want %s", got, want)
 	}
 }
+
+// TestProductionLongRequestProgressMapsToSessionLog 把原先需要人工同时观察的
+// 两个窗口收敛成一个确定性生产管线合同：上游仍被屏障阻塞时，三条阶段进度
+// 已经可见且最终结果尚未出现；释放后，结果行的短 hash 必须对应 session 文件。
+// 大请求复用既有 pipelineMessages fixture，不另建 token/消息生成器。
+func TestProductionLongRequestProgressMapsToSessionLog(t *testing.T) {
+	terminal := &lockedBuffer{}
+	dataDir := t.TempDir()
+	terminalHandler := NewLogHandler(terminal, slog.LevelInfo)
+	fileHandler := NewSessionLogHandler(dataDir, slog.LevelInfo, nil)
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(NewCombinedLogHandler(terminalHandler, fileHandler)))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	upstreamStarted := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseUpstream) }) }
+	t.Cleanup(release)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(upstreamStarted)
+		<-releaseUpstream
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":1200,"output_tokens":7}}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	server := newPipelineTestServer(t, upstream.URL)
+	reporter := NewTerminalHealthReporter(terminalHandler)
+	tracker := NewHealthTracker(reporter)
+	gaps := NewOutcomeGapAccumulator()
+	dispatcher, err := NewOutcomeDispatcherChecked(OutcomeDispatcherOptions{
+		TerminalProjector: terminalHandler,
+		SessionProjector:  NewSessionOutcomeWriter(fileHandler, gaps, tracker),
+		HealthTracker:     tracker,
+		Reporter:          reporter,
+		GapAccumulator:    gaps,
+	})
+	if err != nil {
+		t.Fatalf("NewOutcomeDispatcherChecked: %v", err)
+	}
+	var drainOnce sync.Once
+	drain := func() { drainOnce.Do(func() { _ = dispatcher.CloseAndDrain() }) }
+	t.Cleanup(drain)
+	server.SetOutcomeDispatcher(dispatcher)
+
+	const sessionID = "SECRET-FULL-SESSION-ID-long-progress-probe"
+	body, err := json.Marshal(map[string]any{
+		"model":    "deepseek-v4-pro",
+		"messages": pipelineMessages(80, 260),
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Claude-Code-Session-Id", sessionID)
+	recorder := httptest.NewRecorder()
+	requestDone := make(chan struct{})
+	go func() {
+		server.HandleMessages(recorder, req)
+		close(requestDone)
+	}()
+
+	select {
+	case <-upstreamStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("长请求未到达受控上游")
+	}
+
+	// 请求明确仍在处理中：此时上游没有返回，结果行不可能已经完成。
+	during := terminal.String()
+	for _, want := range []string{"请求进入", "frozen prefix 已存储", "上游请求发送", "[INFO]"} {
+		if !strings.Contains(during, want) {
+			t.Fatalf("长请求处理中缺少进度反馈 %q:\n%s", want, during)
+		}
+	}
+	if strings.Contains(during, "ST 已触发") {
+		t.Fatalf("上游仍阻塞时提前输出最终结果:\n%s", during)
+	}
+	if strings.Contains(during, sessionID) || strings.Contains(during, "request_session_id") {
+		t.Fatalf("长请求进度泄漏完整 session 身份:\n%s", during)
+	}
+
+	release()
+	select {
+	case <-requestDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("释放上游后请求未完成")
+	}
+	drain()
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("HandleMessages status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	hash := stableSessionHash(sessionID)
+	completed := terminal.String()
+	if strings.Count(completed, "ST 已触发") != 1 || !strings.Contains(completed, "会话="+hash) {
+		t.Fatalf("最终结果行未唯一输出或短 hash 不匹配 %s:\n%s", hash, completed)
+	}
+	if strings.Contains(completed, sessionID) || strings.Contains(completed, "request_session_id") {
+		t.Fatalf("完整终端输出泄漏 session 身份:\n%s", completed)
+	}
+
+	sessionPath := filepath.Join(dataDir, "logs", hash+".log")
+	sessionLog := readSessionLogFile(t, sessionPath)
+	if strings.Count(sessionLog, "event=request_outcome") != 1 || !strings.Contains(sessionLog, "session="+hash) {
+		t.Fatalf("session 文件缺少唯一闭环或短 hash 不匹配 %s: %q", sessionPath, sessionLog)
+	}
+	if strings.Contains(sessionLog, sessionID) || strings.Contains(sessionLog, "request_session_id") {
+		t.Fatalf("session 文件泄漏完整 session 身份: %q", sessionLog)
+	}
+}
