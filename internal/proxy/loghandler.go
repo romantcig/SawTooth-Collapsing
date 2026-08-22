@@ -254,6 +254,9 @@ func outcomeDisplayTime(snapshot requestOutcomeSnapshot) time.Time {
 }
 
 // terminalTriggerPhrase 返回“是否触发”与自然中文原因；未完成判定时不假装已评估。
+// Terminal Policy：普通 direct 请求使用中性“上下文”结果，同一原因里携带
+// 判定值/阈值/来源与 API 完整输入的数值闭环；API 完整输入已超阈值时
+// 明确预告下一次连续主请求将整理，不再宣称“上下文仍有余量”。
 func terminalTriggerPhrase(snapshot requestOutcomeSnapshot) (string, string) {
 	switch snapshot.Eligibility {
 	case outcomeEligibilityUnknown, outcomeEligibilityNotEvaluable:
@@ -261,15 +264,85 @@ func terminalTriggerPhrase(snapshot requestOutcomeSnapshot) (string, string) {
 	}
 	switch snapshot.TriggerReason {
 	case TriggerNone:
-		return "未触发", "上下文仍有余量"
+		apiTotal := terminalAPITotalPhrase(snapshot)
+		if snapshot.APIUsageKnown && snapshot.PressureThresholdTokens > 0 && snapshot.APITotalInputTokens > snapshot.PressureThresholdTokens {
+			reason := terminalPressurePhrase(snapshot)
+			if reason != "" {
+				reason += "，"
+			}
+			return "上下文", reason + apiTotal + " 已超阈值，下一次连续主请求将整理"
+		}
+		if reason := terminalPressurePhrase(snapshot); reason != "" {
+			if apiTotal != "" {
+				return "上下文", reason + "，" + apiTotal
+			}
+			return "上下文", reason
+		}
+		if apiTotal != "" {
+			return "上下文", apiTotal
+		}
+		return "上下文", "本轮未整理"
 	case TriggerTokens:
-		return "已触发", "上下文接近上限"
+		return "已触发", "上下文接近上限" + terminalTriggerDetailPhrase(snapshot)
 	case TriggerPause:
-		return "已触发", "对话长时间未继续"
+		return "已触发", "对话长时间未继续" + terminalTriggerDetailPhrase(snapshot)
 	case TriggerEmergency:
-		return "已触发", "上下文即将超出上限"
+		return "已触发", "上下文即将超出上限" + terminalTriggerDetailPhrase(snapshot)
 	default:
 		return "触发情况未确认", "判定信息不完整"
+	}
+}
+
+// terminalPressurePhrase 渲染“判定 X/阈值 Y（来源）”；数值未知时返回空串。
+func terminalPressurePhrase(snapshot requestOutcomeSnapshot) string {
+	if snapshot.SelectedPressureTokens <= 0 && snapshot.PressureThresholdTokens <= 0 {
+		return ""
+	}
+	phrase := "判定 " + strconv.Itoa(snapshot.SelectedPressureTokens) + "/" + strconv.Itoa(snapshot.PressureThresholdTokens)
+	if source := terminalPressureSourcePhrase(snapshot.PressureSource); source != "" {
+		phrase += "（" + source + "）"
+	}
+	return phrase
+}
+
+// terminalAPITotalPhrase 渲染“API 完整输入 Z”；usage 未知时返回空串。
+func terminalAPITotalPhrase(snapshot requestOutcomeSnapshot) string {
+	if !snapshot.APIUsageKnown {
+		return ""
+	}
+	return "API 完整输入 " + strconv.Itoa(snapshot.APITotalInputTokens)
+}
+
+// terminalTriggerDetailPhrase 在已触发原因后追加判定数值与整理前后估算，
+// 让“已触发”请求同样拥有数值闭环。
+func terminalTriggerDetailPhrase(snapshot requestOutcomeSnapshot) string {
+	detail := terminalPressurePhrase(snapshot)
+	if snapshot.BeforeTokens > 0 && snapshot.AfterTokens > 0 {
+		if detail != "" {
+			detail += "，"
+		}
+		detail += "整理前 " + strconv.Itoa(snapshot.BeforeTokens) + " → 整理后 " + strconv.Itoa(snapshot.AfterTokens) + "（估算）"
+	}
+	if detail == "" {
+		return ""
+	}
+	return "（" + detail + "）"
+}
+
+func terminalPressureSourcePhrase(source pressureSource) string {
+	switch source {
+	case pressureSourceLocalFull:
+		return "本地估算"
+	case pressureSourceActualPlusDelta:
+		return "上次实际输入+新增"
+	case pressureSourceConservativePlusDelta:
+		return "保守估算+新增"
+	case pressureSourceConservativeHighWater:
+		return "保守高水位"
+	case pressureSourceLegacyHighWater:
+		return "历史高水位"
+	default:
+		return ""
 	}
 }
 

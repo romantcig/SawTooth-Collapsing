@@ -514,6 +514,20 @@ func formatRequestOutcomeClosure(snapshot requestOutcomeSnapshot) string {
 	if snapshot.PressureSource != pressureSourceUnknown {
 		appendOutcomeField(&builder, "pressure_source", string(snapshot.PressureSource))
 	}
+	if snapshot.SelectedPressureTokens > 0 || snapshot.PressureThresholdTokens > 0 {
+		appendOutcomeField(&builder, "selected_pressure", strconv.Itoa(snapshot.SelectedPressureTokens))
+		appendOutcomeField(&builder, "pressure_threshold", strconv.Itoa(snapshot.PressureThresholdTokens))
+	}
+	if snapshot.APIUsageKnown {
+		appendOutcomeField(&builder, "api_input", strconv.Itoa(snapshot.APIInputTokens))
+		if snapshot.APICacheCreationTokens > 0 {
+			appendOutcomeField(&builder, "api_cache_creation", strconv.Itoa(snapshot.APICacheCreationTokens))
+		}
+		if snapshot.APICacheReadTokens > 0 {
+			appendOutcomeField(&builder, "api_cache_read", strconv.Itoa(snapshot.APICacheReadTokens))
+		}
+		appendOutcomeField(&builder, "api_total_input", strconv.Itoa(snapshot.APITotalInputTokens))
+	}
 	if snapshot.RequiredWait > 0 || snapshot.ActualWaitKnown {
 		appendOutcomeField(&builder, "required_wait", snapshot.RequiredWait.String())
 		appendOutcomeField(&builder, "actual_wait", snapshot.ActualWait.String())

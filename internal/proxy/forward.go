@@ -1078,6 +1078,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, resp *http.Response, meta *req
 	}
 	if baselineState.complete() {
 		baselineUpdated := s.applyPressureBaselineUsage(meta, baselineState.actual)
+		recordAPIUsageOutcome(meta, baselineState.usage)
 		s.writeUsageDebugFacts(meta, timestamp, baselineState.usage, baselineUpdated)
 	}
 	if !committed {
@@ -1205,6 +1206,7 @@ func (s *Server) handleJSON(w http.ResponseWriter, resp *http.Response, meta *re
 			// 只有严格合法的 Anthropic message usage 才能生成 facts 或校准 baseline。
 			if usage, actual, ok := parseAnthropicMessageInputUsage(body); ok {
 				baselineUpdated := s.applyPressureBaselineUsage(meta, actual)
+				recordAPIUsageOutcome(meta, usage)
 				s.writeUsageDebugFacts(meta, timestamp, usage, baselineUpdated)
 			}
 

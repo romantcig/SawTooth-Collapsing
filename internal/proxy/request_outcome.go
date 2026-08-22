@@ -131,6 +131,15 @@ type requestOutcomeSnapshot struct {
 	ActualWait          time.Duration           `json:"actual_wait,omitempty"`
 	ActualWaitKnown     bool                    `json:"actual_wait_known"`
 	Action              outcomeAction           `json:"action"`
+	// 数值闭环（Terminal Policy）：发送前判定值/阈值与响应后 API 完整输入
+	// 进入同一条结果；APIUsageKnown 区分“合法零值”与“未取得”。
+	SelectedPressureTokens  int `json:"selected_pressure_tokens,omitempty"`
+	PressureThresholdTokens int `json:"pressure_threshold_tokens,omitempty"`
+	APIUsageKnown           bool `json:"api_usage_known"`
+	APIInputTokens          int `json:"api_input_tokens,omitempty"`
+	APICacheCreationTokens  int `json:"api_cache_creation_input_tokens,omitempty"`
+	APICacheReadTokens      int `json:"api_cache_read_input_tokens,omitempty"`
+	APITotalInputTokens     int `json:"api_total_input_tokens,omitempty"`
 	BeforeMessages      int                     `json:"before_messages,omitempty"`
 	AfterMessages       int                     `json:"after_messages,omitempty"`
 	BeforeTokens        int                     `json:"before_tokens,omitempty"`
@@ -294,6 +303,40 @@ func (o *requestOutcomeCollector) SetAction(value outcomeAction) {
 	o.setIfMutable(func(snapshot *requestOutcomeSnapshot) { snapshot.Action = normalizeOutcomeAction(value) })
 }
 
+// SetPressureTokens 登记发送前 ST 判定实际使用的判定值与阈值。
+func (o *requestOutcomeCollector) SetPressureTokens(selected, threshold int) {
+	o.setIfMutable(func(snapshot *requestOutcomeSnapshot) {
+		snapshot.SelectedPressureTokens = nonNegativeOutcomeInt(selected)
+		snapshot.PressureThresholdTokens = nonNegativeOutcomeInt(threshold)
+	})
+}
+
+// SetAPIUsageTotals 登记响应后 API 返回的完整输入 token 分项；total 由分项求和。
+func (o *requestOutcomeCollector) SetAPIUsageTotals(input, cacheCreation, cacheRead int) {
+	o.setIfMutable(func(snapshot *requestOutcomeSnapshot) {
+		snapshot.APIInputTokens = nonNegativeOutcomeInt(input)
+		snapshot.APICacheCreationTokens = nonNegativeOutcomeInt(cacheCreation)
+		snapshot.APICacheReadTokens = nonNegativeOutcomeInt(cacheRead)
+		total := snapshot.APIInputTokens + snapshot.APICacheCreationTokens + snapshot.APICacheReadTokens
+		if total < 0 {
+			total = 0
+		}
+		snapshot.APITotalInputTokens = total
+		snapshot.APIUsageKnown = total > 0
+	})
+}
+
+// SetAPIUsageTotalsUnknown 明确标记本请求未取得合法 usage（例如上游被取消）。
+func (o *requestOutcomeCollector) SetAPIUsageTotalsUnknown() {
+	o.setIfMutable(func(snapshot *requestOutcomeSnapshot) {
+		snapshot.APIUsageKnown = false
+		snapshot.APIInputTokens = 0
+		snapshot.APICacheCreationTokens = 0
+		snapshot.APICacheReadTokens = 0
+		snapshot.APITotalInputTokens = 0
+	})
+}
+
 func (o *requestOutcomeCollector) SetUpstreamState(value upstreamState) {
 	o.setIfMutable(func(snapshot *requestOutcomeSnapshot) { snapshot.UpstreamState = normalizeUpstreamState(value) })
 }
@@ -433,6 +476,12 @@ func (snapshot requestOutcomeSnapshot) normalized() requestOutcomeSnapshot {
 	}
 	snapshot.BeforeMessages = nonNegativeOutcomeInt(snapshot.BeforeMessages)
 	snapshot.AfterMessages = nonNegativeOutcomeInt(snapshot.AfterMessages)
+	snapshot.SelectedPressureTokens = nonNegativeOutcomeInt(snapshot.SelectedPressureTokens)
+	snapshot.PressureThresholdTokens = nonNegativeOutcomeInt(snapshot.PressureThresholdTokens)
+	snapshot.APIInputTokens = nonNegativeOutcomeInt(snapshot.APIInputTokens)
+	snapshot.APICacheCreationTokens = nonNegativeOutcomeInt(snapshot.APICacheCreationTokens)
+	snapshot.APICacheReadTokens = nonNegativeOutcomeInt(snapshot.APICacheReadTokens)
+	snapshot.APITotalInputTokens = nonNegativeOutcomeInt(snapshot.APITotalInputTokens)
 	snapshot.BeforeTokens = nonNegativeOutcomeInt(snapshot.BeforeTokens)
 	snapshot.AfterTokens = nonNegativeOutcomeInt(snapshot.AfterTokens)
 	snapshot.RecallAttempted = nonNegativeOutcomeInt(snapshot.RecallAttempted)
@@ -476,6 +525,20 @@ func (snapshot requestOutcomeSnapshot) SafeLogAttrs() []slog.Attr {
 			slog.Duration("required_wait", snapshot.RequiredWait),
 			slog.Duration("actual_wait", snapshot.ActualWait),
 			slog.Bool("actual_wait_known", snapshot.ActualWaitKnown),
+		)
+	}
+	if snapshot.SelectedPressureTokens > 0 || snapshot.PressureThresholdTokens > 0 {
+		attrs = append(attrs,
+			slog.Int("selected_pressure_tokens", snapshot.SelectedPressureTokens),
+			slog.Int("pressure_threshold_tokens", snapshot.PressureThresholdTokens),
+		)
+	}
+	if snapshot.APIUsageKnown {
+		attrs = append(attrs,
+			slog.Int("api_input_tokens", snapshot.APIInputTokens),
+			slog.Int("api_cache_creation_input_tokens", snapshot.APICacheCreationTokens),
+			slog.Int("api_cache_read_input_tokens", snapshot.APICacheReadTokens),
+			slog.Int("api_total_input_tokens", snapshot.APITotalInputTokens),
 		)
 	}
 	if snapshot.BeforeMessages > 0 || snapshot.AfterMessages > 0 {
@@ -844,6 +907,19 @@ func recordUpstreamOutcome(meta *requestMeta, state upstreamState, status int) {
 	if status > 0 {
 		outcome.SetUpstreamStatus(status)
 	}
+}
+
+// recordAPIUsageOutcome 把一次合法响应 usage 投影进本请求 closure 的数值闭环。
+// 与 debug facts 不同，它不依赖 Debug.Enabled——终端/会话闭环是常驻可观测性。
+func recordAPIUsageOutcome(meta *requestMeta, usage map[string]any) {
+	outcome := requestOutcome(meta)
+	if outcome == nil {
+		return
+	}
+	input := nonNegativeUsageToken(usage["input_tokens"])
+	creation := nonNegativeUsageToken(usage["cache_creation_input_tokens"])
+	read := nonNegativeUsageToken(usage["cache_read_input_tokens"])
+	outcome.SetAPIUsageTotals(input, creation, read)
 }
 
 // recordStateLoadFailure 把四个状态组件的读取失败原样写进同一 closure。

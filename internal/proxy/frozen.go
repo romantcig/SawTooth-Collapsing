@@ -400,7 +400,7 @@ func (f *FrozenStubs) StoreWithResult(logger *slog.Logger, threadID string, stub
 	}
 	receipt := f.submitFrozenState(submitter, persistFn, threadID, string(persisted), completion)
 
-	logger.Info("frozen prefix 已存储", "cutoff", cutoff, "tokens", tokenEstimate)
+	logger.Info("frozen prefix 已存储（frozen 消息估算）", "cutoff", cutoff, "tokens", tokenEstimate)
 	return receipt
 }
 

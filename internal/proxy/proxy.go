@@ -1091,6 +1091,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		outcome.SetEligibility(outcomeEligibilityEvaluable)
 		outcome.SetTriggerReason(decision.TriggerReason)
 		outcome.SetPressureSource(decision.Source)
+		outcome.SetPressureTokens(decision.SelectedPressure, threshold)
 		outcome.SetWait(triggerEvaluation.RequiredWait, triggerEvaluation.ActualWait, triggerEvaluation.ActualWaitKnown)
 		s.writePressureDecisionDebugFacts(meta, rawTimestamp)
 		logPressureSummary(meta)
