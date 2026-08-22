@@ -598,6 +598,24 @@ func TestAPIUsageKnownForLegitimateZeroTotals(t *testing.T) {
 			t.Fatalf("attr %q 期望 0，实际 %d", key, got)
 		}
 	}
+
+	// 会话闭环的投影规则是非对称的，四个 api_* 字段里只有两个应当出现：
+	// api_input 与 api_total_input 在 APIUsageKnown 块内无条件发射，所以零值照常
+	// 输出 =0；而 api_cache_creation 与 api_cache_read 各自还套着一层 > 0 门控，
+	// 三项全零时被挡住。少的这两项是设计如此，不是 bug。
+	// 断言带上 key 前的那个空格（appendOutcomeField 每个 key 前写一个空格），
+	// 既锁死 key 边界，也排除与其它 key 后缀发生子串误配。
+	closure := formatRequestOutcomeClosure(snapshot)
+	for _, want := range []string{" api_input=0", " api_total_input=0"} {
+		if !strings.Contains(closure, want) {
+			t.Fatalf("合法零值 usage 的 closure 缺少 %q: %s", want, closure)
+		}
+	}
+	for _, unwanted := range []string{"api_cache_creation", "api_cache_read"} {
+		if strings.Contains(closure, unwanted) {
+			t.Fatalf("三项全零时 closure 不应出现 %q: %s", unwanted, closure)
+		}
+	}
 }
 
 // fullyPopulatedOutcomeSnapshot 用反射给 requestOutcomeSnapshot 的每个字段写入互不
