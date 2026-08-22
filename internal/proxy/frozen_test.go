@@ -683,6 +683,62 @@ func TestFrozenBoundaryIgnoresNonSemanticContentBlockShapeChanges(t *testing.T) 
 	})
 }
 
+// 已知 content block 的直接 cache_control 是缓存元数据，与 reuseSafetyPrefixHash
+// 的规范化规则同源：只有已知 block 类型忽略，未知类型 fail-closed。
+// 回归自 .planning/debug/context-threshold-cache-hit.md req3 假失效。
+func TestFrozenBoundaryIgnoresKnownBlockCacheControlMetadata(t *testing.T) {
+	boundaryWithoutCacheControl := json.RawMessage(`[{"type":"tool_result","tool_use_id":"tool-1","content":"same"}]`)
+	boundaryWithCacheControl := json.RawMessage(`[{"type":"tool_result","tool_use_id":"tool-1","content":"same","cache_control":{"type":"ephemeral"}}]`)
+	boundaryUnknownBlockCacheControl := json.RawMessage(`[{"type":"future_block","content":"same","cache_control":{"type":"ephemeral"}}]`)
+	boundaryNestedCacheControl := json.RawMessage(`[{"type":"tool_result","tool_use_id":"tool-1","content":[{"type":"text","text":"same","cache_control":{"type":"ephemeral"}}]}]`)
+
+	store := func(boundary json.RawMessage) (*FrozenStubs, []Message) {
+		frozen := NewFrozenStubs()
+		current := frozenTestMessages(3)
+		current[1].Content = boundary
+		frozen.Store("thread", current[:1], 2, current[1], 10, 20)
+		return frozen, current
+	}
+
+	t.Run("已知 block 出现或消失 cache_control 不失效", func(t *testing.T) {
+		frozen, current := store(boundaryWithoutCacheControl)
+		current[1].Content = boundaryWithCacheControl
+		if got := frozen.Get("thread", current); got == nil {
+			t.Fatal("已知 block 仅 cache_control 元数据变化不应使 frozen boundary 失效")
+		}
+
+		frozen, current = store(boundaryWithCacheControl)
+		current[1].Content = boundaryWithoutCacheControl
+		if got := frozen.Get("thread", current); got == nil {
+			t.Fatal("已知 block 仅 cache_control 元数据消失不应使 frozen boundary 失效")
+		}
+	})
+
+	t.Run("未知 block 类型的 cache_control 保持语义敏感", func(t *testing.T) {
+		frozen, current := store(boundaryWithoutCacheControl)
+		current[1].Content = boundaryUnknownBlockCacheControl
+		if got := frozen.Get("thread", current); got != nil {
+			t.Fatal("未知 block 类型的 cache_control 必须保持 fail-closed")
+		}
+	})
+
+	t.Run("嵌套业务内容里的 cache_control 保持语义敏感", func(t *testing.T) {
+		frozen, current := store(boundaryWithoutCacheControl)
+		current[1].Content = boundaryNestedCacheControl
+		if got := frozen.Get("thread", current); got != nil {
+			t.Fatal("tool_result.content 嵌套 block 的 cache_control 不在已知规范化范围内，必须失效")
+		}
+	})
+
+	t.Run("真实业务内容变化仍失效", func(t *testing.T) {
+		frozen, current := store(boundaryWithCacheControl)
+		current[1].Content = json.RawMessage(`[{"type":"tool_result","tool_use_id":"tool-1","content":"changed","cache_control":{"type":"ephemeral"}}]`)
+		if got := frozen.Get("thread", current); got != nil {
+			t.Fatal("真实 tool_result 内容变化后 frozen boundary 仍命中")
+		}
+	})
+}
+
 func TestStableBoundaryHashPreservesUnprovenNullAndUnknownFields(t *testing.T) {
 	base := Message{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","content":["same",null]}]`)}
 	withArrayValue := Message{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","content":["same","changed"]}]`)}
