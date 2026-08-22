@@ -667,13 +667,13 @@ func TestSafeLogAttrsProjectsEverySnapshotField(t *testing.T) {
 
 	// 字段名 → 不投影的书面理由。
 	skipList := map[string]string{
-		// 这是未投影缺口，非刻意省略。APIUsageKnown 只被用作
-		// `if snapshot.APIUsageKnown` 的分支条件，自己从未作为 attr 发出。
-		// 后果：四个 API token 分项全为 0 而 usage 实际已知时，整段 api_* 都不
-		// 输出，日志读者无法区分「合法零值」与「未取得」——而该字段的注释恰恰
-		// 声称它就是用来做这个区分的。本次 quick task 不许改生产代码，故先登记
-		// 在此，是否补投影由老大另行决定。
-		"APIUsageKnown": "未投影缺口（非刻意省略）：只当分支条件用，导致合法零值与未取得无法区分",
+		// 刻意省略，不是缺口。APIUsageKnown 是整个 api_* 块的开关：
+		// `if snapshot.APIUsageKnown` 为 true 时四个 api_* attr 一并发出，
+		// 为 false 时整块不输出。所以「块内该标志恒为 true」「块不在即为 false」，
+		// 它的信息已完全由块本身的出现与否承载，再单发一个 api_usage_known
+		// attr 是冗余。合法零值与未取得的区分由此得以成立：前者输出四个值为 0
+		// 的 api_* attr，后者一个都不输出。
+		"APIUsageKnown": "刻意省略：信息由 api_* 块的出现与否完全承载，块内恒为 true，单发 attr 冗余",
 	}
 
 	structType := reflect.TypeOf(requestOutcomeSnapshot{})
