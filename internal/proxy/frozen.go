@@ -854,10 +854,12 @@ func canonicalMessageForHash(msg Message, normalizeContent func(any) any) (map[s
 	return canonical, nil
 }
 
-// normalizeBoundaryContent 只消除 ContentBlock typed round-trip 已确证产生的
-// 非语义差异：text/thinking/tool_result 块本身不使用 input，但 ContentBlock.Input
-// 缺少 omitempty 会把省略字段重编码为 input:null。未知字段、数组 null 和 tool_use
-// 的 input 均保持原样，避免把未来协议中的显式 null 与 absent 混同。
+// normalizeBoundaryContent 只消除两类已确证的非语义差异：text/thinking/tool_result
+// 块本身不使用 input，但 ContentBlock.Input 缺少 omitempty 会把省略字段重编码为
+// input:null；已知 Anthropic content block 的直接 cache_control 是缓存元数据，
+// 与 normalizeHistoryContent 的 reuse 规范化同源。未知 block 类型的 cache_control、
+// 未知字段、数组 null 和 tool_use 的 input 均保持原样，避免把未来协议中的显式
+// null 与 absent 混同。
 func normalizeBoundaryContent(content any) any {
 	blocks, ok := content.([]any)
 	if !ok {
@@ -865,13 +867,18 @@ func normalizeBoundaryContent(content any) any {
 	}
 	for _, block := range blocks {
 		object, ok := block.(map[string]any)
-		if !ok || object["input"] != nil {
+		if !ok {
 			continue
 		}
 		typeName, _ := object["type"].(string)
-		switch typeName {
-		case "text", "thinking", "tool_result":
-			delete(object, "input")
+		if knownHistoryContentBlockType(typeName) {
+			delete(object, "cache_control")
+		}
+		if object["input"] == nil {
+			switch typeName {
+			case "text", "thinking", "tool_result":
+				delete(object, "input")
+			}
 		}
 	}
 	return blocks
