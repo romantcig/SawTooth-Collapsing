@@ -49,3 +49,6 @@ changes_stat.txt
 /FIX_PLAN.md
 /REVIEW_GAPS.md
 .ace-tool/
+
+# ZCode session artifacts
+.zcode/
