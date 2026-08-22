@@ -279,6 +279,36 @@ func assertTerminalOutcomeSafe(t *testing.T, line string) {
 	}
 }
 
+// terminalAPITotalPhrase 只由 APIUsageKnown 决定是否出声：取得了合法 usage 就必须
+// 报出数值，哪怕 total 恰好是 0；未取得 usage 才返回空串。
+//
+// 合法零值一侧刻意经真实的 SetAPIUsageTotals(0, 0, 0) 取得 usage 字段，而不是直接
+// 赋值 APIUsageKnown——直接赋值只能锁住渲染分支，锁不住“这个状态确实可达”。
+func TestTerminalAPITotalPhraseForKnownZeroUsage(t *testing.T) {
+	collector := newRequestOutcomeCollector(75, "0123456789abcdef", logTestTime, nil)
+	collector.SetAPIUsageTotals(0, 0, 0)
+	usage := collector.Snapshot()
+
+	known := terminalOutcomeSnapshot(func(snapshot *requestOutcomeSnapshot) {
+		snapshot.APIUsageKnown = usage.APIUsageKnown
+		snapshot.APIInputTokens = usage.APIInputTokens
+		snapshot.APICacheCreationTokens = usage.APICacheCreationTokens
+		snapshot.APICacheReadTokens = usage.APICacheReadTokens
+		snapshot.APITotalInputTokens = usage.APITotalInputTokens
+	})
+	if got := terminalAPITotalPhrase(known); got != "API 完整输入 0" {
+		t.Fatalf("合法零值 usage 期望 %q，实际 %q", "API 完整输入 0", got)
+	}
+
+	unknown := terminalOutcomeSnapshot(func(snapshot *requestOutcomeSnapshot) {
+		snapshot.APIUsageKnown = false
+		snapshot.APITotalInputTokens = 0
+	})
+	if got := terminalAPITotalPhrase(unknown); got != "" {
+		t.Fatalf("usage 未取得时期望空串，实际 %q", got)
+	}
+}
+
 func TestTerminalOutcomeRendererMatrix(t *testing.T) {
 	cases := []struct {
 		name    string

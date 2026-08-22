@@ -562,6 +562,44 @@ func TestRequestOutcomeHasNoDirectSinkOrGoroutine(t *testing.T) {
 	}
 }
 
+// 合法零值：三个 token 分项全为 0 也是一次合法 usage。APIUsageKnown 表达的是
+// “是否取得了 usage”，不是“total > 0”，因此该状态下 api_* 四个 attr 必须照常
+// 投影出来且值为 0——这正是本状态与“未取得 usage”的可观测区别。
+func TestAPIUsageKnownForLegitimateZeroTotals(t *testing.T) {
+	collector := newRequestOutcomeCollector(89, "0123456789abcdef", time.Unix(1, 0).UTC(), nil)
+	collector.SetAPIUsageTotals(0, 0, 0)
+
+	snapshot := collector.Snapshot()
+	if !snapshot.APIUsageKnown {
+		t.Fatal("登记了合法 usage（三项全为 0）后 APIUsageKnown 必须为 true")
+	}
+	if snapshot.APIInputTokens != 0 || snapshot.APICacheCreationTokens != 0 ||
+		snapshot.APICacheReadTokens != 0 || snapshot.APITotalInputTokens != 0 {
+		t.Fatalf("合法零值 usage 的分项不应被改写: input=%d creation=%d read=%d total=%d",
+			snapshot.APIInputTokens, snapshot.APICacheCreationTokens,
+			snapshot.APICacheReadTokens, snapshot.APITotalInputTokens)
+	}
+
+	values := map[string]int64{}
+	for _, attr := range snapshot.SafeLogAttrs() {
+		if attr.Value.Kind() == slog.KindInt64 {
+			values[attr.Key] = attr.Value.Int64()
+		}
+	}
+	for _, key := range []string{
+		"api_input_tokens", "api_cache_creation_input_tokens",
+		"api_cache_read_input_tokens", "api_total_input_tokens",
+	} {
+		got, ok := values[key]
+		if !ok {
+			t.Fatalf("合法零值 usage 必须投影 attr %q，实际未出现: %v", key, values)
+		}
+		if got != 0 {
+			t.Fatalf("attr %q 期望 0，实际 %d", key, got)
+		}
+	}
+}
+
 // fullyPopulatedOutcomeSnapshot 用反射给 requestOutcomeSnapshot 的每个字段写入互不
 // 相同的非零值。
 //
