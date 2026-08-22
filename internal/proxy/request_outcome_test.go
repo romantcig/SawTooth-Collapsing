@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -557,5 +559,103 @@ func TestRequestOutcomeHasNoDirectSinkOrGoroutine(t *testing.T) {
 	})
 	if forbidden != "" {
 		t.Fatalf("collector 直接依赖了禁止资源: %s", forbidden)
+	}
+}
+
+// fullyPopulatedOutcomeSnapshot 用反射给 requestOutcomeSnapshot 的每个字段写入互不
+// 相同的非零值。
+//
+// 之所以必须反射填充而不能写 struct 字面量：SafeLogAttrs 的多数 attr 藏在条件块后
+// （BeforeTokens > 0 || ...、APIUsageKnown 等），只有全字段非零才会走遍所有分支；
+// 而字面量在新增字段时没人会记得更新，护栏会静默退化成空跑。
+//
+// 两处会被 normalized() 改写、但不影响 key 是否出现：具名 string 字段填的任意值会被
+// 归一成 unknown，SessionHash 会被 stableSessionHash 重写。本测试只断言 key 存在、
+// 不断言值，所以照常填即可；但 SessionHash 必须非空，否则 session_hash 分支不触发。
+func fullyPopulatedOutcomeSnapshot(t *testing.T) requestOutcomeSnapshot {
+	t.Helper()
+
+	var snapshot requestOutcomeSnapshot
+	value := reflect.ValueOf(&snapshot).Elem()
+	structType := value.Type()
+	timeType := reflect.TypeOf(time.Time{})
+	fixedTime := time.Date(2026, 8, 22, 10, 30, 0, 0, time.UTC)
+	counter := int64(0)
+
+	for i := 0; i < structType.NumField(); i++ {
+		field := structType.Field(i)
+		target := value.Field(i)
+		counter++
+
+		if field.Type == timeType {
+			target.Set(reflect.ValueOf(fixedTime.Add(time.Duration(counter) * time.Minute)))
+			continue
+		}
+
+		switch target.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			// time.Duration 也走这里；递增计数器保证互不相同且为正。
+			target.SetInt(counter)
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			target.SetUint(uint64(counter))
+		case reflect.Bool:
+			target.SetBool(true)
+		case reflect.String:
+			// 覆盖 string 及全部具名 string 类型（outcomeEligibility / TriggerReason /
+			// pressureSource / upstreamState / persistenceState /
+			// persistenceFailureClass / interventionState）。
+			target.SetString("v" + strconv.FormatInt(counter, 10))
+		default:
+			// 刻意大声掀翻：将来出现未预期类型的字段必须报出字段名，而不是被零值
+			// 悄悄填过、让护栏漏判。
+			t.Fatalf("字段 %s 的类型 %s（kind=%s）未被填充 helper 处理，请显式补上",
+				field.Name, field.Type, target.Kind())
+		}
+	}
+
+	return snapshot
+}
+
+// TestSafeLogAttrsProjectsEverySnapshotField 是穷尽性护栏：requestOutcomeSnapshot 的
+// 每个字段都必须被 SafeLogAttrs 投影出去（skipList 内的除外）。新增字段忘了接进投影
+// 时，这条测试判红并指名字段与期望 key。
+func TestSafeLogAttrsProjectsEverySnapshotField(t *testing.T) {
+	snapshot := fullyPopulatedOutcomeSnapshot(t)
+
+	emitted := map[string]bool{}
+	for _, attr := range snapshot.SafeLogAttrs() {
+		emitted[attr.Key] = true
+	}
+
+	// 字段名 → 不投影的书面理由。
+	skipList := map[string]string{}
+
+	structType := reflect.TypeOf(requestOutcomeSnapshot{})
+	present := map[string]bool{}
+	for i := 0; i < structType.NumField(); i++ {
+		field := structType.Field(i)
+		present[field.Name] = true
+
+		tag := field.Tag.Get("json")
+		key := strings.Split(tag, ",")[0]
+		if key == "" || key == "-" {
+			t.Fatalf("字段 %s 缺少可用的 json tag（当前 %q），请显式处理", field.Name, tag)
+		}
+
+		if reason, skipped := skipList[field.Name]; skipped {
+			t.Logf("跳过字段 %s（期望 key %q）：%s", field.Name, key, reason)
+			continue
+		}
+
+		if !emitted[key] {
+			t.Errorf("字段 %s 未被 SafeLogAttrs 投影：期望出现 attr key %q", field.Name, key)
+		}
+	}
+
+	// 防止字段删掉后 skip 项烂在原地。
+	for name := range skipList {
+		if !present[name] {
+			t.Errorf("skipList 中的字段 %s 已不存在于 requestOutcomeSnapshot，请删除该条目", name)
+		}
 	}
 }
