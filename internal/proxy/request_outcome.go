@@ -134,7 +134,9 @@ type requestOutcomeSnapshot struct {
 	ActualWaitKnown     bool                    `json:"actual_wait_known"`
 	Action              outcomeAction           `json:"action"`
 	// 数值闭环（Terminal Policy）：发送前判定值/阈值与响应后 API 完整输入
-	// 进入同一条结果；APIUsageKnown 区分“合法零值”与“未取得”。
+	// 进入同一条结果。APIUsageKnown 表示本次请求是否取得了合法 usage：调用
+	// SetAPIUsageTotals 即置为 true，与三个 token 分项是否全为零无关；只有从未
+	// 登记 usage、或显式调用 SetAPIUsageTotalsUnknown 时才为 false。
 	SelectedPressureTokens  int `json:"selected_pressure_tokens,omitempty"`
 	PressureThresholdTokens int `json:"pressure_threshold_tokens,omitempty"`
 	APIUsageKnown           bool `json:"api_usage_known"`
@@ -324,7 +326,7 @@ func (o *requestOutcomeCollector) SetAPIUsageTotals(input, cacheCreation, cacheR
 			total = 0
 		}
 		snapshot.APITotalInputTokens = total
-		snapshot.APIUsageKnown = total > 0
+		snapshot.APIUsageKnown = true
 	})
 }
 
