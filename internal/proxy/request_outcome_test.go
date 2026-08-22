@@ -212,6 +212,57 @@ func TestRequestOutcomeRecordsPressureAndUsageTokens(t *testing.T) {
 	}
 }
 
+// 响应数值行：主线程请求在响应 usage 解析后输出一条“上下文总Tokens”行，
+// 数值来自 API usage，判定值来自发送前 pressure decision；辅助请求不输出。
+func TestContextTokensOutcomeLine(t *testing.T) {
+	var buf bytes.Buffer
+	meta := newRequestMeta(5, "context-line-session")
+	meta.Logger = slog.New(slog.NewTextHandler(&buf, nil)).With("request_id", 5)
+	meta.PressureDecision = pressureDecision{Available: true, SelectedPressure: 41583, Threshold: 150000}
+
+	recordAPIUsageOutcome(meta, map[string]any{
+		"input_tokens":          float64(2),
+		"cache_read_input_tokens": float64(41956),
+	})
+	line := buf.String()
+	for _, want := range []string{
+		"上下文总Tokens=41958（输入2｜缓存读41956）判定=41583/150000",
+		"total_input_tokens=41958",
+		"request_id=5",
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("上下文总Tokens 行缺少 %q: %s", want, line)
+		}
+	}
+
+	// 缓存写分项也要在出现时显示。
+	buf.Reset()
+	recordAPIUsageOutcome(meta, map[string]any{
+		"input_tokens":                 float64(2),
+		"cache_creation_input_tokens":  float64(205506),
+	})
+	if !strings.Contains(buf.String(), "上下文总Tokens=205508（输入2｜缓存写205506）") {
+		t.Fatalf("缓存写分项未出现在数值行: %s", buf.String())
+	}
+
+	// 辅助请求（session_title/subagent）不输出数值行。
+	buf.Reset()
+	auxiliary := newRequestMeta(6, "context-line-session")
+	auxiliary.Logger = slog.New(slog.NewTextHandler(&buf, nil))
+	auxiliary.RequestKind = requestKindSessionTitle
+	recordAPIUsageOutcome(auxiliary, map[string]any{"input_tokens": float64(2), "cache_read_input_tokens": float64(41956)})
+	if strings.Contains(buf.String(), "上下文总Tokens") {
+		t.Fatalf("辅助请求不应输出上下文数值行: %s", buf.String())
+	}
+
+	// 没有 usage 的响应（取消/失败）不产生数值行。
+	buf.Reset()
+	recordAPIUsageOutcome(meta, nil)
+	if strings.Contains(buf.String(), "上下文总Tokens") {
+		t.Fatalf("无 usage 响应不应输出上下文数值行: %s", buf.String())
+	}
+}
+
 func TestRequestMetaInitializesOutcome(t *testing.T) {
 	fullSessionID := "request-meta-session"
 	meta := newRequestMeta(101, fullSessionID)

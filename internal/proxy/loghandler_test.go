@@ -287,39 +287,6 @@ func TestTerminalOutcomeRendererMatrix(t *testing.T) {
 		notWant []string
 	}{
 		{
-			name: "未触发直通",
-			mutate: func(snapshot *requestOutcomeSnapshot) {
-				snapshot.TriggerReason = TriggerNone
-				snapshot.Action = outcomeActionPassthrough
-				snapshot.RequiredWait, snapshot.ActualWait, snapshot.ActualWaitKnown = 0, 0, false
-				snapshot.BeforeMessages, snapshot.AfterMessages = 0, 0
-				snapshot.BeforeTokens, snapshot.AfterTokens = 0, 0
-				snapshot.SelectedPressureTokens, snapshot.PressureThresholdTokens = 0, 0
-				snapshot.APIUsageKnown = false
-			},
-			want:    []string{"上下文", "原因：本轮未整理", "动作：原样转发", "结果：请求已完成", "无需人工处理"},
-			notWant: []string{"未触发", "上下文仍有余量"},
-		},
-		{
-			name: "直接发送数值闭环",
-			mutate: func(snapshot *requestOutcomeSnapshot) {
-				snapshot.TriggerReason = TriggerNone
-				snapshot.Action = outcomeActionDirect
-				snapshot.PressureSource = pressureSourceLocalFull
-				snapshot.SelectedPressureTokens = 126403
-				snapshot.PressureThresholdTokens = 150000
-				snapshot.RequiredWait, snapshot.ActualWait, snapshot.ActualWaitKnown = 0, 0, false
-				snapshot.BeforeMessages, snapshot.AfterMessages = 0, 0
-				snapshot.BeforeTokens, snapshot.AfterTokens = 0, 0
-				snapshot.APIUsageKnown = true
-				snapshot.APIInputTokens = 2
-				snapshot.APICacheReadTokens = 88043
-				snapshot.APITotalInputTokens = 88045
-			},
-			want: []string{"上下文", "判定 126403/150000", "本地估算", "API 完整输入 88045", "动作：直接发送"},
-			notWant: []string{"未触发", "上下文仍有余量", "下一次连续主请求将整理"},
-		},
-		{
 			name: "API 完整输入已超阈值时预告整理",
 			mutate: func(snapshot *requestOutcomeSnapshot) {
 				snapshot.TriggerReason = TriggerNone
@@ -363,25 +330,6 @@ func TestTerminalOutcomeRendererMatrix(t *testing.T) {
 				snapshot.Action = outcomeActionFallback
 			},
 			want: []string{"动作：改用备用方式整理"},
-		},
-		{
-			name: "直接发送",
-			mutate: func(snapshot *requestOutcomeSnapshot) {
-				snapshot.TriggerReason = TriggerNone
-				snapshot.Action = outcomeActionDirect
-			},
-			want: []string{"上下文", "动作：直接发送"},
-			notWant: []string{"未触发"},
-		},
-		{
-			name: "复用已有整理结果",
-			mutate: func(snapshot *requestOutcomeSnapshot) {
-				snapshot.TriggerReason = TriggerNone
-				snapshot.Action = outcomeActionDirect
-				snapshot.BeforeMessages, snapshot.AfterMessages = 300, 42
-			},
-			want: []string{"上下文", "动作：直接发送", "结果：请求已完成"},
-			notWant: []string{"未触发"},
 		},
 		{
 			name: "历史判定失败保守转发",
@@ -441,6 +389,60 @@ func TestTerminalOutcomeRendererMatrix(t *testing.T) {
 			assertTerminalOutcomeSafe(t, line)
 			if !strings.Contains(line, "会话=0123456789abcdef") || !strings.Contains(line, "请求=75") {
 				t.Fatalf("终端结果缺少短 hash/request 关联: %q", line)
+			}
+		})
+	}
+}
+
+// 普通未折叠请求必须零输出（Terminal Policy 2026-08-22 修订）：
+// 数值闭环由响应侧“上下文总Tokens”行承担，ST 行只服务折叠与异常；
+// “请求已完成/无需人工处理”不得出现在正常高频流程里。
+func TestTerminalOutcomeQuietForNormalDirectRequests(t *testing.T) {
+	quiet := []struct {
+		name   string
+		mutate func(*requestOutcomeSnapshot)
+	}{
+		{name: "普通直通无数值", mutate: func(snapshot *requestOutcomeSnapshot) {
+			snapshot.TriggerReason = TriggerNone
+			snapshot.Action = outcomeActionPassthrough
+			snapshot.RequiredWait, snapshot.ActualWait, snapshot.ActualWaitKnown = 0, 0, false
+			snapshot.BeforeMessages, snapshot.AfterMessages = 0, 0
+			snapshot.BeforeTokens, snapshot.AfterTokens = 0, 0
+			snapshot.SelectedPressureTokens, snapshot.PressureThresholdTokens = 0, 0
+			snapshot.APIUsageKnown = false
+		}},
+		{name: "直接发送且API在阈值内", mutate: func(snapshot *requestOutcomeSnapshot) {
+			snapshot.TriggerReason = TriggerNone
+			snapshot.Action = outcomeActionDirect
+			snapshot.PressureSource = pressureSourceLocalFull
+			snapshot.SelectedPressureTokens = 126403
+			snapshot.PressureThresholdTokens = 150000
+			snapshot.RequiredWait, snapshot.ActualWait, snapshot.ActualWaitKnown = 0, 0, false
+			snapshot.BeforeMessages, snapshot.AfterMessages = 0, 0
+			snapshot.BeforeTokens, snapshot.AfterTokens = 0, 0
+			snapshot.APIUsageKnown = true
+			snapshot.APIInputTokens = 2
+			snapshot.APICacheReadTokens = 88043
+			snapshot.APITotalInputTokens = 88045
+		}},
+		{name: "复用已有整理结果", mutate: func(snapshot *requestOutcomeSnapshot) {
+			snapshot.TriggerReason = TriggerNone
+			snapshot.Action = outcomeActionDirect
+			snapshot.BeforeMessages, snapshot.AfterMessages = 300, 42
+		}},
+		{name: "usage未知但其余正常", mutate: func(snapshot *requestOutcomeSnapshot) {
+			snapshot.TriggerReason = TriggerNone
+			snapshot.Action = outcomeActionDirect
+			snapshot.APIUsageKnown = false
+			snapshot.APITotalInputTokens = 0
+		}},
+	}
+	for _, testCase := range quiet {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			out := projectTerminalOutcome(t, terminalOutcomeSnapshot(testCase.mutate), outcomeDispatchResult{SessionAccepted: true, TerminalAccepted: true})
+			if out != "" {
+				t.Fatalf("普通未折叠请求不应输出 ST 行: %q", out)
 			}
 		})
 	}
