@@ -227,6 +227,8 @@ func terminalOutcomeSnapshot(mutate func(*requestOutcomeSnapshot)) requestOutcom
 		TerminalEligibility: outcomeEligibilityTerminalEligible,
 		TriggerReason:       TriggerTokens,
 		PressureSource:      pressureSourceActualPlusDelta,
+		SelectedPressureTokens:    206628,
+		PressureThresholdTokens:   150000,
 		RequiredWait:        4 * time.Minute,
 		ActualWait:          5 * time.Minute,
 		ActualWaitKnown:     true,
@@ -292,13 +294,54 @@ func TestTerminalOutcomeRendererMatrix(t *testing.T) {
 				snapshot.RequiredWait, snapshot.ActualWait, snapshot.ActualWaitKnown = 0, 0, false
 				snapshot.BeforeMessages, snapshot.AfterMessages = 0, 0
 				snapshot.BeforeTokens, snapshot.AfterTokens = 0, 0
+				snapshot.SelectedPressureTokens, snapshot.PressureThresholdTokens = 0, 0
+				snapshot.APIUsageKnown = false
 			},
-			want: []string{"未触发", "原因：上下文仍有余量", "动作：原样转发", "结果：请求已完成", "无需人工处理"},
+			want:    []string{"上下文", "原因：本轮未整理", "动作：原样转发", "结果：请求已完成", "无需人工处理"},
+			notWant: []string{"未触发", "上下文仍有余量"},
+		},
+		{
+			name: "直接发送数值闭环",
+			mutate: func(snapshot *requestOutcomeSnapshot) {
+				snapshot.TriggerReason = TriggerNone
+				snapshot.Action = outcomeActionDirect
+				snapshot.PressureSource = pressureSourceLocalFull
+				snapshot.SelectedPressureTokens = 126403
+				snapshot.PressureThresholdTokens = 150000
+				snapshot.RequiredWait, snapshot.ActualWait, snapshot.ActualWaitKnown = 0, 0, false
+				snapshot.BeforeMessages, snapshot.AfterMessages = 0, 0
+				snapshot.BeforeTokens, snapshot.AfterTokens = 0, 0
+				snapshot.APIUsageKnown = true
+				snapshot.APIInputTokens = 2
+				snapshot.APICacheReadTokens = 88043
+				snapshot.APITotalInputTokens = 88045
+			},
+			want: []string{"上下文", "判定 126403/150000", "本地估算", "API 完整输入 88045", "动作：直接发送"},
+			notWant: []string{"未触发", "上下文仍有余量", "下一次连续主请求将整理"},
+		},
+		{
+			name: "API 完整输入已超阈值时预告整理",
+			mutate: func(snapshot *requestOutcomeSnapshot) {
+				snapshot.TriggerReason = TriggerNone
+				snapshot.Action = outcomeActionDirect
+				snapshot.PressureSource = pressureSourceLocalFull
+				snapshot.SelectedPressureTokens = 126403
+				snapshot.PressureThresholdTokens = 150000
+				snapshot.RequiredWait, snapshot.ActualWait, snapshot.ActualWaitKnown = 0, 0, false
+				snapshot.BeforeMessages, snapshot.AfterMessages = 0, 0
+				snapshot.BeforeTokens, snapshot.AfterTokens = 0, 0
+				snapshot.APIUsageKnown = true
+				snapshot.APIInputTokens = 2
+				snapshot.APICacheCreationTokens = 205506
+				snapshot.APITotalInputTokens = 205508
+			},
+			want: []string{"上下文", "判定 126403/150000", "API 完整输入 205508 已超阈值", "下一次连续主请求将整理"},
+			notWant: []string{"未触发", "上下文仍有余量"},
 		},
 		{
 			name:   "令牌触发整理",
 			mutate: nil,
-			want:   []string{"已触发", "原因：上下文接近上限", "动作：整理历史消息", "结果：请求已完成"},
+			want:   []string{"已触发", "判定 206628/150000", "整理前 90000 → 整理后 30000", "动作：整理历史消息", "结果：请求已完成"},
 		},
 		{
 			name: "长时间未继续触发",
@@ -327,7 +370,8 @@ func TestTerminalOutcomeRendererMatrix(t *testing.T) {
 				snapshot.TriggerReason = TriggerNone
 				snapshot.Action = outcomeActionDirect
 			},
-			want: []string{"未触发", "动作：直接发送"},
+			want: []string{"上下文", "动作：直接发送"},
+			notWant: []string{"未触发"},
 		},
 		{
 			name: "复用已有整理结果",
@@ -336,7 +380,8 @@ func TestTerminalOutcomeRendererMatrix(t *testing.T) {
 				snapshot.Action = outcomeActionDirect
 				snapshot.BeforeMessages, snapshot.AfterMessages = 300, 42
 			},
-			want: []string{"未触发", "动作：直接发送", "结果：请求已完成"},
+			want: []string{"上下文", "动作：直接发送", "结果：请求已完成"},
+			notWant: []string{"未触发"},
 		},
 		{
 			name: "历史判定失败保守转发",
@@ -413,7 +458,7 @@ func TestTerminalOutcomeFormatAndPrivacy(t *testing.T) {
 		t.Fatalf("终端结果含年月日: %q", line)
 	}
 	assertTerminalOutcomeSafe(t, line)
-	for _, sentinel := range []string{"4m0s", "5m0s", "240", "300", "90000", "30000", "200"} {
+	for _, sentinel := range []string{"4m0s", "5m0s", "240", "200"} {
 		if strings.Contains(line, sentinel) {
 			t.Fatalf("终端结果泄漏内部数值 %q: %q", sentinel, line)
 		}

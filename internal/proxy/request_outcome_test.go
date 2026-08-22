@@ -161,6 +161,57 @@ func TestRequestOutcomeSafeAttrs(t *testing.T) {
 	}
 }
 
+// 数值闭环：发送前的 selected/threshold 与响应后的 API usage 分项都必须能进入
+// 同一个 snapshot，并被 SafeLogAttrs 与 session closure 投影（Terminal Policy）。
+func TestRequestOutcomeRecordsPressureAndUsageTokens(t *testing.T) {
+	collector := newRequestOutcomeCollector(88, "0123456789abcdef", time.Unix(1, 0).UTC(), nil)
+	collector.SetEligibility(outcomeEligibilityEvaluable)
+	collector.SetTerminalEligibility(outcomeEligibilityTerminalEligible)
+	collector.SetTriggerReason(TriggerNone)
+	collector.SetPressureSource(pressureSourceLocalFull)
+	collector.SetAction(outcomeActionDirect)
+	collector.SetPressureTokens(126403, 150000)
+	collector.SetAPIUsageTotals(2, 0, 88043)
+
+	snapshot := collector.Snapshot()
+	if snapshot.SelectedPressureTokens != 126403 || snapshot.PressureThresholdTokens != 150000 {
+		t.Fatalf("pressure tokens 未进入 snapshot: selected=%d threshold=%d", snapshot.SelectedPressureTokens, snapshot.PressureThresholdTokens)
+	}
+	if !snapshot.APIUsageKnown || snapshot.APIInputTokens != 2 || snapshot.APICacheCreationTokens != 0 || snapshot.APICacheReadTokens != 88043 || snapshot.APITotalInputTokens != 88045 {
+		t.Fatalf("API usage 未进入 snapshot: known=%v input=%d creation=%d read=%d total=%d",
+			snapshot.APIUsageKnown, snapshot.APIInputTokens, snapshot.APICacheCreationTokens, snapshot.APICacheReadTokens, snapshot.APITotalInputTokens)
+	}
+
+	attrs := string(attrsJSON(t, snapshot.SafeLogAttrs()))
+	for _, want := range []string{"selected_pressure_tokens", "pressure_threshold_tokens", "api_input_tokens", "api_cache_creation_input_tokens", "api_cache_read_input_tokens", "api_total_input_tokens"} {
+		if !strings.Contains(attrs, want) {
+			t.Fatalf("safe attrs 缺少 %q: %s", want, attrs)
+		}
+	}
+
+	closure := formatRequestOutcomeClosure(snapshot)
+	for _, want := range []string{"selected_pressure=126403", "pressure_threshold=150000", "api_input=2", "api_cache_read=88043", "api_total_input=88045"} {
+		if !strings.Contains(closure, want) {
+			t.Fatalf("closure 缺少 %q: %s", want, closure)
+		}
+	}
+
+	// 未取得 usage 的请求不能假装有 API 数值。
+	collector.SetAPIUsageTotalsUnknown()
+	if collector.Snapshot().APIUsageKnown {
+		t.Fatal("未登记 usage 时 APIUsageKnown 必须为 false")
+	}
+	if strings.Contains(formatRequestOutcomeClosure(collector.Snapshot()), "api_total_input") {
+		t.Fatal("usage 未知时 closure 不应输出 api_total_input")
+	}
+
+	// 负值必须被拒绝，不得污染判定闭环。
+	collector.SetPressureTokens(-5, -1)
+	if snapshot := collector.Snapshot(); snapshot.SelectedPressureTokens != 0 || snapshot.PressureThresholdTokens != 0 {
+		t.Fatalf("负值 pressure 未归零: selected=%d threshold=%d", snapshot.SelectedPressureTokens, snapshot.PressureThresholdTokens)
+	}
+}
+
 func TestRequestMetaInitializesOutcome(t *testing.T) {
 	fullSessionID := "request-meta-session"
 	meta := newRequestMeta(101, fullSessionID)
