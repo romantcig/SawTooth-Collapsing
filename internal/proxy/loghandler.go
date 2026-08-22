@@ -215,9 +215,14 @@ func (h *LogHandler) ProjectTerminal(snapshot requestOutcomeSnapshot, admission 
 
 // renderRequestOutcome 把 typed outcome 渲染成一条面向老大的自然中文结果。
 // terminal-ineligible 返回空串——session 投影资格与此无关，由 dispatcher 独立决定。
+// 普通未折叠且无异常的 direct 请求同样返回空串（Terminal Policy 2026-08-22 修订）：
+// 高频数值闭环由响应侧“上下文总Tokens”行承担，ST 行只服务折叠与异常事件。
 func renderRequestOutcome(snapshot requestOutcomeSnapshot, admission outcomeDispatchResult) string {
 	snapshot = snapshot.normalized()
 	if snapshot.TerminalEligibility != outcomeEligibilityTerminalEligible {
+		return ""
+	}
+	if terminalOutcomeQuiet(snapshot) {
 		return ""
 	}
 	trigger, reason := terminalTriggerPhrase(snapshot)
@@ -251,6 +256,37 @@ func outcomeDisplayTime(snapshot requestOutcomeSnapshot) time.Time {
 		return snapshot.StartedAt.Local()
 	}
 	return time.Now()
+}
+
+// terminalOutcomeQuiet 判定一次 outcome 是否“无事发生”：已评估、未触发、
+// direct/passthrough、上游成功、持久化无故障、无需介入、也没有超阈值预告。
+// 这些请求的 token 数值已由响应侧“上下文总Tokens”行按响应频率展示。
+func terminalOutcomeQuiet(snapshot requestOutcomeSnapshot) bool {
+	if snapshot.TriggerReason != TriggerNone {
+		return false
+	}
+	switch snapshot.Action {
+	case outcomeActionDirect, outcomeActionPassthrough:
+	default:
+		return false
+	}
+	if snapshot.Eligibility != outcomeEligibilityEvaluable {
+		return false
+	}
+	if snapshot.UpstreamState != upstreamStateSuccess {
+		return false
+	}
+	if snapshot.MemoryState == persistenceStateFailed ||
+		snapshot.DiskState == persistenceStateFailed || snapshot.DiskState == persistenceStateUnavailable {
+		return false
+	}
+	if snapshot.Intervention != interventionNone && snapshot.Intervention != interventionNotRequired {
+		return false
+	}
+	if snapshot.APIUsageKnown && snapshot.PressureThresholdTokens > 0 && snapshot.APITotalInputTokens > snapshot.PressureThresholdTokens {
+		return false
+	}
+	return true
 }
 
 // terminalTriggerPhrase 返回“是否触发”与自然中文原因；未完成判定时不假装已评估。

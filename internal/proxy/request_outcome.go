@@ -3,6 +3,8 @@ package proxy
 import (
 	"errors"
 	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -911,6 +913,8 @@ func recordUpstreamOutcome(meta *requestMeta, state upstreamState, status int) {
 
 // recordAPIUsageOutcome 把一次合法响应 usage 投影进本请求 closure 的数值闭环。
 // 与 debug facts 不同，它不依赖 Debug.Enabled——终端/会话闭环是常驻可观测性。
+// 主线程请求同时输出一条“上下文总Tokens”日志行：这是老大肉眼盯上下文增长的
+// 唯一高频数值来源，频率与主请求响应一致，不依赖 ST 判定事件。
 func recordAPIUsageOutcome(meta *requestMeta, usage map[string]any) {
 	outcome := requestOutcome(meta)
 	if outcome == nil {
@@ -920,6 +924,43 @@ func recordAPIUsageOutcome(meta *requestMeta, usage map[string]any) {
 	creation := nonNegativeUsageToken(usage["cache_creation_input_tokens"])
 	read := nonNegativeUsageToken(usage["cache_read_input_tokens"])
 	outcome.SetAPIUsageTotals(input, creation, read)
+
+	total := input + creation + read
+	if total <= 0 || meta == nil || !meta.tracksSawtoothState() || meta.Logger == nil {
+		return
+	}
+	decision := meta.PressureDecision
+	meta.Logger.Info(formatContextTokensPhrase(total, input, creation, read, decision.SelectedPressure, decision.Threshold),
+		"total_input_tokens", total,
+		"input_tokens", input,
+		"cache_creation_input_tokens", creation,
+		"cache_read_input_tokens", read,
+		"selected_pressure", decision.SelectedPressure,
+		"pressure_threshold", decision.Threshold,
+	)
+}
+
+// formatContextTokensPhrase 渲染“上下文总Tokens=N（输入a｜缓存写b｜缓存读c）判定=x/y”；
+// 零值分项省略，判定段在判定值与阈值都未知时省略。
+func formatContextTokensPhrase(total, input, creation, read, selected, threshold int) string {
+	var segments []string
+	if input > 0 {
+		segments = append(segments, "输入"+strconv.Itoa(input))
+	}
+	if creation > 0 {
+		segments = append(segments, "缓存写"+strconv.Itoa(creation))
+	}
+	if read > 0 {
+		segments = append(segments, "缓存读"+strconv.Itoa(read))
+	}
+	phrase := "上下文总Tokens=" + strconv.Itoa(total)
+	if len(segments) > 0 {
+		phrase += "（" + strings.Join(segments, "｜") + "）"
+	}
+	if selected > 0 || threshold > 0 {
+		phrase += "判定=" + strconv.Itoa(selected) + "/" + strconv.Itoa(threshold)
+	}
+	return phrase
 }
 
 // recordStateLoadFailure 把四个状态组件的读取失败原样写进同一 closure。
