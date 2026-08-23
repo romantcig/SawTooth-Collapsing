@@ -3,8 +3,6 @@ package proxy
 import (
 	"errors"
 	"log/slog"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -932,37 +930,17 @@ func recordAPIUsageOutcome(meta *requestMeta, usage map[string]any) {
 		return
 	}
 	decision := meta.PressureDecision
-	meta.Logger.Info(formatContextTokensPhrase(total, input, creation, read, decision.SelectedPressure, decision.Threshold),
-		"total_input_tokens", total,
-		"input_tokens", input,
-		"cache_creation_input_tokens", creation,
-		"cache_read_input_tokens", read,
-		"selected_pressure", decision.SelectedPressure,
-		"pressure_threshold", decision.Threshold,
+	// 高频事件键 + snake_case kv：终端经模板表渲染中文单行（LogDim 暗灰），
+	// 文件侧原样存事件键与全量 kv。
+	meta.Logger.Info(eventKeyCtxTokens,
+		"total", total,
+		"in", input,
+		"write", creation,
+		"read", read,
+		"sel", decision.SelectedPressure,
+		"thr", decision.Threshold,
+		LogDim,
 	)
-}
-
-// formatContextTokensPhrase 渲染“上下文总Tokens=N（输入a｜缓存写b｜缓存读c）判定=x/y”；
-// 零值分项省略，判定段在判定值与阈值都未知时省略。
-func formatContextTokensPhrase(total, input, creation, read, selected, threshold int) string {
-	var segments []string
-	if input > 0 {
-		segments = append(segments, "输入"+strconv.Itoa(input))
-	}
-	if creation > 0 {
-		segments = append(segments, "缓存写"+strconv.Itoa(creation))
-	}
-	if read > 0 {
-		segments = append(segments, "缓存读"+strconv.Itoa(read))
-	}
-	phrase := "上下文总Tokens=" + strconv.Itoa(total)
-	if len(segments) > 0 {
-		phrase += "（" + strings.Join(segments, "｜") + "）"
-	}
-	if selected > 0 || threshold > 0 {
-		phrase += "判定=" + strconv.Itoa(selected) + "/" + strconv.Itoa(threshold)
-	}
-	return phrase
 }
 
 // recordStateLoadFailure 把四个状态组件的读取失败原样写进同一 closure。

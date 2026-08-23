@@ -14,11 +14,11 @@ import (
 	"time"
 )
 
-// logTestTime 测试用固定时间戳——对应输出 2026/07/06 15:04:05。
+// logTestTime 测试用固定时间戳——对应输出 15:04:05。
 var logTestTime = time.Date(2026, 7, 6, 15, 4, 5, 0, time.Local)
 
 // logTestPrefix 固定时间戳对应的无色前缀。
-const logTestPrefix = "2026/07/06 15:04:05 "
+const logTestPrefix = "15:04:05 "
 
 // emitLogRecord 用固定时间手工构造 record 并直接调 Handle，返回输出内容。
 func emitLogRecord(t *testing.T, h *LogHandler, buf *bytes.Buffer, level slog.Level, msg string, attrs ...slog.Attr) string {
@@ -32,8 +32,9 @@ func emitLogRecord(t *testing.T, h *LogHandler, buf *bytes.Buffer, level slog.Le
 	return buf.String()
 }
 
-// Test 1: 时间戳格式——行以 "2006/01/02 15:04:05 " 格式前缀开头，
-// 且时间戳段无任何 ANSI 码（开色时色码只包裹级别标签）。
+// Test 1: 时间戳格式——行以 "15:04:05 " 格式前缀开头（与 ST 行、健康行、
+// 文件侧 formatSessionLogLine 一致），且时间戳段无任何 ANSI 码
+// （开色时色码只包裹级别标签）。
 func TestLogHandlerTimestampFormat(t *testing.T) {
 	var buf bytes.Buffer
 	h := NewLogHandler(&buf, slog.LevelInfo)
@@ -92,8 +93,8 @@ func TestLogHandlerNonTTY(t *testing.T) {
 	}
 }
 
-// Test 3: level 默认色（强制开色）——Info 绿、Error 红、Warn 黄、Debug 暗灰，
-// 色码只包裹级别标签，消息正文不着色。
+// Test 3: level 默认色（强制开色）——Info 素色（终端默认色）、Error 红、
+// Warn 黄、Debug 暗灰；色码只包裹级别标签，消息正文不着色。
 func TestLogHandlerLevelColors(t *testing.T) {
 	var buf bytes.Buffer
 	h := NewLogHandler(&buf, slog.LevelDebug)
@@ -105,7 +106,7 @@ func TestLogHandlerLevelColors(t *testing.T) {
 		code  string
 		label string
 	}{
-		{"Info绿", slog.LevelInfo, "\033[32m", "[INFO]"},
+		{"Info素色", slog.LevelInfo, "", "[INFO]"},
 		{"Error红", slog.LevelError, "\033[31m", "[ERROR]"},
 		{"Warn黄", slog.LevelWarn, "\033[33m", "[WARN]"},
 		{"Debug暗灰", slog.LevelDebug, "\033[2m", "[DEBUG]"},
@@ -113,7 +114,10 @@ func TestLogHandlerLevelColors(t *testing.T) {
 	for _, c := range cases {
 		got := emitLogRecord(t, h, &buf, c.level, "msg")
 		rest := strings.TrimPrefix(got, logTestPrefix)
-		wantColoredLabel := c.code + c.label + colorReset
+		wantColoredLabel := c.label
+		if c.code != "" {
+			wantColoredLabel = c.code + c.label + colorReset
+		}
 		if !strings.HasPrefix(rest, wantColoredLabel) {
 			t.Errorf("%s: 级别段 = %q, want 以 %q 开头", c.name, rest, wantColoredLabel)
 		}
@@ -163,6 +167,50 @@ func TestLogHandlerAttrFormat(t *testing.T) {
 	want := logTestPrefix + "[INFO]  msg k=v k2=42\n"
 	if got != want {
 		t.Errorf("输出 = %q, want %q", got, want)
+	}
+}
+
+// Test 5b: 高频事件键模板渲染——消息为已知事件键时按模板渲染中文单行，
+// 只引用模板字段；未引用 kv 与 WithAttrs 预置段不进终端；无模板的事件键
+// 原样显示并保留 attrs（兜底，不丢日志）。
+func TestLogHandlerTerminalTemplates(t *testing.T) {
+	var buf bytes.Buffer
+	h := NewLogHandler(&buf, slog.LevelDebug)
+
+	got := emitLogRecord(t, h, &buf, slog.LevelInfo, eventKeyCtxTokens,
+		slog.Int("total", 1200), slog.Int("in", 1200), slog.Int("write", 0), slog.Int("read", 0),
+		slog.Int("sel", 1260), slog.Int("thr", 16000), slog.String("extra", "hidden"))
+	want := logTestPrefix + "[INFO]  上下文总Tokens=1200（输入1200｜缓存写0｜缓存读0）判定=1260/16000\n"
+	if got != want {
+		t.Errorf("ctx_tokens 渲染 = %q, want %q", got, want)
+	}
+
+	got = emitLogRecord(t, h, &buf, slog.LevelDebug, eventKeyRequestIn,
+		slog.Int("original_message_count", 5), slog.String("model", "m"))
+	want = logTestPrefix + "[DEBUG] ▸ 请求进入\n"
+	if got != want {
+		t.Errorf("request_in 渲染 = %q, want %q", got, want)
+	}
+
+	// 模板行不追加 WithAttrs 预置段：request_id 等关联字段只在文件侧保留。
+	h2 := h.WithAttrs([]slog.Attr{slog.String("request_id", "17")}).(*LogHandler)
+	got = emitLogRecord(t, h2, &buf, slog.LevelInfo, eventKeyRequestForwarded,
+		slog.Int("forwarded_message_count", 2))
+	want = logTestPrefix + "[INFO]  → 上游发送\n"
+	if got != want {
+		t.Errorf("request_forwarded 渲染 = %q, want %q（预置段不得进模板行）", got, want)
+	}
+
+	// 占位符缺 attr 时保留原样（兜底可见）；无模板事件键原样显示 + attrs。
+	got = emitLogRecord(t, h, &buf, slog.LevelInfo, eventKeyCtxTokens)
+	want = logTestPrefix + "[INFO]  上下文总Tokens={total}（输入{in}｜缓存写{write}｜缓存读{read}）判定={sel}/{thr}\n"
+	if got != want {
+		t.Errorf("缺 attr 的模板渲染 = %q, want %q", got, want)
+	}
+	got = emitLogRecord(t, h, &buf, slog.LevelInfo, "unknown_event_key", slog.Int("k", 1))
+	want = logTestPrefix + "[INFO]  unknown_event_key k=1\n"
+	if got != want {
+		t.Errorf("无模板事件键 = %q, want %q", got, want)
 	}
 }
 

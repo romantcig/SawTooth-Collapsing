@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,12 +35,49 @@ var (
 	LogGreen      = slog.String(logColorKey, colorGreen)      // 折叠/压缩完成
 	LogLightGreen = slog.String(logColorKey, colorLightGreen) // 无需压缩
 	LogBlue       = slog.String(logColorKey, colorBlue)       // archive 注入
-	LogDim        = slog.String(logColorKey, colorDim)        // passthrough 高频噪音
+	LogDim        = slog.String(logColorKey, colorDim)        // 高频数值/噪音
 )
 
+// 高频事件键——消息层双轨机制：调用点以英文事件键 + snake_case kv 发出，
+// 终端经模板表渲染中文，文件侧原样存事件键 + 全量 kv。
+const (
+	eventKeyCtxTokens        = "ctx_tokens"
+	eventKeyRequestIn        = "request_in"
+	eventKeyRequestForwarded = "request_forwarded"
+	eventKeyAuxiliaryPass    = "auxiliary_passthrough"
+)
+
+// terminalTemplates 是高频事件键的终端渲染模板。占位符 {key} 从 record attrs
+// 取值；模板未引用的 kv 与 WithAttrs 预置段终端不渲染、文件侧照存；
+// 无模板项的事件键终端原样显示（兜底，不丢日志）。
+var terminalTemplates = map[string]string{
+	eventKeyCtxTokens:        "上下文总Tokens={total}（输入{in}｜缓存写{write}｜缓存读{read}）判定={sel}/{thr}",
+	eventKeyRequestIn:        "▸ 请求进入",
+	eventKeyRequestForwarded: "→ 上游发送",
+	eventKeyAuxiliaryPass:    "辅助直通",
+}
+
+// terminalTemplatePlaceholder 匹配模板中的 {key} 占位符。
+var terminalTemplatePlaceholder = regexp.MustCompile(`\{[a-zA-Z_][a-zA-Z0-9_]*\}`)
+
+// renderTerminalTemplate 用 record attrs 替换模板占位符；无对应 attr 的
+// 占位符保留原样（兜底可见，不静默吞字段）。
+func renderTerminalTemplate(template string, attrs map[string]string) string {
+	if len(attrs) == 0 {
+		return template
+	}
+	return terminalTemplatePlaceholder.ReplaceAllStringFunc(template, func(placeholder string) string {
+		if value, ok := attrs[placeholder[1:len(placeholder)-1]]; ok {
+			return value
+		}
+		return placeholder
+	})
+}
+
 // LogHandler 是对齐 YesMem 日志体验的 slog.Handler：
-// 行格式 `2006/01/02 15:04:05 [LEVEL] 消息 k=v`，仅级别标签按级别/语义着色，
-// 时间戳、消息和 attrs 永远保持终端默认颜色；非 TTY 输出零转义码。
+// 行格式 `15:04:05 [LEVEL] 消息 k=v`（与 ST 行、健康行、文件侧一致），
+// 仅级别标签按级别/语义着色，时间戳、消息和 attrs 永远保持终端默认颜色；
+// 非 TTY 输出零转义码。
 type LogHandler struct {
 	w         io.Writer
 	level     slog.Level  // 最低输出级别
@@ -71,17 +109,25 @@ func (h *LogHandler) Enabled(_ context.Context, level slog.Level) bool {
 }
 
 // Handle 输出一行：`时间戳 ` + [色码] + `[LEVEL]` + [复位] + 消息 + attrs + 换行。
-// 在本地 buffer 拼完整行后持锁单次 Write，保证并发下行不交错。
+// 消息为已知事件键时进入模板渲染：终端只显示模板结果，不再追加任何 kv
+// （含 WithAttrs 预置段）；文件侧另一个 handler 不做模板渲染，事件键与
+// 全量 kv 照存。在本地 buffer 拼完整行后持锁单次 Write，保证并发下行不交错。
 func (h *LogHandler) Handle(_ context.Context, r slog.Record) error {
 	var buf bytes.Buffer
 
-	// 时间戳段永远无色。
-	buf.WriteString(r.Time.Format("2006/01/02 15:04:05"))
+	// 时间戳段永远无色；HH:MM:SS 与 ST 行、健康行、文件侧一致。
+	buf.WriteString(r.Time.Format("15:04:05"))
 	buf.WriteByte(' ')
 
-	// 遍历 record attrs：消费语义色 attr，其余格式化为 " k=v"
+	// 遍历 record attrs：消费语义色 attr，其余格式化为 " k=v"。
+	template, templated := terminalTemplates[r.Message]
+	message := r.Message
 	semColor := ""
 	var attrBuf bytes.Buffer
+	var templateAttrs map[string]string
+	if templated {
+		templateAttrs = make(map[string]string)
+	}
 	r.Attrs(func(a slog.Attr) bool {
 		if a.Key == logColorKey {
 			semColor = a.Value.String()
@@ -91,6 +137,10 @@ func (h *LogHandler) Handle(_ context.Context, r slog.Record) error {
 		if isSessionIdentityLogAttr(a.Key) {
 			return true
 		}
+		if templated {
+			templateAttrs[a.Key] = a.Value.String()
+			return true
+		}
 		attrBuf.WriteByte(' ')
 		attrBuf.WriteString(h.groups)
 		attrBuf.WriteString(a.Key)
@@ -98,8 +148,12 @@ func (h *LogHandler) Handle(_ context.Context, r slog.Record) error {
 		attrBuf.WriteString(a.Value.String())
 		return true
 	})
+	if templated {
+		message = renderTerminalTemplate(template, templateAttrs)
+	}
 
 	// 选色优先级：record 语义色 > WithAttrs 语义色 > level 默认色。
+	// INFO 默认素色：彩色仅限显式语义色（终端行规范）。
 	c := semColor
 	if c == "" {
 		c = h.withColor
@@ -113,7 +167,7 @@ func (h *LogHandler) Handle(_ context.Context, r slog.Record) error {
 		case r.Level < slog.LevelInfo:
 			c = colorDim
 		default:
-			c = colorGreen
+			c = ""
 		}
 	}
 
@@ -126,9 +180,11 @@ func (h *LogHandler) Handle(_ context.Context, r slog.Record) error {
 		buf.WriteString(colorReset)
 	}
 	buf.WriteString(padding)
-	buf.WriteString(r.Message)
-	buf.WriteString(h.preAttrs) // WithAttrs 预置段在 record attrs 之前
-	buf.Write(attrBuf.Bytes())
+	buf.WriteString(message)
+	if !templated {
+		buf.WriteString(h.preAttrs) // WithAttrs 预置段在 record attrs 之前
+		buf.Write(attrBuf.Bytes())
+	}
 	buf.WriteByte('\n')
 
 	h.mu.Lock()

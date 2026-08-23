@@ -75,10 +75,16 @@ func run() int {
 	// 1. flag 解析
 	portFlag := flag.Int("port", 0, "监听端口（0 表示使用配置文件中的值）")
 	configFlag := flag.String("config", "sawtooth.yaml", "配置文件路径")
+	verboseFlag := flag.Bool("v", false, "终端显示 Debug 级日志（文件日志级别不受影响）")
 	flag.Parse()
 
-	// 2. 日志初始化
-	terminalHandler := proxy.NewLogHandler(os.Stdout, slog.LevelInfo)
+	// 2. 日志初始化：-v 只调终端 handler 级别 Info → Debug，文件侧固定
+	// LevelDebug 全量收录。
+	terminalLevel := slog.LevelInfo
+	if *verboseFlag {
+		terminalLevel = slog.LevelDebug
+	}
+	terminalHandler := proxy.NewLogHandler(os.Stdout, terminalLevel)
 	terminalLogger := slog.New(terminalHandler)
 	slog.SetDefault(terminalLogger)
 
@@ -90,7 +96,7 @@ func run() int {
 	}
 
 	// 配置成功后才安装文件日志；配置读取失败保持仅终端可见。
-	fileHandler := proxy.NewSessionLogHandler(cfg.Debug.DataDir, slog.LevelInfo, func(err error) {
+	fileHandler := proxy.NewSessionLogHandler(cfg.Debug.DataDir, slog.LevelDebug, func(err error) {
 		terminalLogger.Error("文件日志写入失败", "error", err)
 	})
 	slog.SetDefault(slog.New(proxy.NewCombinedLogHandler(terminalHandler, fileHandler)))

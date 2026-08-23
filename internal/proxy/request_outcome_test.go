@@ -214,7 +214,8 @@ func TestRequestOutcomeRecordsPressureAndUsageTokens(t *testing.T) {
 	}
 }
 
-// 响应数值行：主线程请求在响应 usage 解析后输出一条“上下文总Tokens”行，
+// 响应数值行：主线程请求在响应 usage 解析后输出一条 ctx_tokens 事件键行
+// （终端经模板表渲染“上下文总Tokens”，文件/TextHandler 侧存事件键与全量 kv），
 // 数值来自 API usage，判定值来自发送前 pressure decision；辅助请求不输出。
 func TestContextTokensOutcomeLine(t *testing.T) {
 	var buf bytes.Buffer
@@ -228,23 +229,27 @@ func TestContextTokensOutcomeLine(t *testing.T) {
 	})
 	line := buf.String()
 	for _, want := range []string{
-		"上下文总Tokens=41958（输入2｜缓存读41956）判定=41583/150000",
-		"total_input_tokens=41958",
+		"msg=ctx_tokens",
+		"total=41958",
+		"in=2",
+		"read=41956",
+		"sel=41583",
+		"thr=150000",
 		"request_id=5",
 	} {
 		if !strings.Contains(line, want) {
-			t.Fatalf("上下文总Tokens 行缺少 %q: %s", want, line)
+			t.Fatalf("ctx_tokens 行缺少 %q: %s", want, line)
 		}
 	}
 
-	// 缓存写分项也要在出现时显示。
+	// 缓存写分项作为 write kv 记录。
 	buf.Reset()
 	recordAPIUsageOutcome(meta, map[string]any{
 		"input_tokens":                 float64(2),
 		"cache_creation_input_tokens":  float64(205506),
 	})
-	if !strings.Contains(buf.String(), "上下文总Tokens=205508（输入2｜缓存写205506）") {
-		t.Fatalf("缓存写分项未出现在数值行: %s", buf.String())
+	if !strings.Contains(buf.String(), "msg=ctx_tokens") || !strings.Contains(buf.String(), "write=205506") {
+		t.Fatalf("缓存写分项未进入数值行: %s", buf.String())
 	}
 
 	// 辅助请求（session_title/subagent）不输出数值行。
@@ -253,14 +258,14 @@ func TestContextTokensOutcomeLine(t *testing.T) {
 	auxiliary.Logger = slog.New(slog.NewTextHandler(&buf, nil))
 	auxiliary.RequestKind = requestKindSessionTitle
 	recordAPIUsageOutcome(auxiliary, map[string]any{"input_tokens": float64(2), "cache_read_input_tokens": float64(41956)})
-	if strings.Contains(buf.String(), "上下文总Tokens") {
+	if strings.Contains(buf.String(), "ctx_tokens") {
 		t.Fatalf("辅助请求不应输出上下文数值行: %s", buf.String())
 	}
 
 	// 没有 usage 的响应（取消/失败）不产生数值行。
 	buf.Reset()
 	recordAPIUsageOutcome(meta, nil)
-	if strings.Contains(buf.String(), "上下文总Tokens") {
+	if strings.Contains(buf.String(), "ctx_tokens") {
 		t.Fatalf("无 usage 响应不应输出上下文数值行: %s", buf.String())
 	}
 }

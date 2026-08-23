@@ -501,9 +501,11 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 	markForwardedPressureCoordinates(meta, body, s.TokenCounter)
 	stream := streamRequest(body)
 	meta.logEntry(model, messageCount)
-	logger.Info("上游请求发送",
+	// Debug 级事件键：终端模板渲染 `→ 上游发送`（-v 可见），文件侧全量收录。
+	logger.Debug(eventKeyRequestForwarded,
 		"forwarded_message_count", messageCount,
 		"model", model,
+		LogDim,
 	)
 
 	timestamp := time.Now()

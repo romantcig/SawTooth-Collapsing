@@ -212,13 +212,13 @@ func TestAuxiliaryClassificationLog(t *testing.T) {
 
 	var output bytes.Buffer
 	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 	meta := newRequestMeta(42, secretSessionID)
 	logAuxiliaryClassification(meta.auxiliaryLogger(), classification, 1)
 	got := output.String()
-	if strings.Count(got, "辅助请求安全直通") != 1 {
-		t.Fatalf("Info 审计数量不正确: %s", got)
+	if strings.Count(got, "auxiliary_passthrough") != 1 {
+		t.Fatalf("Debug 审计数量不正确: %s", got)
 	}
 	for _, field := range []string{"request_id=42", "request_kind=session_title", "request_reason=title_schema", "message_count=1"} {
 		if !strings.Contains(got, field) {
@@ -232,7 +232,7 @@ func TestAuxiliaryClassificationLog(t *testing.T) {
 	}
 
 	var zeroOutput bytes.Buffer
-	slog.SetDefault(slog.New(slog.NewTextHandler(&zeroOutput, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	slog.SetDefault(slog.New(slog.NewTextHandler(&zeroOutput, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	manualMeta := &requestMeta{
 		ID:     43,
 		Logger: slog.Default().With("request_session_id", secretSessionID),

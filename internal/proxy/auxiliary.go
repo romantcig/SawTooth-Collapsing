@@ -288,9 +288,11 @@ func logAuxiliaryClassification(logger *slog.Logger, classification auxiliaryCla
 	if logger == nil {
 		logger = slog.Default()
 	}
-	logger.Info("辅助请求安全直通",
+	// Debug 级事件键：终端模板渲染 `辅助直通`（-v 可见），文件侧全量收录。
+	logger.Debug(eventKeyAuxiliaryPass,
 		"request_kind", classification.Kind,
 		"request_reason", classification.Reason,
 		"message_count", messageCount,
+		LogDim,
 	)
 }

@@ -635,9 +635,11 @@ func TestConcurrentRequestLogsReconstructable(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
 	// LOG-03 之后终端不再渲染 session 身份，因此并发日志的还原键只剩 request_id：
 	// 每条并发主请求必须有自己的入口行与完整事件链，且互不串号。
+	// 高频行已事件键化（request_in/request_forwarded 模板渲染无 request_id），
+	// 入口还原改从同样每请求一条的 agent_features Debug 行提取。
 	requestIDs := make(map[string]bool)
 	for _, line := range lines {
-		if !strings.Contains(line, "请求进入") {
+		if !strings.Contains(line, "agent_features") {
 			continue
 		}
 		for _, field := range strings.Fields(line) {
@@ -658,11 +660,18 @@ func TestConcurrentRequestLogsReconstructable(t *testing.T) {
 			}
 		}
 		got := chain.String()
-		for _, event := range []string{"请求进入", "agent_features", "frozen prefix 未命中", "Archive 召回汇总", "上游请求发送"} {
+		for _, event := range []string{"agent_features", "frozen prefix 未命中", "Archive 召回汇总"} {
 			if !strings.Contains(got, event) {
 				t.Fatalf("request_id=%s 缺少 %s:\n%s", requestID, event, got)
 			}
 		}
+	}
+	// 模板化高频行不带 request_id，改按全局出现次数断言每请求各一条。
+	if got := strings.Count(logs.String(), "▸ 请求进入"); got != 2 {
+		t.Fatalf("模板行 `▸ 请求进入` 出现 %d 次, want 2:\n%s", got, logs.String())
+	}
+	if got := strings.Count(logs.String(), "→ 上游发送"); got != 2 {
+		t.Fatalf("模板行 `→ 上游发送` 出现 %d 次, want 2:\n%s", got, logs.String())
 	}
 	// 只否定 session 身份属性本身：本用例的 block_id fixture 刻意把 session 名
 	// 编进了存档块 ID，那是测试命名而非生产身份泄漏。
@@ -712,7 +721,8 @@ func TestHandleMessagesSessionTitleRequestState(t *testing.T) {
 
 	var logs bytes.Buffer
 	previous := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	// 辅助直通审计已降为 Debug 级事件键（auxiliary_passthrough）。
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(rawBody))
@@ -743,15 +753,15 @@ func TestHandleMessagesSessionTitleRequestState(t *testing.T) {
 	gotLogs := logs.String()
 	var auxiliaryLog string
 	for _, line := range strings.Split(strings.TrimSpace(gotLogs), "\n") {
-		if strings.Contains(line, "辅助请求安全直通") {
+		if strings.Contains(line, "auxiliary_passthrough") {
 			if auxiliaryLog != "" {
-				t.Fatalf("标题分类 Info 多于一条: %s", gotLogs)
+				t.Fatalf("标题分类审计多于一条: %s", gotLogs)
 			}
 			auxiliaryLog = line
 		}
 	}
 	if auxiliaryLog == "" {
-		t.Fatalf("标题分类 Info 数量不正确: %s", gotLogs)
+		t.Fatalf("标题分类审计数量不正确: %s", gotLogs)
 	}
 	for _, field := range []string{"request_kind=session_title", "request_reason=title_schema", "message_count=1", "request_id="} {
 		if !strings.Contains(auxiliaryLog, field) {
@@ -2983,9 +2993,10 @@ func TestProductionTerminalNeverPrintsFullSessionID(t *testing.T) {
 	serveOutcomeMessages(t, server, terminalProbeSessionID, pipelineMessages(80, 260))
 	output := logs.String()
 
-	// 正向（范围围栏）先断言：脱敏不得靠降级 Info 进度行来换取。
-	// 放在负向之前，使实现前的红也能证明这三条行本来就在。
-	for _, want := range []string{"请求进入", "frozen prefix 已存储", "上游请求发送", "[INFO]"} {
+	// 正向（范围围栏）先断言：脱敏不得靠降级进度行来换取。请求进入/上游发送
+	// 已按双轨规范降为 Debug 事件键（默认 Info 终端不可见），进行中与完成后的
+	// 进度反馈由 frozen 存储行与 ctx_tokens 模板行承担。
+	for _, want := range []string{"frozen prefix 已存储", "上下文总Tokens=", "[INFO]"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("终端丢失请求进行中的进度反馈 %q:\n%s", want, output)
 		}
@@ -3075,8 +3086,10 @@ func TestProductionLongRequestProgressMapsToSessionLog(t *testing.T) {
 	}
 
 	// 请求明确仍在处理中：此时上游没有返回，结果行不可能已经完成。
+	// 请求进入/上游发送已降为 Debug 事件键（本终端为默认 Info 级），
+	// 进行中可见的进度反馈是折叠路径的 frozen 存储行。
 	during := terminal.String()
-	for _, want := range []string{"请求进入", "frozen prefix 已存储", "上游请求发送", "[INFO]"} {
+	for _, want := range []string{"frozen prefix 已存储", "[INFO]"} {
 		if !strings.Contains(during, want) {
 			t.Fatalf("长请求处理中缺少进度反馈 %q:\n%s", want, during)
 		}

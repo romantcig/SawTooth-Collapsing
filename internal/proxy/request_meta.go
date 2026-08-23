@@ -108,9 +108,11 @@ func (m *requestMeta) auxiliaryLogger() *slog.Logger {
 func (m *requestMeta) logEntry(model string, originalMessageCount int) {
 	m.entryOnce.Do(func() {
 		m.OriginalMessageCount = originalMessageCount
-		m.Logger.Info("请求进入",
+		// Debug 级事件键：终端模板渲染 `▸ 请求进入`（-v 可见），文件侧全量收录。
+		m.Logger.Debug(eventKeyRequestIn,
 			"original_message_count", originalMessageCount,
 			"model", model,
+			LogDim,
 		)
 	})
 }

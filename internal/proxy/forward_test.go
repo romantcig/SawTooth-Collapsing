@@ -1336,13 +1336,18 @@ func TestForwardRawRequestLogFields(t *testing.T) {
 	s.forwardRaw(recorder, req, meta)
 
 	output := logs.String()
+	// 高频行已事件键化并降为 Debug：终端模板渲染单行中文，不再追加 kv
+	// （request_id 等关联字段只在文件侧保留）。
 	for _, want := range []string{
-		"请求进入 request_id=17 original_message_count=2 model=test-model",
-		"上游请求发送 request_id=17 forwarded_message_count=2 model=test-model",
+		"▸ 请求进入",
+		"→ 上游发送",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("日志缺少 %q:\n%s", want, output)
 		}
+	}
+	if strings.Contains(output, "original_message_count=2") || strings.Contains(output, "forwarded_message_count=2") {
+		t.Fatalf("模板化事件行不应渲染英文 kv:\n%s", output)
 	}
 	// LOG-03：session 身份不进终端渲染，关联改由 request_id 承担。
 	if strings.Contains(output, "request-session") || strings.Contains(output, "request_session_id") {

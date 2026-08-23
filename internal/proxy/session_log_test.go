@@ -19,7 +19,7 @@ func TestSessionLogRoutesProcessAndSession(t *testing.T) {
 	secret := "session-secret-must-not-be-rendered"
 
 	logger.Info("启动代理", "component", "proxy")
-	logger.With("request_session_id", secret, "request_id", uint64(27)).Info("请求进入", "status", 200)
+	logger.With("request_session_id", secret, "request_id", uint64(27)).Debug("request_in", "status", 200)
 	logger.With("request_session_id", secret, "request_id", uint64(27)).Warn("上游返回非 2xx", "status", 502)
 
 	process := readSessionLogFile(t, filepath.Join(dataDir, "logs", "process.log"))
@@ -29,13 +29,13 @@ func TestSessionLogRoutesProcessAndSession(t *testing.T) {
 	if !strings.Contains(process, "启动代理 component=proxy") {
 		t.Fatalf("process.log 缺少无 session 事件: %q", process)
 	}
-	if strings.Contains(process, "请求进入") || strings.Contains(process, secret) {
+	if strings.Contains(process, "request_in") || strings.Contains(process, secret) {
 		t.Fatalf("process.log 错误接收 session 事件或身份: %q", process)
 	}
 	if strings.Contains(session, secret) || strings.Contains(session, "request_session_id") {
 		t.Fatalf("session.log 泄漏完整 session 身份: %q", session)
 	}
-	if !strings.Contains(session, "#27 请求进入 status=200") {
+	if !strings.Contains(session, "[DEBUG] #27 request_in status=200") {
 		t.Fatalf("session.log 缺少紧凑 request 关联: %q", session)
 	}
 	if !strings.Contains(session, "[WARN] #27 上游返回非 2xx status=502") {
@@ -44,7 +44,7 @@ func TestSessionLogRoutesProcessAndSession(t *testing.T) {
 	if strings.Contains(session, "[INFO]") || strings.Contains(session, "\033[") {
 		t.Fatalf("session.log 含多余 Info 标签或 ANSI: %q", session)
 	}
-	linePattern := regexp.MustCompile(`(?m)^\d{2}:\d{2}:\d{2} (?:\[WARN\] )?.+$`)
+	linePattern := regexp.MustCompile(`(?m)^\d{2}:\d{2}:\d{2} (?:\[(?:WARN|DEBUG)\] )?.+$`)
 	if !linePattern.MatchString(session) {
 		t.Fatalf("session.log 时间/级别格式不是 HH:MM:SS: %q", session)
 	}
