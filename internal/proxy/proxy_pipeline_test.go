@@ -3001,6 +3001,10 @@ func TestProductionTerminalNeverPrintsFullSessionID(t *testing.T) {
 			t.Fatalf("终端丢失请求进行中的进度反馈 %q:\n%s", want, output)
 		}
 	}
+	// 模板占位符必须已被 kv 替换：裸占位符意味着调用点 kv 键与模板发生漂移。
+	if strings.Contains(output, "上下文总Tokens={") {
+		t.Fatalf("ctx_tokens 模板占位符未被替换（kv 键漂移?）:\n%s", output)
+	}
 
 	// 负向：完整 session ID 与属性键都不得进终端。
 	if strings.Contains(output, terminalProbeSessionID) {
