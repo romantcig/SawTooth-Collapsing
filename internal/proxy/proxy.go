@@ -250,6 +250,15 @@ type ArchiveCommitObserver interface {
 // 超限时必须在任何状态副作用之前拒绝，而不是静默截取一段窗口。
 const maxPrimaryRequestMessages = 10000
 
+// collapseArchiveReserveTokens 是折叠归档占位块（占位 + 摘要）在本地口径下的
+// 静态保守预留：实测 677~743 本地 token，且摘要文本有硬预算封顶
+// （Timeline 120 条 / Files 40 条 / Conclusion 300 runes）。
+const collapseArchiveReserveTokens = 1000
+
+// collapseFloorRetryLimit 是折叠边界保护重试的硬上限：从 threshold/2 起每级
+// +10% 到 threshold×0.8 封顶最多 ~5 次即可走完，该上限只作死循环防御。
+const collapseFloorRetryLimit = 16
+
 // SetOutcomeDispatcher 注入进程级 nonblocking dispatcher。
 // 生产 wiring 只调用一次；此后每个请求 collector 共享同一实例。
 func (s *Server) SetOutcomeDispatcher(dispatcher *OutcomeDispatcher) {
@@ -517,6 +526,10 @@ type pressureDecision struct {
 	// system/tools/messages 坐标已经成功解析并绑定到本次 decision。
 	// false 且 ForwardedCoordinatesChanged=true 时，禁止把 actual 写回 baseline。
 	ForwardedCoordinatesBound bool
+	// ForwardedLocalEstimate 是转发 wire 的本地全量估算（messages + system +
+	// tools），由 markForwardedPressureCoordinates 与坐标绑定同点补算，供响应侧
+	// 与 actual 配对写入校准样本。0 表示未计算（坐标未绑定或无 TokenCounter）。
+	ForwardedLocalEstimate    int
 	SystemFingerprintChanged  bool
 	ToolsFingerprintChanged   bool
 	CompressDecision          bool
@@ -1157,7 +1170,18 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			// cutoff > 0 → collapse 为主路径
 			// cutoff <= 0 → stubify+decay 为 fallback
 			// ================================================================
-			tokenFloor := threshold / 2
+			// tokenFloor 是折叠保留 messages 的本地估算预算。设计落点 =
+			// threshold/2（真实计费口径），除以滚动校准系数换算回本地口径，再扣除
+			// 不随折叠变化的 system/tools/persistent context 本地开销与归档占位
+			// 预留；旧公式直接拿本地 messages 估算对齐 threshold/2，系统性低估
+			// 约 1.5 倍导致真实落点钉在阈值上，是折叠死循环的主因。
+			calibration := defaultCalibrationRatio
+			if s.Sawtooth != nil {
+				calibration = s.Sawtooth.CalibrationRatio(stateKey)
+			}
+			tokenFloor := int(float64(threshold)/(2.0*calibration)) -
+				decision.SystemLocalTokens - decision.ToolsLocalTokens -
+				contextTokens - collapseArchiveReserveTokens
 			if tokenFloor < 10000 {
 				tokenFloor = 10000
 			}
@@ -1169,12 +1193,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				// collapse.enabled 只关闭主 Collapse；fallback 压缩链保持可用。
 				meta.Logger.Debug("collapse 已按配置关闭，使用备用压缩链")
 			default:
-				cutoffIdx = CalcCollapseCutoff(messages, tokenFloor, s.TokenCounter, s.Config.Stubify.KeepRecent)
-				if cutoffIdx >= len(messages) {
-					meta.Logger.Warn("collapse cutoff 越界，回退到 stubify",
-						"cutoff", cutoffIdx, "message_count", len(messages))
-					cutoffIdx = -1
-				}
+				cutoffIdx = collapseCutoffWithBoundaryGuard(messages, tokenFloor, threshold, s.Config.Stubify.KeepRecent, s.TokenCounter)
 			}
 
 			if cutoffIdx > 0 {
@@ -1425,6 +1444,34 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.forwardRaw(w, r, meta)
+}
+
+// collapseCutoffWithBoundaryGuard 在 CalcCollapseCutoff 之上实现调用方边界保护。
+// CalcCollapseCutoff 内部钳制（maxCutoff = n−keepRecent；orphan 调整可推 cutoff
+// < 2 → -1）不对外暴露信号，可能把保留条数压到边缘（如尾部 26k 级单条大消息
+// 挤占预算）。cutoff 被推 -1 或保留条数 < keep_recent+4 时，逐级上调落点目标
+// （每级 +10%，至 threshold×0.8 封顶）重试；封顶仍不满足则接受当前结果——
+// 钳制场景落点偏高，方向安全（远离阈值）。
+func collapseCutoffWithBoundaryGuard(messages []Message, tokenFloor, threshold, keepRecent int, tc *TokenCounter) int {
+	keepSafe := keepRecent + 4
+	maxFloor := int(float64(threshold) * 0.8)
+	targetFloor := tokenFloor
+	cutoff := CalcCollapseCutoff(messages, targetFloor, tc, keepRecent)
+	for attempt := 0; attempt < collapseFloorRetryLimit; attempt++ {
+		if cutoff >= 0 && len(messages)-cutoff >= keepSafe {
+			break
+		}
+		nextFloor := int(float64(targetFloor)*1.1) + 1
+		if nextFloor > maxFloor || nextFloor <= targetFloor {
+			break
+		}
+		targetFloor = nextFloor
+		cutoff = CalcCollapseCutoff(messages, targetFloor, tc, keepRecent)
+	}
+	if cutoff >= len(messages) {
+		return -1
+	}
+	return cutoff
 }
 
 // formatApproxTokens 使用纯整数规则把 token 数格式化为终端近似值。

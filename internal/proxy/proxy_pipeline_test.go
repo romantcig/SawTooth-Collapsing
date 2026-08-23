@@ -1854,10 +1854,18 @@ func retrievedArchiveTexts(messages []Message) []string {
 
 func newPipelineTestServer(t *testing.T, upstreamURL string) *Server {
 	t.Helper()
+	return newPipelineTestServerWithThreshold(t, upstreamURL, 16000)
+}
+
+// newPipelineTestServerWithThreshold 建立可配置 token 阈值的管线测试环境。
+// 折叠落点口径测试需要 threshold ≥60000：旧/新 floor 公式在 16000 环境下
+// 都被 10000 下限钉死，行为无区分度。
+func newPipelineTestServerWithThreshold(t *testing.T, upstreamURL string, threshold int) *Server {
+	t.Helper()
 	cfg := DefaultConfig()
 	cfg.Proxy.Target = upstreamURL
 	cfg.Proxy.Deflation = 1
-	cfg.Stubify.TokenThreshold = 16000
+	cfg.Stubify.TokenThreshold = threshold
 	cfg.Stubify.KeepRecent = 8
 	cfg.Debug.Enabled = false
 
@@ -1876,7 +1884,7 @@ func newPipelineTestServer(t *testing.T, upstreamURL string) *Server {
 	server.DecayTracker = NewDecayTracker()
 	server.Store = store
 	server.Frozen = NewFrozenStubs()
-	server.Sawtooth = NewSawtoothTrigger(time.Minute, cfg.Stubify.TokenThreshold, cfg.Stubify.TokenThreshold/2)
+	server.Sawtooth = NewSawtoothTrigger(time.Minute, threshold, threshold/2)
 	return server
 }
 

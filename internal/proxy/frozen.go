@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 )
@@ -953,9 +954,24 @@ type pressureBaseline struct {
 	ResetReason               baselineResetReason
 }
 
+// 校准系数的滚动实测口径：本地估算 → 真实计费 token 的转换率。
+// 样本只存内存（受 st.mu 保护），不放入 persistedState——ResetPressureBaseline
+// 的 epoch 清零不波及它（校准比率与会话历史无关），进程重启由冷启动常数兜底。
+const (
+	// defaultCalibrationRatio 是冷启动/样本不足时的常数：真实会话 101 个
+	// 非折叠请求的中位实测值（cl100k 估算系统性低估约 1.5 倍）。
+	defaultCalibrationRatio = 1.50
+	// calibrationSampleWindow 是每个 stateKey 保留的 (actual, estimate) 比值数。
+	calibrationSampleWindow = 8
+	// calibrationMinRatio / calibrationMaxRatio 钳制滚动中位数的漂移范围。
+	calibrationMinRatio = 1.35
+	calibrationMaxRatio = 1.80
+)
+
 // SawtoothTrigger 根据 token 使用量和时间判断是否执行桩化周期。
 type SawtoothTrigger struct {
 	mu                          sync.RWMutex
+	calibrationSamples          map[string][]float64        // stateKey → 最近 N 个 actual/estimate 比值
 	lastTotalTokens             map[string]int              // threadID → 上次 API 响应 input tokens
 	lastMessageCount            map[string]int              // threadID → 上次响应时的消息数
 	systemFingerprints          map[string]string           // threadID → 上次主请求 system 的 SHA-256 指纹
@@ -985,6 +1001,7 @@ type SawtoothTrigger struct {
 // NewSawtoothTrigger 创建新的触发状态跟踪器。
 func NewSawtoothTrigger(pauseThreshold time.Duration, tokenThreshold, tokenMinimum int) *SawtoothTrigger {
 	return &SawtoothTrigger{
+		calibrationSamples:          make(map[string][]float64),
 		lastTotalTokens:             make(map[string]int),
 		lastMessageCount:            make(map[string]int),
 		systemFingerprints:          make(map[string]string),
@@ -1272,6 +1289,59 @@ func (st *SawtoothTrigger) submitSawtoothState(submitter StateSubmitter, persist
 	return submitStateOp(submitter, legacy, PersistenceOp{
 		Kind: PersistenceOpPut, OrderingKey: key, Key: key, Value: value, Completion: completion,
 	})
+}
+
+// RecordCalibrationSample 记录一次完整响应的 (actual, estimate) 比值样本。
+// estimate 是与 actual 同点采集的转发 wire 本地全量估算（messages + system +
+// tools）；调用方只在响应完整（SSE 完整 / JSON 2xx 且 usage 可解析）且坐标已
+// 绑定时才到达这里，中断/非 2xx/乱序路径不产生样本，配对天然不错位。
+func (st *SawtoothTrigger) RecordCalibrationSample(stateKey string, actual, estimate int) {
+	if st == nil || stateKey == "" || actual <= 0 || estimate <= 0 {
+		return
+	}
+	ratio := float64(actual) / float64(estimate)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	stateKey = st.resolveStateKeyLocked(stateKey)
+	samples := append(st.calibrationSamples[stateKey], ratio)
+	if excess := len(samples) - calibrationSampleWindow; excess > 0 {
+		copy(samples, samples[excess:])
+		samples = samples[:calibrationSampleWindow]
+	}
+	st.calibrationSamples[stateKey] = samples
+}
+
+// CalibrationRatio 返回该 stateKey 的滚动校准系数（锁内只读）。
+// 冷启动/样本不足返回常数 1.50；否则取窗口内中位数并 clamp 到 [1.35, 1.80]。
+func (st *SawtoothTrigger) CalibrationRatio(stateKey string) float64 {
+	if st == nil {
+		return defaultCalibrationRatio
+	}
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	stateKey = st.resolveStateKeyLocked(stateKey)
+	samples := st.calibrationSamples[stateKey]
+	if len(samples) == 0 {
+		return defaultCalibrationRatio
+	}
+	sorted := append([]float64(nil), samples...)
+	sort.Float64s(sorted)
+	mid := len(sorted) / 2
+	median := sorted[mid]
+	if len(sorted)%2 == 0 {
+		median = (sorted[mid-1] + sorted[mid]) / 2
+	}
+	return clampCalibrationRatio(median)
+}
+
+func clampCalibrationRatio(ratio float64) float64 {
+	if ratio < calibrationMinRatio {
+		return calibrationMinRatio
+	}
+	if ratio > calibrationMaxRatio {
+		return calibrationMaxRatio
+	}
+	return ratio
 }
 
 // Evaluate 返回本次触发判定实际使用的同锁快照。

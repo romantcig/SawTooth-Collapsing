@@ -238,7 +238,7 @@ func TestHandleSSEStripsDeltaWhileBaselineKeepsTruth(t *testing.T) {
 	forwarded := pipelineMessages(29, 6)
 	meta := newRequestMeta(3, "sse-delta-strip")
 	meta.PressureDecision = pressureDecision{Available: true}
-	markForwardedPressureCoordinates(meta, forwardedPressureBody(t, system, tools, forwarded))
+	markForwardedPressureCoordinates(meta, forwardedPressureBody(t, system, tools, forwarded), nil)
 
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
@@ -300,7 +300,7 @@ func TestHandleSSEPressureBaseline(t *testing.T) {
 	forwarded := pipelineMessages(37, 6)
 	meta := newRequestMeta(1, "sse-cache")
 	meta.PressureDecision = pressureDecision{Available: true}
-	markForwardedPressureCoordinates(meta, forwardedPressureBody(t, system, tools, forwarded))
+	markForwardedPressureCoordinates(meta, forwardedPressureBody(t, system, tools, forwarded), nil)
 	if !meta.PressureDecision.ForwardedCoordinatesBound {
 		t.Fatalf("forwarded 坐标未绑定: %+v", meta.PressureDecision)
 	}
@@ -340,7 +340,7 @@ func TestHandleJSONPressureBaseline(t *testing.T) {
 	forwarded := pipelineMessages(41, 6)
 	meta := newRequestMeta(2, "json-cache")
 	meta.PressureDecision = pressureDecision{Available: true}
-	markForwardedPressureCoordinates(meta, forwardedPressureBody(t, system, tools, forwarded))
+	markForwardedPressureCoordinates(meta, forwardedPressureBody(t, system, tools, forwarded), nil)
 	if !meta.PressureDecision.ForwardedCoordinatesBound {
 		t.Fatalf("forwarded 坐标未绑定: %+v", meta.PressureDecision)
 	}
@@ -1056,7 +1056,7 @@ func TestUnchangedForwardedBodyBindsExactPressureBaseline(t *testing.T) {
 		MessagesPrefixFingerprint: fingerprintMessagesPrefix(forwarded, len(forwarded)),
 	}
 
-	markForwardedPressureCoordinates(meta, forwardedPressureBody(t, system, tools, forwarded))
+	markForwardedPressureCoordinates(meta, forwardedPressureBody(t, system, tools, forwarded), nil)
 	if meta.PressureDecision.ForwardedCoordinatesChanged || !meta.PressureDecision.ForwardedCoordinatesBound {
 		t.Fatalf("未改写的 body 应为 changed=false bound=true: %+v", meta.PressureDecision)
 	}
@@ -1104,7 +1104,7 @@ func TestForwardedRewriteBindsExactPressureBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	markForwardedPressureCoordinates(meta, body)
+	markForwardedPressureCoordinates(meta, body, nil)
 	if !meta.PressureDecision.ForwardedCoordinatesChanged || !meta.PressureDecision.ForwardedCoordinatesBound {
 		t.Fatalf("forwarded 坐标变化未被绑定: %+v", meta.PressureDecision)
 	}
@@ -1150,7 +1150,7 @@ func TestMalformedForwardedBodyDoesNotWritePressureBaseline(t *testing.T) {
 		MessagesPrefixFingerprint: strings.Repeat("a", 64),
 	}
 
-	markForwardedPressureCoordinates(meta, []byte(`{"messages":`))
+	markForwardedPressureCoordinates(meta, []byte(`{"messages":`), nil)
 	if !meta.PressureDecision.ForwardedCoordinatesChanged || meta.PressureDecision.ForwardedCoordinatesBound {
 		t.Fatalf("malformed body incorrectly bound: %+v", meta.PressureDecision)
 	}

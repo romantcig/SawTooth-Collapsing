@@ -498,7 +498,7 @@ func (s *Server) forwardRaw(w http.ResponseWriter, r *http.Request, meta *reques
 
 	model := extractModelFromBody(body)
 	messageCount := countMessages(body)
-	markForwardedPressureCoordinates(meta, body)
+	markForwardedPressureCoordinates(meta, body, s.TokenCounter)
 	stream := streamRequest(body)
 	meta.logEntry(model, messageCount)
 	logger.Info("上游请求发送",
@@ -624,7 +624,10 @@ func upstreamFailureState(decision upstreamFailureDecision, committed bool, fall
 // system/tools/messages。压缩、桩化、Archive 注入或 orphan repair 改写消息时，
 // ForwardedCoordinatesChanged 仍记录这一事实，但 actual 现在绑定到改写后的真实坐标，
 // 而不是被 max(actual, selected) 人为抬成 conservative floor。
-func markForwardedPressureCoordinates(meta *requestMeta, body []byte) {
+// 同点补算转发 wire 的本地全量估算（messages + system + tools，口径与
+// buildPressureDecision 的 FullLocalEstimate 一致），供响应侧与 actual 配对写入
+// 校准样本；此处只暂存，绝不单独写样本。
+func markForwardedPressureCoordinates(meta *requestMeta, body []byte, tc *TokenCounter) {
 	if meta == nil || !meta.PressureDecision.Available {
 		return
 	}
@@ -675,6 +678,12 @@ func markForwardedPressureCoordinates(meta *requestMeta, body []byte) {
 	decision.ToolsFingerprint = toolsFingerprint
 	decision.MessagesPrefixFingerprint = messagesPrefixFingerprint
 	decision.ForwardedCoordinatesBound = true
+	if tc != nil {
+		decision.ForwardedLocalEstimate = saturatingAdd(
+			saturatingAdd(tc.CountMessagesTokens(messages), measureTopLevelTokens(payload["system"], tc)),
+			measureTopLevelTokens(payload["tools"], tc),
+		)
+	}
 }
 
 type pressureBaselineUpdateKind string
@@ -716,6 +725,10 @@ func (s *Server) applyPressureBaselineUsage(meta *requestMeta, actual int) bool 
 	if updated {
 		meta.BaselineUpdateKind = pressureBaselineUpdateExact
 	}
+	// estimate 与 actual 在同一响应点配对采集：只有完整响应（SSE 完整 / JSON
+	// 2xx 且 usage 可解析）且坐标已绑定才会到达这里，中断路径天然不写样本。
+	// baseline 因代际过期未被接受不影响配对正确性，样本照记。
+	s.Sawtooth.RecordCalibrationSample(stateKey, actual, decision.ForwardedLocalEstimate)
 	return updated
 }
 

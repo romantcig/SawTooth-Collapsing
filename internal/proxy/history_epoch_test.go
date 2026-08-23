@@ -332,7 +332,7 @@ func TestForwardedCoordinatesUsePositionSensitiveHistoryFingerprint(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	markForwardedPressureCoordinates(meta, body)
+	markForwardedPressureCoordinates(meta, body, nil)
 	if !meta.PressureDecision.ForwardedCoordinatesChanged {
 		t.Fatal("tool_use.input.cache_control 业务变化未使 forwarded 坐标失效")
 	}
@@ -382,7 +382,7 @@ func TestHistoryEpochStateIsolationAndLateResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	markForwardedPressureCoordinates(meta, lateBody)
+	markForwardedPressureCoordinates(meta, lateBody, nil)
 	if !meta.PressureDecision.ForwardedCoordinatesBound {
 		t.Fatalf("迟到响应的 forwarded 坐标未绑定: %+v", meta.PressureDecision)
 	}
