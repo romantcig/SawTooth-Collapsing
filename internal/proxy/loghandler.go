@@ -288,10 +288,14 @@ func renderRequestOutcome(snapshot requestOutcomeSnapshot, admission outcomeDisp
 	builder.WriteString(outcomeDisplayTime(snapshot).Format("15:04:05"))
 	builder.WriteString(" ST ")
 	builder.WriteString(trigger)
-	builder.WriteString("｜原因：")
-	builder.WriteString(reason)
-	builder.WriteString("｜动作：")
-	builder.WriteString(terminalActionPhrase(snapshot.Action))
+	if reason != "" {
+		builder.WriteString("｜原因：")
+		builder.WriteString(reason)
+	}
+	if !terminalActionRedundant(snapshot) {
+		builder.WriteString("｜动作：")
+		builder.WriteString(terminalActionPhrase(snapshot.Action))
+	}
 	builder.WriteString("｜结果：")
 	builder.WriteString(terminalResultPhrase(snapshot))
 	builder.WriteString("｜会话=")
@@ -303,6 +307,20 @@ func renderRequestOutcome(snapshot requestOutcomeSnapshot, admission outcomeDisp
 		builder.WriteString("｜详细记录未保存")
 	}
 	return builder.String()
+}
+
+// terminalActionRedundant 判定“动作”段是否与“未整理”同义反复：未触发且只是
+// 直接发送/原样转发时，动作段不携带任何新信息。
+func terminalActionRedundant(snapshot requestOutcomeSnapshot) bool {
+	if snapshot.TriggerReason != TriggerNone {
+		return false
+	}
+	switch snapshot.Action {
+	case outcomeActionDirect, outcomeActionPassthrough:
+		return true
+	default:
+		return false
+	}
 }
 
 // outcomeDisplayTime 优先使用结束时间；终端只显示本地 HH:MM:SS，不显示年月日和毫秒。
@@ -348,9 +366,9 @@ func terminalOutcomeQuiet(snapshot requestOutcomeSnapshot) bool {
 }
 
 // terminalTriggerPhrase 返回“是否触发”与自然中文原因；未完成判定时不假装已评估。
-// Terminal Policy：普通 direct 请求使用中性“上下文”结果，同一原因里携带
-// 判定值/阈值/来源与 API 完整输入的数值闭环；API 完整输入已超阈值时
-// 明确预告下一次连续主请求将整理，不再宣称“上下文仍有余量”。
+// Terminal Policy：未触发的请求只报“未整理”，判定数值与来源由 ctx_tokens 行承担；
+// 只有完整输入已超阈值时才追加一句不含数值的行为预告。原因为空表示无话可说，
+// 由 renderRequestOutcome 整段省略。
 func terminalTriggerPhrase(snapshot requestOutcomeSnapshot) (string, string) {
 	switch snapshot.Eligibility {
 	case outcomeEligibilityUnknown, outcomeEligibilityNotEvaluable:
@@ -358,24 +376,10 @@ func terminalTriggerPhrase(snapshot requestOutcomeSnapshot) (string, string) {
 	}
 	switch snapshot.TriggerReason {
 	case TriggerNone:
-		apiTotal := terminalAPITotalPhrase(snapshot)
 		if snapshot.APIUsageKnown && snapshot.PressureThresholdTokens > 0 && snapshot.APITotalInputTokens > snapshot.PressureThresholdTokens {
-			reason := terminalPressurePhrase(snapshot)
-			if reason != "" {
-				reason += "，"
-			}
-			return "上下文", reason + apiTotal + " 已超阈值，下一次连续主请求将整理"
+			return "未整理", "完整输入已超阈值，下一次连续主请求将整理"
 		}
-		if reason := terminalPressurePhrase(snapshot); reason != "" {
-			if apiTotal != "" {
-				return "上下文", reason + "，" + apiTotal
-			}
-			return "上下文", reason
-		}
-		if apiTotal != "" {
-			return "上下文", apiTotal
-		}
-		return "上下文", "本轮未整理"
+		return "未整理", ""
 	case TriggerTokens:
 		return "已触发", "上下文接近上限" + terminalTriggerDetailPhrase(snapshot)
 	case TriggerPause:

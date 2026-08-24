@@ -397,8 +397,19 @@ func TestTerminalOutcomeRendererMatrix(t *testing.T) {
 				snapshot.APICacheCreationTokens = 205506
 				snapshot.APITotalInputTokens = 205508
 			},
-			want: []string{"上下文", "判定 126403/150000", "API 完整输入 205508 已超阈值", "下一次连续主请求将整理"},
-			notWant: []string{"未触发", "上下文仍有余量"},
+			want:    []string{"未整理", "已超阈值", "下一次连续主请求将整理"},
+			notWant: []string{"未触发", "上下文仍有余量", "判定 126403/150000", "API 完整输入 205508", "本地估算", "｜动作："},
+		},
+		{
+			name: "未触发且直接发送时省略原因与动作段",
+			mutate: func(snapshot *requestOutcomeSnapshot) {
+				snapshot.TriggerReason = TriggerNone
+				snapshot.Action = outcomeActionDirect
+				snapshot.UpstreamState = upstreamStateTransportFailure
+				snapshot.UpstreamStatus = 0
+			},
+			want:    []string{"ST 未整理｜结果：未能连接上游"},
+			notWant: []string{"｜原因：", "｜动作："},
 		},
 		{
 			name:   "令牌触发整理",
