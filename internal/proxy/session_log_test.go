@@ -20,7 +20,7 @@ func TestSessionLogRoutesProcessAndSession(t *testing.T) {
 
 	logger.Info("启动代理", "component", "proxy")
 	logger.With("request_session_id", secret, "request_id", uint64(27)).Debug("request_in", "status", 200)
-	logger.With("request_session_id", secret, "request_id", uint64(27)).Warn("上游返回非 2xx", "status", 502)
+	logger.With("request_session_id", secret, "request_id", uint64(27)).Warn(eventKeyUpstreamNon2xx, "status", 502)
 
 	process := readSessionLogFile(t, filepath.Join(dataDir, "logs", "process.log"))
 	sessionPath := filepath.Join(dataDir, "logs", stableSessionHash(secret)+".log")
@@ -38,7 +38,7 @@ func TestSessionLogRoutesProcessAndSession(t *testing.T) {
 	if !strings.Contains(session, "[DEBUG] #27 request_in status=200") {
 		t.Fatalf("session.log 缺少紧凑 request 关联: %q", session)
 	}
-	if !strings.Contains(session, "[WARN] #27 上游返回非 2xx status=502") {
+	if !strings.Contains(session, "[WARN] #27 upstream_non2xx status=502") {
 		t.Fatalf("session.log Warn 标签格式错误: %q", session)
 	}
 	if strings.Contains(session, "[INFO]") || strings.Contains(session, "\033[") {

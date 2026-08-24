@@ -881,7 +881,7 @@ func (s *Server) handleNon2xx(w http.ResponseWriter, resp *http.Response, meta *
 		requestOutcome(meta).SetFailureClass(persistenceFailureUpstream)
 		return upstreamResponseResult{err: err}
 	}
-	meta.Logger.Warn("上游返回非 2xx", "status", resp.StatusCode)
+	meta.Logger.Warn(eventKeyUpstreamNon2xx, "status", resp.StatusCode)
 	// 非 2xx 是明确的上游失败，绝不能因为下游成功写出而记成 success。
 	recordUpstreamOutcome(meta, upstreamStateNon2xx, resp.StatusCode)
 	requestOutcome(meta).SetFailureClass(persistenceFailureUpstream)

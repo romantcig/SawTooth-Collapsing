@@ -212,6 +212,13 @@ func TestLogHandlerTerminalTemplates(t *testing.T) {
 	if got != want {
 		t.Errorf("无模板事件键 = %q, want %q", got, want)
 	}
+
+	// 上游非 2xx 进入双轨机制：终端渲染中文 + 状态码，不再显示英文事件键。
+	got = emitLogRecord(t, h, &buf, slog.LevelWarn, eventKeyUpstreamNon2xx, slog.Int("status", 429))
+	want = logTestPrefix + "[WARN]  上游返回 429\n"
+	if got != want {
+		t.Errorf("upstream_non2xx 渲染 = %q, want %q", got, want)
+	}
 }
 
 // Test 6: Handler 契约——WithAttrs 预置 attr 出现在后续每行、
@@ -437,12 +444,11 @@ func TestTerminalOutcomeRendererMatrix(t *testing.T) {
 			want: []string{"结果：请求已完成", "本地状态未能保存到磁盘", "需要人工检查"},
 		},
 		{
-			name: "内存与磁盘均正常时不需要干预",
+			name: "内存与磁盘均正常时不再输出干预文案",
 			mutate: func(snapshot *requestOutcomeSnapshot) {
 				snapshot.Intervention = interventionNone
 			},
-			want:    []string{"无需人工处理"},
-			notWant: []string{"需要人工检查"},
+			notWant: []string{"需要人工检查", "无需人工处理", "，，", "，｜会话="},
 		},
 	}
 

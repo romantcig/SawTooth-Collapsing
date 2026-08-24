@@ -45,6 +45,7 @@ const (
 	eventKeyRequestIn        = "request_in"
 	eventKeyRequestForwarded = "request_forwarded"
 	eventKeyAuxiliaryPass    = "auxiliary_passthrough"
+	eventKeyUpstreamNon2xx   = "upstream_non2xx"
 )
 
 // terminalTemplates 是高频事件键的终端渲染模板。占位符 {key} 从 record attrs
@@ -55,6 +56,7 @@ var terminalTemplates = map[string]string{
 	eventKeyRequestIn:        "▸ 请求进入",
 	eventKeyRequestForwarded: "→ 上游发送",
 	eventKeyAuxiliaryPass:    "辅助直通",
+	eventKeyUpstreamNon2xx:   "上游返回 {status}",
 }
 
 // terminalTemplatePlaceholder 匹配模板中的 {key} 占位符。
@@ -469,8 +471,10 @@ func terminalResultPhrase(snapshot requestOutcomeSnapshot) string {
 		builder.WriteString("，")
 		builder.WriteString(persistence)
 	}
-	builder.WriteString("，")
-	builder.WriteString(terminalInterventionPhrase(snapshot.Intervention))
+	if intervention := terminalInterventionPhrase(snapshot.Intervention); intervention != "" {
+		builder.WriteString("，")
+		builder.WriteString(intervention)
+	}
 	return builder.String()
 }
 
@@ -519,7 +523,7 @@ func terminalInterventionPhrase(state interventionState) string {
 	case interventionUnknown:
 		return "是否需要人工处理待确认"
 	default:
-		return "无需人工处理"
+		return ""
 	}
 }
 
