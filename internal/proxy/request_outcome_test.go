@@ -221,7 +221,7 @@ func TestContextTokensOutcomeLine(t *testing.T) {
 	var buf bytes.Buffer
 	meta := newRequestMeta(5, "context-line-session")
 	meta.Logger = slog.New(slog.NewTextHandler(&buf, nil)).With("request_id", 5)
-	meta.PressureDecision = pressureDecision{Available: true, SelectedPressure: 41583, Threshold: 150000}
+	meta.PressureDecision = pressureDecision{Available: true, SelectedPressure: 41583, Threshold: 150000, Source: pressureSourceLocalFull}
 
 	recordAPIUsageOutcome(meta, map[string]any{
 		"input_tokens":          float64(2),
@@ -235,11 +235,22 @@ func TestContextTokensOutcomeLine(t *testing.T) {
 		"read=41956",
 		"sel=41583",
 		"thr=150000",
+		"src=（本地估算）",
 		"request_id=5",
 	} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("ctx_tokens 行缺少 %q: %s", want, line)
 		}
+	}
+
+	// 来源未知时 src 为空值，终端模板据此整段省略括号。
+	buf.Reset()
+	unknownSource := newRequestMeta(7, "context-line-session")
+	unknownSource.Logger = slog.New(slog.NewTextHandler(&buf, nil))
+	unknownSource.PressureDecision = pressureDecision{Available: true, SelectedPressure: 41583, Threshold: 150000}
+	recordAPIUsageOutcome(unknownSource, map[string]any{"input_tokens": float64(2)})
+	if !strings.Contains(buf.String(), `src=""`) {
+		t.Fatalf("来源未知时 src 应为空值: %s", buf.String())
 	}
 
 	// 缓存写分项作为 write kv 记录。

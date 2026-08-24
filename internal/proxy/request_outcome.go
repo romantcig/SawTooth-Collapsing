@@ -939,6 +939,7 @@ func recordAPIUsageOutcome(meta *requestMeta, usage map[string]any) {
 		"read", read,
 		"sel", decision.SelectedPressure,
 		"thr", decision.Threshold,
+		"src", terminalPressureSourceSuffix(decision.Source),
 		LogDim,
 	)
 }

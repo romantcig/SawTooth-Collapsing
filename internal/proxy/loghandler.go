@@ -52,7 +52,7 @@ const (
 // 取值；模板未引用的 kv 与 WithAttrs 预置段终端不渲染、文件侧照存；
 // 无模板项的事件键终端原样显示（兜底，不丢日志）。
 var terminalTemplates = map[string]string{
-	eventKeyCtxTokens:        "上下文总Tokens={total}（输入{in}｜缓存写{write}｜缓存读{read}）判定={sel}/{thr}",
+	eventKeyCtxTokens:        "上下文总Tokens={total}（输入{in}｜缓存写{write}｜缓存读{read}）判定={sel}/{thr}{src}",
 	eventKeyRequestIn:        "▸ 请求进入",
 	eventKeyRequestForwarded: "→ 上游发送",
 	eventKeyAuxiliaryPass:    "辅助直通",
@@ -438,6 +438,16 @@ func terminalPressureSourcePhrase(source pressureSource) string {
 	default:
 		return ""
 	}
+}
+
+// terminalPressureSourceSuffix 把来源渲染成带括号的行尾后缀。括号随值走而不写进
+// 模板：老大要靠 ctx_tokens 这一行同时看到估算值 sel 与实际值 total 来判断本地估算
+// 是否抽风，来源未知时整段消失即可，无需在通用模板渲染器里加特例。
+func terminalPressureSourceSuffix(source pressureSource) string {
+	if phrase := terminalPressureSourcePhrase(source); phrase != "" {
+		return "（" + phrase + "）"
+	}
+	return ""
 }
 
 func terminalActionPhrase(action outcomeAction) string {

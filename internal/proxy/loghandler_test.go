@@ -179,10 +179,20 @@ func TestLogHandlerTerminalTemplates(t *testing.T) {
 
 	got := emitLogRecord(t, h, &buf, slog.LevelInfo, eventKeyCtxTokens,
 		slog.Int("total", 1200), slog.Int("in", 1200), slog.Int("write", 0), slog.Int("read", 0),
-		slog.Int("sel", 1260), slog.Int("thr", 16000), slog.String("extra", "hidden"))
-	want := logTestPrefix + "[INFO]  上下文总Tokens=1200（输入1200｜缓存写0｜缓存读0）判定=1260/16000\n"
+		slog.Int("sel", 1260), slog.Int("thr", 16000), slog.String("src", "（本地估算）"),
+		slog.String("extra", "hidden"))
+	want := logTestPrefix + "[INFO]  上下文总Tokens=1200（输入1200｜缓存写0｜缓存读0）判定=1260/16000（本地估算）\n"
 	if got != want {
 		t.Errorf("ctx_tokens 渲染 = %q, want %q", got, want)
+	}
+
+	// 来源未知时 src 为空串：行尾既不出现空括号，也不残留占位符字面量。
+	got = emitLogRecord(t, h, &buf, slog.LevelInfo, eventKeyCtxTokens,
+		slog.Int("total", 1200), slog.Int("in", 1200), slog.Int("write", 0), slog.Int("read", 0),
+		slog.Int("sel", 1260), slog.Int("thr", 16000), slog.String("src", ""))
+	want = logTestPrefix + "[INFO]  上下文总Tokens=1200（输入1200｜缓存写0｜缓存读0）判定=1260/16000\n"
+	if got != want {
+		t.Errorf("来源未知的 ctx_tokens 渲染 = %q, want %q", got, want)
 	}
 
 	got = emitLogRecord(t, h, &buf, slog.LevelDebug, eventKeyRequestIn,
@@ -203,7 +213,7 @@ func TestLogHandlerTerminalTemplates(t *testing.T) {
 
 	// 占位符缺 attr 时保留原样（兜底可见）；无模板事件键原样显示 + attrs。
 	got = emitLogRecord(t, h, &buf, slog.LevelInfo, eventKeyCtxTokens)
-	want = logTestPrefix + "[INFO]  上下文总Tokens={total}（输入{in}｜缓存写{write}｜缓存读{read}）判定={sel}/{thr}\n"
+	want = logTestPrefix + "[INFO]  上下文总Tokens={total}（输入{in}｜缓存写{write}｜缓存读{read}）判定={sel}/{thr}{src}\n"
 	if got != want {
 		t.Errorf("缺 attr 的模板渲染 = %q, want %q", got, want)
 	}
