@@ -183,7 +183,10 @@ func TestArchiveRecoveryE2EFailedCommitLeavesNoRecoverableID(t *testing.T) {
 	server.archiveCommitter = committer
 
 	const sessionID = "archive-recovery-failed"
-	serveOutcomeMessages(t, server, sessionID, pipelineMessages(80, 260))
+	// fixture 压力须落在 (折叠触发线, emergency 拒发线) 区间内：local_full 乘校准
+	// 后要越 threshold 触发破坏性压缩，但不得超过 threshold+10k，否则归档失败会
+	// 走 fail-closed 503（不发上游），captured 为空。
+	serveOutcomeMessages(t, server, sessionID, pipelineMessages(80, 130))
 
 	if committer.count() == 0 {
 		t.Fatal("未尝试同步 Archive 提交")

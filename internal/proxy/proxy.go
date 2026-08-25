@@ -1050,6 +1050,12 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		selectPressure := func(candidate []Message) pressureDecision {
 			pressureMessages := finalizeMessages(candidate)
 			selected := buildPressureDecision(pressureMessages, bodyMap["system"], bodyMap["tools"], baseline, s.TokenCounter, threshold)
+			if selected.Source == pressureSourceLocalFull && s.Sawtooth != nil {
+				// local_full 是本地估算直比 threshold；实测 cl100k 系统性低估
+				// 1.5~1.6 倍，不乘校准系数会在断流期（baseline 无法刷新）持续
+				// 漏判，直到本地估算追上 threshold——对应真实约 1.6×threshold。
+				selected.SelectedPressure = int(float64(selected.SelectedPressure) * s.Sawtooth.CalibrationRatio(stateKey))
+			}
 			if s.Sawtooth != nil {
 				triggerEvaluation = s.Sawtooth.Evaluate(stateKey, selected.SelectedPressure, time.Now())
 			} else {

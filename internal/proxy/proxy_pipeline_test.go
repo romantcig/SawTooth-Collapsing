@@ -1556,8 +1556,12 @@ func TestHandleMessagesPressureBaselineReset(t *testing.T) {
 
 			servePipelineRequestWith(t, server, sessionID, tc.messages, map[string]any{"system": system, "tools": tools}, nil)
 
-			if captured.Source != pressureSourceLocalFull || captured.ResetReason != tc.wantReason || captured.SelectedPressure != captured.FullLocalEstimate {
-				t.Fatalf("reset decision=%+v, want reason=%q", captured, tc.wantReason)
+			// local_full 判定在生产路径乘校准系数；本用例判定发生在冷启动
+			// （样本窗口为空），故用常数 1.50。断言不能用 CalibrationRatio——
+			// 完整响应已写入首个校准样本，窗口中位数在断言时刻已经漂移。
+			wantSelected := int(float64(captured.FullLocalEstimate) * defaultCalibrationRatio)
+			if captured.Source != pressureSourceLocalFull || captured.ResetReason != tc.wantReason || captured.SelectedPressure != wantSelected {
+				t.Fatalf("reset decision=%+v, want reason=%q selected=%d", captured, tc.wantReason, wantSelected)
 			}
 			if captured.TriggerReason != TriggerNone || captured.CompressDecision {
 				t.Fatalf("失效旧 actual 被重新引入 trigger: %+v", captured)
@@ -1581,7 +1585,9 @@ func TestHandleMessagesCollapseThenRestore(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newPipelineTestServer(t, upstream.URL)
+	// threshold 抬到 18000 让两轮落在正确区间：第一轮 raw 校准后越线触发折叠；
+	// 第二轮 frozen+tail 候选校准后（≈16.5k）仍低于线，不重压缩、不新增 archive。
+	server := newPipelineTestServerWithThreshold(t, upstream.URL, 18000)
 	history := pipelineMessages(300, 80)
 	raw := append([]Message{pipelinePersistentContextMessage(t, "context-A")}, history...)
 	servePipelineRequest(t, server, "thread-restore", raw)
@@ -2736,7 +2742,10 @@ func TestArchiveFailurePreservesOriginalOrFailsClosed(t *testing.T) {
 		committer := &failingArchiveCommitter{}
 		server.archiveCommitter = committer
 
-		messages := pipelineMessages(80, 260)
+		// fixture 压力须落在 (折叠触发线, emergency 拒发线) 区间：local_full 乘
+		// 校准后要越 threshold 触发压缩尝试，但不得超过 threshold+10k，否则归档
+		// 失败会 fail-closed 503 而非本分支要测的"保留原文"路径。
+		messages := pipelineMessages(80, 130)
 		recorder := serveOutcomeMessages(t, server, "archive-fail-preserve", messages)
 		if recorder.Code != http.StatusOK {
 			t.Fatalf("status=%d, want 200 body=%s", recorder.Code, recorder.Body.String())

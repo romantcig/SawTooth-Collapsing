@@ -274,6 +274,100 @@ func roleFor(i int) string {
 	return "user"
 }
 
+// ── local_full 判定乘校准系数（P0：断流期漏判链）──
+
+// 冷启动 local_full 判定必须乘上校准系数再比 threshold。实测本地估算系统性
+// 低估 1.5~1.6 倍，不乘系数时断流/429 常态下（baseline 无法刷新）会持续漏判
+// 到真实 ~1.6×threshold 才触发，中途撞上游 prompt-too-long。
+func TestLocalFullPressureAppliesCalibrationRatio(t *testing.T) {
+	const (
+		sessionID = "local-full-calibration"
+		threshold = 150000
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":10,"output_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServerWithThreshold(t, upstream.URL, threshold)
+	server.searchAndExpandFn = func(current []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, meta *requestMeta) RecallOutcome {
+		return RecallOutcome{Messages: current}
+	}
+
+	// 本地估算约 threshold 的 0.6~0.9 倍区间：乘 1.50 后越过阈值、裸估算则不越。
+	// fixture 先量出单条 token 数，再按目标精确铺条数。
+	tc := server.TokenCounter
+	perMessage := tc.CountMessageTokens(Message{Role: "user", Content: mustMarshal(strings.Repeat("context ", 40))})
+	count := int(float64(threshold)*0.7) / perMessage
+	if count < 2 {
+		t.Fatalf("fixture 条数异常: perMessage=%d count=%d", perMessage, count)
+	}
+	messages := make([]Message, 0, count+1)
+	for i := 0; i < count; i++ {
+		messages = append(messages, Message{Role: roleFor(i), Content: mustMarshal(strings.Repeat("context ", 40))})
+	}
+	rawEstimate := tc.CountMessagesTokens(messages) + measureTopLevelTokens(nil, tc) + measureTopLevelTokens(nil, tc)
+	ratio := server.Sawtooth.CalibrationRatio(sessionID) // 冷启动 = defaultCalibrationRatio
+	if rawEstimate >= threshold || rawEstimate <= threshold/2 {
+		t.Fatalf("fixture 本地全量估算=%d 应落在 (%d, %d] 区间内", rawEstimate, threshold/2, threshold)
+	}
+
+	var decision pressureDecision
+	capture := server.searchAndExpandFn
+	server.searchAndExpandFn = func(current []Message, store *SQLiteStore, limit int, counter *TokenCounter, budget *Budget, meta *requestMeta) RecallOutcome {
+		out := capture(current, store, limit, counter, budget, meta)
+		decision = meta.PressureDecision
+		return out
+	}
+	servePipelineRequest(t, server, sessionID, messages)
+
+	if decision.Source != pressureSourceLocalFull {
+		t.Fatalf("应为 local_full 冷启动判定: source=%s", decision.Source)
+	}
+	want := int(float64(decision.FullLocalEstimate) * ratio)
+	if decision.SelectedPressure != want {
+		t.Fatalf("SelectedPressure=%d, want FullLocalEstimate×ratio = %d×%.2f = %d",
+			decision.SelectedPressure, decision.FullLocalEstimate, ratio, want)
+	}
+	if decision.SelectedPressure <= threshold {
+		t.Fatalf("乘系数后应越过阈值触发折叠: pressure=%d threshold=%d", decision.SelectedPressure, threshold)
+	}
+	if got := archiveCount(t, server.Store); got != 1 {
+		t.Fatalf("应产生 collapse archive: %d", got)
+	}
+}
+
+// actual_plus_delta 与 conservative_high_water 是真实口径，绝不能再乘校准系数。
+func TestCalibratedSourcesSkipRatio(t *testing.T) {
+	const sessionID = "calibrated-sources-skip-ratio"
+	st := NewSawtoothTrigger(time.Minute, 1000, 500)
+	for i := 0; i < calibrationSampleWindow; i++ {
+		st.RecordCalibrationSample(sessionID, 300, 100) // ratio 样本 3.0 → clamp 1.80
+	}
+	baseline := pressureBaseline{
+		ActualTokens:              900,
+		MessageCount:              2,
+		SystemFingerprint:         fingerprintTopLevelJSON(nil),
+		ToolsFingerprint:          fingerprintTopLevelJSON(nil),
+		MessagesPrefixFingerprint: fingerprintMessagesPrefix(pipelineMessages(2, 4), 2),
+		Available:                 true,
+	}
+	messages := append(pipelineMessages(2, 4), pipelineMessages(2, 4)...)
+	tc, err := NewTokenCounter()
+	if err != nil {
+		t.Fatalf("NewTokenCounter: %v", err)
+	}
+	decision := buildPressureDecision(messages, nil, nil, baseline, tc, 1000)
+	if decision.Source != pressureSourceActualPlusDelta {
+		t.Fatalf("fixture 应落 actual_plus_delta: %s", decision.Source)
+	}
+	if decision.SelectedPressure != decision.PreviousActual+decision.NewMessageDelta {
+		t.Fatalf("actual_plus_delta 不得被校准系数改写: %d ≠ %d+%d",
+			decision.SelectedPressure, decision.PreviousActual, decision.NewMessageDelta)
+	}
+}
+
 func messageWithAtLeastTokens(t *testing.T, tc *TokenCounter, role string, target int) Message {
 	t.Helper()
 	words := target
