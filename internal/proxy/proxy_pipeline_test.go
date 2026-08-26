@@ -2745,7 +2745,9 @@ func TestArchiveFailurePreservesOriginalOrFailsClosed(t *testing.T) {
 		// fixture 压力须落在 (折叠触发线, emergency 拒发线) 区间：local_full 乘
 		// 校准后要越 threshold 触发压缩尝试，但不得超过 threshold+10k，否则归档
 		// 失败会 fail-closed 503 而非本分支要测的"保留原文"路径。
-		messages := pipelineMessages(80, 130)
+		// 加权字符口径下 80 条 × 85 词 ≈14560 tok，×冷启动 1.50 ≈21840，
+		// 落在 (16000, 26000) 内；旧词表口径的 130 词已超上界。
+		messages := pipelineMessages(80, 85)
 		recorder := serveOutcomeMessages(t, server, "archive-fail-preserve", messages)
 		if recorder.Code != http.StatusOK {
 			t.Fatalf("status=%d, want 200 body=%s", recorder.Code, recorder.Body.String())

@@ -8,6 +8,65 @@ import (
 	"testing"
 )
 
+// TestTokenCounterWeights 按四档权重规则断言比例关系，不写精确值断言。
+func TestTokenCounterWeights(t *testing.T) {
+	tc := mustTokenCounter(t)
+
+	t.Run("空串", func(t *testing.T) {
+		if got := tc.CountTokens(""); got != 0 {
+			t.Fatalf("空串期望 0，得到 %d", got)
+		}
+	})
+
+	t.Run("纯ASCII每字符0.25即4字符1token", func(t *testing.T) {
+		if got := tc.CountTokens("abcd"); got != 1 {
+			t.Fatalf("4 个 ASCII 字符期望 1 token，得到 %d", got)
+		}
+		if a, b := tc.CountTokens(strings.Repeat("a", 40)), tc.CountTokens(strings.Repeat("a", 80)); b != 2*a {
+			t.Fatalf("纯 ASCII 应线性: %d 字符=%d, %d 字符=%d", 40, a, 80, b)
+		}
+	})
+
+	t.Run("JSON结构字符是普通ASCII的1/8", func(t *testing.T) {
+		structural := tc.CountTokens("{}[],:\"/")   // 8×0.125 = 1 → ceil 1
+		plain := tc.CountTokens("abcdefgh")         // 8×0.25 = 2 → ceil 2
+		if plain != 2*structural {                  // 结构档恰为 ASCII 档一半
+			t.Fatalf("8 个普通 ASCII 字符(%d) 应为 8 个 JSON 结构字符(%d) 的两倍", plain, structural)
+		}
+		if got := tc.CountTokens("::::"); got != 1 { // 4×0.125=0.5 → ceil=1
+			t.Fatalf("4 个冒号期望向上取整为 1，得到 %d", got)
+		}
+	})
+
+	t.Run("CJK与中英混合", func(t *testing.T) {
+		cjkOnly := tc.CountTokens("你好世界") // 4 rune × 1.0 = 4
+		if cjkOnly != 4 {
+			t.Fatalf("4 个汉字期望 4 token（1.0/rune），得到 %d", cjkOnly)
+		}
+		mixed := tc.CountTokens("ab你好cd")
+		pureParts := tc.CountTokens("ab") + tc.CountTokens("cd")
+		if mixed <= pureParts {
+			t.Fatalf("中英混合(%d)应显著高于等量 ASCII(%d)", mixed, pureParts)
+		}
+	})
+
+	t.Run("emoji权重高于CJK", func(t *testing.T) {
+		emoji := tc.CountTokens("\U0001F600\U0001F600\U0001F600\U0001F600") // 4 × 2.0 = 8
+		cjk := tc.CountTokens("你好世界")                                     // 4 × 1.0 = 4
+		if emoji <= cjk {
+			t.Fatalf("同数量 emoji(%d) 权重应高于 CJK(%d)", emoji, cjk)
+		}
+	})
+
+	t.Run("单字符向上取整", func(t *testing.T) {
+		for _, s := range []string{"a", "你", "\U0001F600"} {
+			if got := tc.CountTokens(s); got < 1 {
+				t.Fatalf("单字符 %q 期望 ≥1，得到 %d", s, got)
+			}
+		}
+	})
+}
+
 func TestTokenCounterMultimodalNestedToolResult(t *testing.T) {
 	tc := mustTokenCounter(t)
 	imageData := base64.StdEncoding.EncodeToString(testImageHeader("image/png", 1920, 897))
@@ -43,6 +102,19 @@ func TestTokenCounterImageFormatsAndBoundedPayload(t *testing.T) {
 				t.Fatalf("超长 payload 改变头部语义估算: short=%d long=%d", short, long)
 			}
 		})
+	}
+}
+
+// TestTokenCounterHugeBase64ScreenshotBounded 计划 §4.2：>1MB 截图不得打穿折叠系统。
+func TestTokenCounterHugeBase64ScreenshotBounded(t *testing.T) {
+	tc := mustTokenCounter(t)
+	hugePNG := base64.StdEncoding.EncodeToString(testPNGHeader(800, 600)) + strings.Repeat("A", 3_000_000)
+	msg := multimodalToolResultMessage(t, []any{
+		map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": hugePNG}},
+	})
+	got := tc.CountMessageTokens(msg)
+	if got <= 0 || got > maxSemanticBlockTokens+32 {
+		t.Fatalf(">1MB 截图估算=%d，超出封顶上限 %d", got, maxSemanticBlockTokens+32)
 	}
 }
 

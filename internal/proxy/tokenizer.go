@@ -5,33 +5,54 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
-	"fmt"
-
-	"github.com/pkoukk/tiktoken-go"
+	"math"
+	"unicode"
+	"unicode/utf8"
 )
 
-// TokenCounter tiktoken-go 封装，统一 token 计数接口。
-// 在 Server 启动时初始化一次，避免每次请求重复加载编码器词表。
-type TokenCounter struct {
-	enc *tiktoken.Tiktoken
-}
+// TokenCounter 加权字符计数估算器，统一 token 计数接口。
+// Anthropic 词表未公开，且本项目的绝对精度需求由 CalibrationRatio
+// 滚动校准吸收；估算器只需单调一致性（同输入同输出），无需贴近真实分词。
+type TokenCounter struct{}
 
-// NewTokenCounter 初始化 cl100k_base 编码器。
-// cl100k_base 是最接近 Claude API 的通用 BPE 编码，与 GPT-4/Claude 共用同一词表。
+// NewTokenCounter 保留 (tc, error) 签名：nil 表示管线关闭的语义不变。
 func NewTokenCounter() (*TokenCounter, error) {
-	enc, err := tiktoken.GetEncoding(tiktoken.MODEL_CL100K_BASE)
-	if err != nil {
-		return nil, fmt.Errorf("初始化 tiktoken 编码器失败: %w", err)
-	}
-	return &TokenCounter{enc: enc}, nil
+	return &TokenCounter{}, nil
 }
 
-// CountTokens 计算文本的 token 数量。
-// 使用 cl100k_base 编码器，无特殊 token 处理。
-// 空字符串返回 0。
+// CountTokens 按加权字符启发式估算 token 数量。
+// 权重分四档：JSON 结构字符 0.125、其余 ASCII 0.25、CJK 与其余非 ASCII 兜底 1.0、emoji 2.0，
+// 结果向上取整，空字符串返回 0。单次遍历，无分配。
+// CJK 初版取 1.2，真实录制语料的密度方差 CV 超验收线（0.39>0.35），降至 1.0 后
+// 收敛——档位间距是方差主项，绝对偏差交给 CalibrationRatio 吸收。
 func (tc *TokenCounter) CountTokens(text string) int {
-	tokens := tc.enc.Encode(text, nil, nil)
-	return len(tokens)
+	if text == "" {
+		return 0
+	}
+	var total float64
+	for _, r := range text {
+		switch {
+		case r < utf8.RuneSelf:
+			switch r {
+			case '{', '}', '[', ']', ',', ':', '"', '/':
+				total += 0.125
+			default:
+				total += 0.25
+			}
+		case isCJK(r):
+			total += 1.0
+		case r >= 0x1F000:
+			total += 2.0
+		default:
+			total += 1.0
+		}
+	}
+	return int(math.Ceil(total))
+}
+
+func isCJK(r rune) bool {
+	return unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) ||
+		unicode.Is(unicode.Katakana, r) || unicode.Is(unicode.Hangul, r)
 }
 
 // perMessageOverhead 是 Anthropic API 每条消息的角色标记和分隔符开销（token 估算）。
@@ -68,12 +89,6 @@ func (tc *TokenCounter) CountMessageTokens(msg Message) int {
 		return total
 	}
 	return total + tc.countSemanticContent(content)
-}
-
-// countToolResultTokens 递归计算 tool_result 内容的 token 数。
-// content 可以是字符串（纯文本结果）或 []any（嵌套 content blocks）。
-func countToolResultTokens(content any, tc *TokenCounter) int {
-	return tc.countSemanticContent(content)
 }
 
 func (tc *TokenCounter) countSemanticContent(content any) int {

@@ -43,7 +43,7 @@ func TestSawtoothCalibrationRatioColdStartClampAndWindow(t *testing.T) {
 	// clamp 下界：持续低样本
 	low := NewSawtoothTrigger(time.Minute, 1000, 500)
 	for i := 0; i < calibrationSampleWindow; i++ {
-		low.RecordCalibrationSample("thread", 100, 90) // ≈1.11
+		low.RecordCalibrationSample("thread", 50, 100) // 0.5，远低于过渡期下界
 	}
 	if got := low.CalibrationRatio("thread"); got != calibrationMinRatio {
 		t.Fatalf("低样本 ratio=%v, want clamp 下界 %v", got, calibrationMinRatio)
@@ -246,13 +246,14 @@ func TestCollapseCutoffWithBoundaryGuard(t *testing.T) {
 	})
 
 	t.Run("正常场景直通", func(t *testing.T) {
-		// floor 远小于总量时 cutoff 不会被 keepRecent 钳制，guard 一次成功，
-		// 结果与直接调用 CalcCollapseCutoff 完全一致。
+		// floor 选在窗口内时 cutoff 不会被 keepRecent 或 keepSafe 钳制，guard
+		// 第一轮即成功，结果与直接调用 CalcCollapseCutoff 完全一致。
+		// （floor 过小时尾部窗口条数不足 keepSafe=12，会误入逐级上调路径。）
 		messages := make([]Message, 0, 30)
 		for i := 0; i < 30; i++ {
 			messages = append(messages, messageWithAtLeastTokens(t, tc, roleFor(i), 100))
 		}
-		const floor = 2000
+		const floor = 3000
 		want := CalcCollapseCutoff(messages, floor, tc, 8)
 		if got := collapseCutoffWithBoundaryGuard(messages, floor, 60000, 8, tc); got != want {
 			t.Fatalf("guard=%d, want 直通 %d", got, want)

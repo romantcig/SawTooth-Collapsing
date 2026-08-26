@@ -371,8 +371,8 @@ func searchAndExpandWithMeta(messages []Message, store *SQLiteStore, tokenThresh
 			headCost := tc.CountTokens(prefix + truncated)
 			remaining := outcome.BudgetRemaining - headCost
 			if remaining > 0 {
-				// rune 预算 ≈ 2×token 预算：粗剪防格式化浪费，真门控靠下方 CountTokens 实测
-				if full, ok := formatFullMessages(summary.MessagesJSON, remaining*2); ok {
+				// rune 预算 ≈ token 预算（最高密度档 1.0 tok/rune）：粗剪防格式化浪费，真门控靠下方 CountTokens 实测
+				if full, ok := formatFullMessages(summary.MessagesJSON, remaining); ok {
 					candidate := prefix + truncated + "\n\n--- Full messages ---\n" + full
 					if cost := tc.CountTokens(candidate); canSpend(cost) {
 						payload = candidate

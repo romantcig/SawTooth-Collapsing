@@ -186,7 +186,9 @@ func TestArchiveRecoveryE2EFailedCommitLeavesNoRecoverableID(t *testing.T) {
 	// fixture 压力须落在 (折叠触发线, emergency 拒发线) 区间内：local_full 乘校准
 	// 后要越 threshold 触发破坏性压缩，但不得超过 threshold+10k，否则归档失败会
 	// 走 fail-closed 503（不发上游），captured 为空。
-	serveOutcomeMessages(t, server, sessionID, pipelineMessages(80, 130))
+	// 加权字符口径下 80 条 × 85 词估算 ≈14560 tok，×冷启动 1.50 ≈21840，
+	// 落在 (16000, 26000) 内；旧词表口径的 130 词已超上界。
+	serveOutcomeMessages(t, server, sessionID, pipelineMessages(80, 85))
 
 	if committer.count() == 0 {
 		t.Fatal("未尝试同步 Archive 提交")

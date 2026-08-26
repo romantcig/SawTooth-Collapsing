@@ -959,12 +959,14 @@ type pressureBaseline struct {
 // 的 epoch 清零不波及它（校准比率与会话历史无关），进程重启由冷启动常数兜底。
 const (
 	// defaultCalibrationRatio 是冷启动/样本不足时的常数：真实会话 101 个
-	// 非折叠请求的中位实测值（cl100k 估算系统性低估约 1.5 倍）。
+	// 非折叠请求的中位实测值（本地估算系统性低估约 1.5 倍）。
 	defaultCalibrationRatio = 1.50
 	// calibrationSampleWindow 是每个 stateKey 保留的 (actual, estimate) 比值数。
 	calibrationSampleWindow = 8
 	// calibrationMinRatio / calibrationMaxRatio 钳制滚动中位数的漂移范围。
-	calibrationMinRatio = 1.35
+	// 下界处于过渡期放宽值：加权字符口径的全局偏差预计显著低于旧词表口径
+	// 中位 1.588，不放宽会被下界钉死；样本稳定落在开区间内后再收回原值。
+	calibrationMinRatio = 1.10
 	calibrationMaxRatio = 1.80
 )
 
