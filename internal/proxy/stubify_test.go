@@ -102,15 +102,6 @@ func TestMessageUnknownFieldsFrozenRoundTripAndHashSensitivity(t *testing.T) {
 	assertJSONEquivalent(t, mustMarshalJSON(t, result.Messages), withJSON)
 }
 
-func mustMarshalJSON(t *testing.T, value any) []byte {
-	t.Helper()
-	data, err := json.Marshal(value)
-	if err != nil {
-		t.Fatalf("marshal JSON: %v", err)
-	}
-	return data
-}
-
 func assertJSONEquivalent(t *testing.T, got, want []byte) {
 	t.Helper()
 	var gotValue any
@@ -388,10 +379,7 @@ func TestExtractFallbackKeywordsAllFiltered(t *testing.T) {
 // ---- stubifyMessages end-to-end with deep_search ----
 
 func TestStubifyMessagesDeepSearchIntegration(t *testing.T) {
-	tc, _ := NewTokenCounter()
-	if tc == nil {
-		t.Skip("token counter not available")
-	}
+	tc := mustTokenCounter(t)
 
 	// 构造真实消息序列：assistant 发起 Read，user 返回 tool_result
 	messages := []Message{
@@ -521,10 +509,7 @@ func mustMarshalBlocks(blocks []ContentBlock) json.RawMessage {
 
 func TestStubifyThresholdGuardZero(t *testing.T) {
 	// threshold=0 时不触发守卫（向后兼容）
-	tc, _ := NewTokenCounter()
-	if tc == nil {
-		t.Skip("token counter not available")
-	}
+	tc := mustTokenCounter(t)
 	messages := []Message{
 		{Role: "user", Content: json.RawMessage(`"hello"`)},
 		{Role: "assistant", Content: json.RawMessage(`"hi there, this is a response with enough tokens to be meaningful"`)},
@@ -537,10 +522,7 @@ func TestStubifyThresholdGuardZero(t *testing.T) {
 
 func TestStubifyThresholdGuardActive(t *testing.T) {
 	// threshold > tokens → 提前返回（不 stub）
-	tc, _ := NewTokenCounter()
-	if tc == nil {
-		t.Skip("token counter not available")
-	}
+	tc := mustTokenCounter(t)
 	messages := []Message{
 		{Role: "user", Content: json.RawMessage(`"hello"`)},
 	}
@@ -558,33 +540,11 @@ func TestStubifyThresholdGuardActive(t *testing.T) {
 	}
 }
 
-func TestStubifyThresholdGuardInactive(t *testing.T) {
-	// threshold < tokens → 正常 stub
-	tc, _ := NewTokenCounter()
-	if tc == nil {
-		t.Skip("token counter not available")
-	}
-	messages := []Message{
-		{Role: "user", Content: json.RawMessage(`"hello"`)},
-		{Role: "assistant", Content: json.RawMessage(`"a longer response that will exceed the threshold"`)},
-	}
-	// threshold=1 远小于实际 token → 不触发守卫
-	_, stats := stubifyMessages(messages, tc, "", 0, false, nil, "test", 1, 0.0, 1)
-	// 消息数 > 1，至少 messages[0] 之后的会被 stub
-	if stats.OriginalTokens <= 1 {
-		t.Skip("test messages too short for meaningful threshold test")
-	}
-	// 守卫不应触发
-}
-
 // ---- Gap C: 80-token 硬底测试 ----
 
 func TestStubify80TokenFloorShortText(t *testing.T) {
 	// 短纯文本消息不应被 stub
-	tc, _ := NewTokenCounter()
-	if tc == nil {
-		t.Skip("token counter not available")
-	}
+	tc := mustTokenCounter(t)
 	// 构造一条短消息（"ok" 远小于 80 tokens）
 	messages := []Message{
 		{Role: "user", Content: json.RawMessage(`"hello"`)}, // messages[0] 受保护
@@ -611,10 +571,7 @@ func TestStubify80TokenFloorShortText(t *testing.T) {
 
 func TestStubify80TokenFloorShortWithToolUse(t *testing.T) {
 	// 短但含 tool_use 的消息仍需 stub
-	tc, _ := NewTokenCounter()
-	if tc == nil {
-		t.Skip("token counter not available")
-	}
+	tc := mustTokenCounter(t)
 	messages := []Message{
 		{Role: "user", Content: json.RawMessage(`"hello"`)},
 		{Role: "assistant", Content: mustMarshalBlocks([]ContentBlock{
@@ -796,4 +753,71 @@ func TestStubifyArchiveCoverage(t *testing.T) {
 	if strings.Contains(joined, "stub-archive") {
 		t.Fatalf("恢复引用泄漏 session: %s", joined)
 	}
+}
+
+func TestDecisionDetectionMatchesYesMemStructuralRules(t *testing.T) {
+	longAnalysis := strings.Repeat("analysis ", 60)
+	messages := []Message{
+		decisionAlignmentMessage(t, "assistant", longAnalysis),
+		decisionAlignmentMessage(t, "user", "Use option B."),
+		decisionAlignmentMessage(t, "user", "Should we use option C?"),
+	}
+
+	if !isDecisionMessage(messages, 1) {
+		t.Fatal("承接长分析的短 user 答复应识别为 decision")
+	}
+	if isDecisionMessage(messages, 2) {
+		t.Fatal("问句不应识别为 decision")
+	}
+}
+
+func TestDecisionUsesYesMemIntensityBoostWhenStubbed(t *testing.T) {
+	tracker := NewDecayTracker()
+	tc, err := NewTokenCounter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages := []Message{
+		decisionAlignmentMessage(t, "assistant", strings.Repeat("analysis ", 80)),
+		decisionAlignmentMessage(t, "user", "Use option B. "+strings.Repeat("decision detail ", 50)),
+		decisionAlignmentMessage(t, "assistant", strings.Repeat("ordinary explanation ", 100)),
+	}
+
+	_, stats := stubifyMessages(messages, tc, "", 0, false, tracker, "session", 0, 0, 1)
+	if !stats.IsDecision {
+		t.Fatal("stubify 未识别 YesMem 风格的 user decision")
+	}
+	if got := tracker.GetStage("session", 1, 8, len(messages), 3.0); got != DecayFresh {
+		t.Fatalf("decision 在 intensity boost 期间阶段 = %v，期望 %v", got, DecayFresh)
+	}
+	if got := tracker.GetStage("session", 2, 8, len(messages), 3.0); got != DecayMiddle {
+		t.Fatalf("普通消息阶段 = %v，期望 %v", got, DecayMiddle)
+	}
+}
+
+func TestApplyDecayBatchWritesBackMiddleAndOldText(t *testing.T) {
+	tracker := NewDecayTracker()
+	messages := []Message{
+		decisionAlignmentMessage(t, "user", "start"),
+		decisionAlignmentMessage(t, "assistant", strings.Repeat("historical detail ", 80)),
+	}
+	tracker.MarkStubbed("session", 1, 0, 0)
+
+	middle, _ := tracker.ApplyDecayBatch(messages, "session", 300, 100, nil, "", 6)
+	if bytes.Equal(middle[1].Content, messages[1].Content) {
+		t.Fatal("DecayMiddle 计算后未写回消息")
+	}
+	old, _ := tracker.ApplyDecayBatch(messages, "session", 300, 100, nil, "", 20)
+	if bytes.Equal(old[1].Content, messages[1].Content) {
+		t.Fatal("DecayOld 计算后未写回消息")
+	}
+}
+
+func decisionAlignmentMessage(t *testing.T, role, text string) Message {
+	t.Helper()
+	content, err := json.Marshal([]map[string]any{{"type": "text", "text": text}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Message{Role: role, Content: content}
 }

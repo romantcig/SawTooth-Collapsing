@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -500,6 +501,48 @@ func TestAgentSystemAttributionStrongFeature(t *testing.T) {
 			)
 			if got.Role != tt.wantRole || string(got.Reason) != tt.wantReason {
 				t.Fatalf("classification = %#v, want role=%q reason=%q", got, tt.wantRole, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestPhase08AgentIsolationMatrix(t *testing.T) {
+	tests := []struct {
+		name        string
+		extra       map[string]any
+		headers     map[string]string
+		wantSearch  int
+		wantArchive int
+	}{
+		{name: "CC 2.1.220 agent ID header", headers: map[string]string{"X-Claude-Code-Agent-Id": "ae62648d28a17ee1a"}},
+		{name: "billing subagent", headers: map[string]string{"x-anthropic-billing-header": "cch=1, cc_is_subagent=true"}},
+		{name: "agentContext subagent", extra: map[string]any{"agentContext": map[string]any{"agentType": "subagent", "parentSessionId": "parent-secret"}}},
+		{name: "system attribution subagent", extra: map[string]any{"system": []map[string]any{{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.207; cc_is_subagent=true"}}}},
+		{name: "unknown is main", wantSearch: 1, wantArchive: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":1}}`))
+			}))
+			defer upstream.Close()
+			server := newPipelineTestServer(t, upstream.URL)
+			searchCalls := 0
+			server.searchAndExpandFn = func(messages []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, _ *requestMeta) RecallOutcome {
+				searchCalls++
+				return RecallOutcome{Messages: messages}
+			}
+			raw := append([]Message{pipelinePersistentContextMessage(t, "agent-matrix")}, pipelineMessages(300, 80)...)
+			servePipelineRequestWith(t, server, "phase08-agent-"+strings.ReplaceAll(tt.name, " ", "-"), raw, tt.extra, tt.headers)
+			if searchCalls != tt.wantSearch {
+				t.Fatalf("SearchAndExpand calls=%d, want %d", searchCalls, tt.wantSearch)
+			}
+			if got := archiveCount(t, server.Store); got != tt.wantArchive {
+				t.Fatalf("Archive rows=%d, want %d", got, tt.wantArchive)
+			}
+			if tt.wantSearch == 0 && server.Frozen.LengthFor("phase08-agent-"+strings.ReplaceAll(tt.name, " ", "-")) != 0 {
+				t.Fatal("subagent 写入 Frozen")
 			}
 		})
 	}

@@ -200,7 +200,7 @@ func TestHandleSSEAutoDecompressedClearsContentEncoding(t *testing.T) {
 }
 
 func TestResponseDebugSeparatesUpstreamAndDownstreamHeaders(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	s := NewServer(Config{
 		Proxy: ProxyConfig{Deflation: 1},
 		Debug: DebugConfig{Enabled: true, FullBody: true, DataDir: dataDir},

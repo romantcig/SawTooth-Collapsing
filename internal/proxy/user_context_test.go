@@ -172,22 +172,3 @@ func TestPersistentUserContextCollapseBlankGuard(t *testing.T) {
 	blanked := blankFirstMessage(messages, len(messages)-1, tc)
 	assertJSONEquivalent(t, mustMarshalJSON(t, blanked[0]), mustMarshalJSON(t, context))
 }
-
-func persistentReminder(key, value string) string {
-	return "<system-reminder>\nAs you answer, use this context:\n# " + key + "\n" + value + "\n</system-reminder>"
-}
-
-func persistentContextMessage(key, value string) Message {
-	content, _ := json.Marshal([]map[string]any{{"type": "text", "text": persistentReminder(key, value)}})
-	return Message{Role: "user", Content: content}
-}
-
-func persistentContextCount(messages []Message) int {
-	total := 0
-	for _, message := range messages {
-		if ExtractPersistentUserContext([]Message{message}) != nil {
-			total++
-		}
-	}
-	return total
-}

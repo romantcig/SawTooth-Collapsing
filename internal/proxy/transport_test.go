@@ -34,7 +34,7 @@ func TestTransportConfigDefaults(t *testing.T) {
 }
 
 func TestTransportConfigYAMLAndZeroDisable(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "sawtooth.yaml")
+	configPath := filepath.Join(tempDirRetryCleanup(t), "sawtooth.yaml")
 	content := []byte(`transport:
   dial_timeout: 1s
   tls_handshake_timeout: 2s
@@ -62,7 +62,7 @@ func TestTransportConfigYAMLAndZeroDisable(t *testing.T) {
 		t.Fatalf("YAML Transport = %+v, want %+v", loaded.Transport, want)
 	}
 
-	zeroPath := filepath.Join(t.TempDir(), "zero.yaml")
+	zeroPath := filepath.Join(tempDirRetryCleanup(t), "zero.yaml")
 	zeroContent := []byte(`transport:
   dial_timeout: 0
   tls_handshake_timeout: 0

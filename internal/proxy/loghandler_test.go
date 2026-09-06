@@ -14,9 +14,6 @@ import (
 	"time"
 )
 
-// logTestTime 测试用固定时间戳——对应输出 15:04:05。
-var logTestTime = time.Date(2026, 7, 6, 15, 4, 5, 0, time.Local)
-
 // logTestPrefix 固定时间戳对应的无色前缀。
 const logTestPrefix = "15:04:05 "
 
@@ -675,25 +672,9 @@ func TestTerminalHealthReporterSkipsOngoing(t *testing.T) {
 	}
 }
 
-// countingHandler 统计任何 file-capable logger 是否被健康路径调用。
-type countingHandler struct {
-	calls int
-}
-
-func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
-
-func (h *countingHandler) Handle(context.Context, slog.Record) error {
-	h.calls++
-	return nil
-}
-
-func (h *countingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
-
-func (h *countingHandler) WithGroup(string) slog.Handler { return h }
-
 func TestTerminalHealthReporterHasNoFileCapableDependency(t *testing.T) {
 	var terminal bytes.Buffer
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	fileHandler := NewSessionLogHandler(dataDir, slog.LevelDebug, nil)
 	combinedProbe := &countingHandler{}
 	defaultProbe := &countingHandler{}

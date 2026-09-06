@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -43,7 +44,7 @@ func assertStateLoadFailure(t *testing.T, result StateLoadResult, key, dbPath st
 }
 
 func TestSQLiteStoreLoadStateResultExisting(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "load-existing.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "load-existing.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +64,7 @@ func TestSQLiteStoreLoadStateResultExisting(t *testing.T) {
 }
 
 func TestSQLiteStoreLoadStateResultMissing(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "load-missing.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "load-missing.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +153,7 @@ func TestSQLiteStoreLoadStateResultBusy(t *testing.T) {
 }
 
 func TestSQLiteStoreLoadStateResultQueryError(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "load-query-error.db")
+	dbPath := filepath.Join(tempDirRetryCleanup(t), "load-query-error.db")
 	store, err := NewSQLiteStore(dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -181,7 +182,7 @@ func TestSQLiteStoreLoadStateResultQueryError(t *testing.T) {
 }
 
 func TestHistoryTransitionRemainsSynchronous(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "transition-sync.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "transition-sync.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +244,7 @@ func TestHistoryTransitionRemainsSynchronous(t *testing.T) {
 }
 
 func TestSQLiteStoreMigrationPreservesArchiveVisibilityData(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "legacy-visibility.db")
+	dbPath := filepath.Join(tempDirRetryCleanup(t), "legacy-visibility.db")
 	legacy, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("打开旧库失败: %v", err)
@@ -319,7 +320,7 @@ func TestSQLiteStoreMigrationPreservesArchiveVisibilityData(t *testing.T) {
 }
 
 func TestSQLiteStoreCommitHistoryTransitionIsolatesArchiveSuffix(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "history-transition.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "history-transition.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -387,7 +388,7 @@ func TestSQLiteStoreCommitHistoryTransitionIsolatesArchiveSuffix(t *testing.T) {
 }
 
 func TestSQLiteStoreCommitHistoryTransitionCommonPrefixZeroIsolatesAll(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "history-transition-zero.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "history-transition-zero.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,7 +416,7 @@ func TestSQLiteStoreCommitHistoryTransitionCommonPrefixZeroIsolatesAll(t *testin
 }
 
 func TestSQLiteStoreCommitHistoryTransitionRollsBackStateAndVisibility(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "history-transition-rollback.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "history-transition-rollback.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -452,7 +453,7 @@ func TestSQLiteStoreCommitHistoryTransitionRollsBackStateAndVisibility(t *testin
 }
 
 func TestSearchArchivesVisibleGateAppliesBeforeLimit(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "visible-search.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "visible-search.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -483,7 +484,7 @@ func TestSearchArchivesVisibleGateAppliesBeforeLimit(t *testing.T) {
 }
 
 func TestSaveArchivePersistsHistoryEpoch(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "archive-epoch.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "archive-epoch.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -502,7 +503,7 @@ func TestSaveArchivePersistsHistoryEpoch(t *testing.T) {
 }
 
 func TestSaveArchiveRejectsStaleEpochAfterTransition(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "stale-epoch.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "stale-epoch.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,7 +572,7 @@ func archiveRowExists(t *testing.T, store *SQLiteStore, id string) bool {
 }
 
 func TestSaveArchiveUsesAuthoritativeHistoryEpoch(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "authoritative-epoch.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "authoritative-epoch.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -618,7 +619,7 @@ func TestSaveArchiveUsesAuthoritativeHistoryEpoch(t *testing.T) {
 }
 
 func TestSaveArchiveRejectsLateOldEpochWithoutNewArchiveRow(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "late-epoch.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "late-epoch.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -660,7 +661,7 @@ func TestSaveArchiveRejectsLateOldEpochWithoutNewArchiveRow(t *testing.T) {
 }
 
 func TestSaveArchiveReturnsCanonicalIDOnContentConflict(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "canonical-id.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "canonical-id.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -706,7 +707,7 @@ func TestSaveArchiveReturnsCanonicalIDOnContentConflict(t *testing.T) {
 }
 
 func TestGetVisibleArchiveByIDSessionAndBranchGate(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "visible-exact.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "visible-exact.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -755,7 +756,7 @@ func TestGetVisibleArchiveByIDSessionAndBranchGate(t *testing.T) {
 }
 
 func TestSearchVisibleArchivesSessionAndBranchGate(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "visible-search-gate.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "visible-search-gate.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -820,7 +821,7 @@ func archiveRangeTestBlock(id, sessionID string, start, end int, epoch uint64, t
 }
 
 func TestSQLiteStoreMigrationPreservesLegacyDuplicateRows(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+	dbPath := filepath.Join(tempDirRetryCleanup(t), "legacy.db")
 	legacy, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("打开旧库失败: %v", err)
@@ -869,7 +870,7 @@ func TestSQLiteStoreMigrationPreservesLegacyDuplicateRows(t *testing.T) {
 }
 
 func TestNewSQLiteStoreMigrationErrorDoesNotDeleteDatabaseFiles(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "migration-error.db")
+	dbPath := filepath.Join(tempDirRetryCleanup(t), "migration-error.db")
 	legacy, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatalf("打开迁移错误 fixture 失败: %v", err)
@@ -931,7 +932,7 @@ func TestNewSQLiteStoreMigrationErrorDoesNotDeleteDatabaseFiles(t *testing.T) {
 // ---- SearchArchives 多词排序测试 ----
 
 func TestSearchArchivesMultiKeywordRanking(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "test.db")
+	dbPath := filepath.Join(tempDirRetryCleanup(t), "test.db")
 	store, err := NewSQLiteStore(dbPath)
 	if err != nil {
 		t.Fatalf("NewSQLiteStore failed: %v", err)
@@ -1007,7 +1008,7 @@ func TestSearchArchivesMultiKeywordRanking(t *testing.T) {
 }
 
 func TestSearchArchivesStableOrderingAndFields(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "stable.db")
+	dbPath := filepath.Join(tempDirRetryCleanup(t), "stable.db")
 	store, err := NewSQLiteStore(dbPath)
 	if err != nil {
 		t.Fatalf("NewSQLiteStore failed: %v", err)
@@ -1070,7 +1071,7 @@ func TestSearchArchivesStableOrderingAndFields(t *testing.T) {
 }
 
 func TestSQLiteStoreCloseRemovesWALCompanions(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "close-cleanup.db")
+	dbPath := filepath.Join(tempDirRetryCleanup(t), "close-cleanup.db")
 	store, err := NewSQLiteStore(dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -1090,7 +1091,7 @@ func TestSQLiteStoreCloseRemovesWALCompanions(t *testing.T) {
 }
 
 func TestSQLiteStoreCloseBusyPreservesCommittedWALData(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "close-busy.db")
+	dbPath := filepath.Join(tempDirRetryCleanup(t), "close-busy.db")
 	store, err := NewSQLiteStore(dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -1150,7 +1151,7 @@ func TestSQLiteStoreCloseBusyPreservesCommittedWALData(t *testing.T) {
 }
 
 func TestSQLiteStoreCloseCheckpointErrorPreservesCompanions(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "close-error.db")
+	dbPath := filepath.Join(tempDirRetryCleanup(t), "close-error.db")
 	store, err := NewSQLiteStore(dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -1175,7 +1176,7 @@ func TestSQLiteStoreCloseCheckpointErrorPreservesCompanions(t *testing.T) {
 }
 
 func TestSQLiteStoreDeleteState(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "delete-state.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "delete-state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1198,7 +1199,7 @@ func TestSQLiteStoreDeleteState(t *testing.T) {
 // 自动删除损坏文件并重建可用库。
 // 只断言恢复结果，不断言具体错误消息字符串（驱动版本升级时措辞可能变化）。
 func TestNewSQLiteStoreRecoversFromCorruptDB(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "corrupt.db")
+	dbPath := filepath.Join(tempDirRetryCleanup(t), "corrupt.db")
 	if err := os.WriteFile(dbPath, []byte("this is not a database"), 0644); err != nil {
 		t.Fatalf("预置损坏 DB 文件失败: %v", err)
 	}
@@ -1237,7 +1238,7 @@ func TestNewSQLiteStoreRecoversFromCorruptDB(t *testing.T) {
 // NewSQLiteStore 的 removeStaleWALFiles 前置清理应使建库正常成功。
 // 不断言 -wal/-shm 文件存在性——建库后 WAL 模式会生成新的伴生文件。
 func TestNewSQLiteStoreCleansOrphanWALFiles(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "orphan.db")
+	dbPath := filepath.Join(tempDirRetryCleanup(t), "orphan.db")
 	if err := os.WriteFile(dbPath+"-wal", []byte("stale wal"), 0644); err != nil {
 		t.Fatalf("预置残留 -wal 文件失败: %v", err)
 	}
@@ -1265,7 +1266,7 @@ func TestNewSQLiteStoreCleansOrphanWALFiles(t *testing.T) {
 }
 
 func TestSaveArchiveIdempotent(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "idempotent.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "idempotent.db"))
 	if err != nil {
 		t.Fatalf("NewSQLiteStore failed: %v", err)
 	}
@@ -1300,7 +1301,7 @@ func TestSaveArchiveIdempotent(t *testing.T) {
 }
 
 func TestSaveArchiveIgnoresForgedContentHash(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "forged-hash.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "forged-hash.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1327,7 +1328,7 @@ func TestSaveArchiveIgnoresForgedContentHash(t *testing.T) {
 }
 
 func TestSaveArchivePreservesDistinctMessageUnknownFields(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "message-fields.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "message-fields.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1356,7 +1357,7 @@ func TestSaveArchivePreservesDistinctMessageUnknownFields(t *testing.T) {
 }
 
 func TestSaveArchiveConcurrent(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "concurrent.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "concurrent.db"))
 	if err != nil {
 		t.Fatalf("NewSQLiteStore failed: %v", err)
 	}
@@ -1410,5 +1411,63 @@ func assertArchiveCounts(t *testing.T, store *SQLiteStore, blocks, keywords int)
 	}
 	if gotBlocks != blocks || gotKeywords != keywords {
 		t.Fatalf("archive 计数=%d/%d, want %d/%d", gotBlocks, gotKeywords, blocks, keywords)
+	}
+}
+
+// TestPhase071ArchiveIdentityAndDominance 把新写入幂等边界与召回 dominance
+// 放在同一个真实 SQLite 生命周期内验收，避免只验证各自的纯函数。
+func TestPhase071ArchiveIdentityAndDominance(t *testing.T) {
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "phase071.db"))
+	if err != nil {
+		t.Fatalf("NewSQLiteStore: %v", err)
+	}
+	defer store.Close()
+
+	messages := []Message{{Role: "user", Content: mustMarshal("restore archive about alpha beta gamma")}}
+	makeBlock := func(id string, end int) ArchiveBlock {
+		return ArchiveBlock{
+			ID: id, SessionID: "phase071-session", BlockRangeStart: 1, BlockRangeEnd: end,
+			MessageCount: end, EstimatedTokens: 100, Messages: messages,
+			SummaryText: "alpha beta gamma summary",
+			Keywords:    []KeywordEntry{{Word: "alpha", Source: "user_message"}},
+		}
+	}
+
+	const writers = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	for i := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- store.SaveArchive(makeBlock(fmt.Sprintf("duplicate-%d", i), 299))
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("并发 SaveArchive: %v", err)
+		}
+	}
+	if got := archiveCount(t, store); got != 1 {
+		t.Fatalf("相同逻辑 Archive 并发保存后 count=%d, want 1", got)
+	}
+
+	long := makeBlock("long-range", 347)
+	long.Messages = append(long.Messages, Message{Role: "assistant", Content: mustMarshal("longer range")})
+	if err := store.SaveArchive(long); err != nil {
+		t.Fatalf("SaveArchive(long): %v", err)
+	}
+	results, err := store.SearchArchives(`"alpha"`, 10)
+	if err != nil {
+		t.Fatalf("SearchArchives: %v", err)
+	}
+	candidates := make([]recallCandidate, 0, len(results))
+	for _, result := range results {
+		candidates = append(candidates, recallCandidate{Summary: result, SameSession: true})
+	}
+	if got := len(dedupeDominatedCandidates(candidates)); got != 1 {
+		t.Fatalf("1-347 与 1-299 dominance 后 selected=%d, want 1", got)
 	}
 }

@@ -25,7 +25,7 @@ func TestArchiveReadOnlyAudit(t *testing.T) {
 		t.Fatalf("解析审计路径: %v", err)
 	}
 	before := snapshotFileStates(t, abs)
-	snapshotPath := filepath.Join(t.TempDir(), filepath.Base(abs))
+	snapshotPath := filepath.Join(tempDirRetryCleanup(t), filepath.Base(abs))
 	for _, suffix := range []string{"", "-wal", "-shm"} {
 		source := abs + suffix
 		if _, err := os.Stat(source); os.IsNotExist(err) {

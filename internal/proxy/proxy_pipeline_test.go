@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -498,7 +499,7 @@ func TestHandleMessagesDebugStages(t *testing.T) {
 	defer upstream.Close()
 
 	server := newPipelineTestServer(t, upstream.URL)
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, FullBody: false, DataDir: dataDir})
 	raw := append([]Message{pipelinePersistentContextMessage(t, "DEBUG-STAGE-CLAUDE-MD-SECRET")}, pipelineMessages(4, 5)...)
 	servePipelineRequest(t, server, "debug-stage-session-secret", raw)
@@ -545,7 +546,7 @@ func TestHandleMessagesDebugFullBodyOptIn(t *testing.T) {
 	defer upstream.Close()
 
 	server := newPipelineTestServer(t, upstream.URL)
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, FullBody: true, DataDir: dataDir})
 	servePipelineRequest(t, server, "debug-full-body-session", pipelineMessages(2, 2))
 
@@ -835,7 +836,7 @@ func testSessionTitleResponseState(t *testing.T, sse bool) {
 
 	server := newPipelineTestServer(t, upstream.URL)
 	server.Config.Proxy.Deflation = 0.5
-	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, DataDir: t.TempDir()})
+	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, DataDir: tempDirRetryCleanup(t)})
 	missingFingerprint := fingerprintTopLevelJSON(nil)
 	server.Sawtooth.UpdatePressureBaseline(sessionID, 777, 9, missingFingerprint, missingFingerprint, strings.Repeat("a", 64))
 	baselineBefore := server.Sawtooth.PressureBaseline(sessionID)
@@ -939,7 +940,7 @@ func testSubagentResponseState(t *testing.T, sse bool) {
 
 	server := newPipelineTestServer(t, upstream.URL)
 	server.Config.Proxy.Deflation = 0.5
-	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, DataDir: t.TempDir()})
+	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, DataDir: tempDirRetryCleanup(t)})
 	missingFingerprint := fingerprintTopLevelJSON(nil)
 	server.Sawtooth.UpdatePressureBaseline(sessionID, 888, 11, missingFingerprint, missingFingerprint, strings.Repeat("a", 64))
 	baselineBefore := server.Sawtooth.PressureBaseline(sessionID)
@@ -2523,7 +2524,7 @@ func TestRequestOutcomePersistenceCompletion(t *testing.T) {
 func TestPressureAndUsageFactsRemain(t *testing.T) {
 	upstream := jsonOutcomeUpstream(t)
 	server, sink := newOutcomePipelineServer(t, upstream.URL)
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, FullBody: false, DataDir: dataDir})
 
 	const sessionID = "outcome-facts-session"
@@ -2826,41 +2827,6 @@ func TestArchiveStateQueueFullDoesNotAffectCommit(t *testing.T) {
 	}
 }
 
-func TestArchiveReturnsCanonicalIDOnConflict(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "conflict.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = store.Close() })
-
-	messages := pipelineMessages(6, 4)
-	first := ArchiveBlock{
-		ID: "first-id", SessionID: "conflict-session", HistoryEpoch: 1,
-		BlockRangeStart: 1, BlockRangeEnd: 5, MessageCount: len(messages),
-		Messages: messages, SummaryText: "summary",
-	}
-	firstResult, err := store.SaveArchiveResult(first)
-	if err != nil || firstResult.State != persistenceStateSaved || firstResult.ID != "first-id" {
-		t.Fatalf("首次提交=%+v err=%v", firstResult, err)
-	}
-
-	second := first
-	second.ID = "second-id"
-	secondResult, err := store.SaveArchiveResult(second)
-	if err != nil {
-		t.Fatalf("内容相同的重复提交应成功: %v", err)
-	}
-	if secondResult.ID != "first-id" {
-		t.Fatalf("冲突返回 ID=%q, want 既有 canonical ID first-id", secondResult.ID)
-	}
-	if _, found, err := store.GetVisibleArchiveByID("conflict-session", secondResult.ID); err != nil || !found {
-		t.Fatalf("canonical ID 不可按同 session 找回: found=%v err=%v", found, err)
-	}
-	if _, found, _ := store.GetVisibleArchiveByID("other-session", secondResult.ID); found {
-		t.Fatal("canonical ID 跨 session 可见")
-	}
-}
-
 func TestCollapseEnabledOnlyControlsPrimary(t *testing.T) {
 	var captured [][]Message
 	upstream := capturingUpstream(t, &captured)
@@ -3037,7 +3003,7 @@ func TestProductionTerminalNeverPrintsFullSessionID(t *testing.T) {
 // 大请求复用既有 pipelineMessages fixture，不另建 token/消息生成器。
 func TestProductionLongRequestProgressMapsToSessionLog(t *testing.T) {
 	terminal := &lockedBuffer{}
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	terminalHandler := NewLogHandler(terminal, slog.LevelInfo)
 	fileHandler := NewSessionLogHandler(dataDir, slog.LevelInfo, nil)
 	previousLogger := slog.Default()
@@ -3143,5 +3109,454 @@ func TestProductionLongRequestProgressMapsToSessionLog(t *testing.T) {
 	}
 	if strings.Contains(sessionLog, sessionID) || strings.Contains(sessionLog, "request_session_id") {
 		t.Fatalf("session 文件泄漏完整 session 身份: %q", sessionLog)
+	}
+}
+
+func TestPhase08CombinedLifecycle(t *testing.T) {
+	var forwarded [][]Message
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Messages []Message `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		forwarded = append(forwarded, deepCopyMessages(body.Messages))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":196,"cache_creation_input_tokens":0,"cache_read_input_tokens":93056,"output_tokens":3}}`))
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+	debugDir := tempDirRetryCleanup(t)
+	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, FullBody: false, DataDir: debugDir})
+	var persisted string
+	server.Sawtooth.SetPersistFunc(func(key, value string) {
+		// Phase 11 起生产状态始终使用显式 epoch-scoped key；测试只观察
+		// 当前 epoch，不把旧裸 session key 重新当作当前状态。
+		if strings.HasPrefix(key, "sawtooth:phase08-combined:history_epoch:") {
+			persisted = value
+		}
+	})
+
+	history := pipelineMessages(300, 80)
+	history = append(history, phase08ScreenshotToolPair(t)...)
+	firstRaw := append([]Message{pipelinePersistentContextMessage(t, "phase08-context-A")}, history...)
+	servePipelineRequest(t, server, "phase08-combined", firstRaw)
+	archivesAfterCollapse := archiveCount(t, server.Store)
+	if archivesAfterCollapse == 0 {
+		t.Fatal("组合场景未触发 collapse/archive")
+	}
+
+	var fresh Message
+	if err := json.Unmarshal([]byte(`{"role":"user","content":"phase08-fresh-tail","future_phase08":{"preserve":true}}`), &fresh); err != nil {
+		t.Fatal(err)
+	}
+	secondHistory := append(deepCopyMessages(history), fresh)
+	secondRaw := append([]Message{pipelinePersistentContextMessage(t, "phase08-context-B")}, secondHistory...)
+	servePipelineRequest(t, server, "phase08-combined", secondRaw)
+
+	if len(forwarded) != 2 {
+		t.Fatalf("upstream requests=%d, want 2", len(forwarded))
+	}
+	if len(forwarded[0]) <= server.Config.Stubify.KeepRecent+2 {
+		t.Fatalf("大截图后只保留 keep_recent 边界: forwarded=%d keep_recent=%d", len(forwarded[0]), server.Config.Stubify.KeepRecent)
+	}
+	assertPersistentContext(t, forwarded[1], "phase08-context-B")
+	if got := countMessagesContaining(forwarded[1], "phase08-context-A"); got != 0 {
+		t.Fatalf("Frozen restore 后旧 context A count=%d", got)
+	}
+	if got := countMessagesContaining(forwarded[1], "phase08-context-B"); got != 1 {
+		t.Fatalf("Frozen restore 后 current context B count=%d", got)
+	}
+	lastJSON, err := json.Marshal(forwarded[1][len(forwarded[1])-1])
+	if err != nil || !bytes.Contains(lastJSON, []byte("future_phase08")) {
+		t.Fatalf("fresh tail 未知字段丢失: %s err=%v", lastJSON, err)
+	}
+	// Archive 行数不能证明"没有重复 collapse"——SaveArchive 是 ON CONFLICT DO NOTHING，
+	// 相同 Archive 再折叠一次也不会新增行。这里只保留它能真正证明的那一点：
+	// 没有产生一份**不同**的 Archive。是否重复 collapse 由下面的 pressure 状态转换断言。
+	if got := archiveCount(t, server.Store); got != archivesAfterCollapse {
+		t.Fatalf("第二轮生成了新的 Archive 行: got=%d want=%d", got, archivesAfterCollapse)
+	}
+	if result := server.Frozen.Get("phase08-combined", StripReminders(secondHistory)); result == nil {
+		t.Fatal("组合场景第二轮未保持 Frozen hit")
+	}
+
+	var state persistedState
+	if err := json.Unmarshal([]byte(persisted), &state); err != nil {
+		t.Fatalf("parse persisted Sawtooth state: %v raw=%q", err, persisted)
+	}
+	if state.Tokens != 93_252 || state.MsgCount != len(forwarded[1]) || state.Conservative || state.SystemFingerprint == "" || state.ToolsFingerprint == "" || state.MessagesPrefixFingerprint != fingerprintMessagesPrefix(forwarded[1], len(forwarded[1])) {
+		t.Fatalf("forwarded 坐标未绑定 exact pressure baseline: %+v", state)
+	}
+	if baseline := server.Sawtooth.PressureBaseline("phase08-combined"); !baseline.Available || baseline.Conservative || baseline.ActualTokens != 93_252 || baseline.MessageCount != len(forwarded[1]) || baseline.MessagesPrefixFingerprint != fingerprintMessagesPrefix(forwarded[1], len(forwarded[1])) {
+		t.Fatalf("forwarded 坐标绑定后的 exact baseline 不可用: %+v", baseline)
+	}
+
+	facts := readDebugFactFiles(t, debugDir, "phase08-combined")
+	if len(facts) != 8 {
+		t.Fatalf("两请求 facts=%d, want 8", len(facts))
+	}
+	stageByRequest := make(map[uint64]map[debugStage]debugFact)
+	for _, data := range facts {
+		if bytes.Contains(data, []byte("phase08-context-A")) || bytes.Contains(data, []byte("phase08-context-B")) || bytes.Contains(data, []byte(phase08ScreenshotBase64(t))) {
+			t.Fatal("组合 facts 泄漏 context 或 base64")
+		}
+		var fact debugFact
+		if err := json.Unmarshal(data, &fact); err != nil {
+			t.Fatal(err)
+		}
+		if stageByRequest[fact.RequestID] == nil {
+			stageByRequest[fact.RequestID] = make(map[debugStage]debugFact)
+		}
+		stageByRequest[fact.RequestID][fact.Stage] = fact
+	}
+	if len(stageByRequest) != 2 {
+		t.Fatalf("facts request IDs=%d, want 2", len(stageByRequest))
+	}
+	assertPhase08PressureTransition(t, stageByRequest, len(forwarded[0]))
+	for requestID, stages := range stageByRequest {
+		for _, stage := range []debugStage{debugStageRawInbound, debugStagePressureDecision, debugStageForwarded, debugStageResponseUsage} {
+			if _, ok := stages[stage]; !ok {
+				t.Fatalf("request %d missing stage %q", requestID, stage)
+			}
+		}
+		if usage := stages[debugStageResponseUsage]; usage.TotalInputTokens != 93252 {
+			t.Fatalf("request %d usage total=%d, want 93252", requestID, usage.TotalInputTokens)
+		} else if usage.BaselineUpdated == nil || !*usage.BaselineUpdated {
+			t.Fatalf("request %d baseline_updated=%v, want true", requestID, usage.BaselineUpdated)
+		} else if usage.BaselineUpdateKind == nil || *usage.BaselineUpdateKind != pressureBaselineUpdateExact {
+			t.Fatalf("request %d baseline_update_kind=%v, want exact", requestID, usage.BaselineUpdateKind)
+		}
+		if raw := stages[debugStageRawInbound]; raw.ImageCount != 1 || !raw.HasClaudeMDContext {
+			t.Fatalf("request %d raw facts=%+v", requestID, raw)
+		}
+		if forwardedFact := stages[debugStageForwarded]; forwardedFact.ImageCount != 1 || !forwardedFact.HasClaudeMDContext {
+			t.Fatalf("request %d forwarded facts=%+v", requestID, forwardedFact)
+		}
+	}
+}
+
+// assertPhase08PressureTransition 直接断言两轮之间的 pressure 状态转换，取代
+// 「Archive 行数没增加 ⇒ 没有重复 collapse」这个恒真推断（REVIEW_GAPS 4.2）。
+//
+// 本场景的第二轮**确实**会重新 collapse，这是 fixture 决定的而非缺陷：
+// 上游 stub 对一份本地估算约 29k 的 body 固定回报 93252 tokens，而阈值只有 16000。
+// 同时 persistent context 从 A 换成 B 使前缀指纹改变，pressure 落到
+// conservative_high_water 分支并沿用 93252 高水位 → emergency。
+//
+// 因此这里断言的是真正有证明力的东西：第一轮冷启动走 local_full，第二轮
+// **消费了第一轮写下的 exact baseline**（previous_actual / previous_message_count
+// 与第一轮 forwarded 坐标一致）。旧的 Archive 行数断言恰恰漏掉的就是这一段。
+// 「不重复 collapse」的正面护栏在 TestPressureActualPlusDeltaLifecycle。
+func assertPhase08PressureTransition(t *testing.T, stageByRequest map[uint64]map[debugStage]debugFact, firstForwardedCount int) {
+	t.Helper()
+	requestIDs := make([]uint64, 0, len(stageByRequest))
+	for requestID := range stageByRequest {
+		requestIDs = append(requestIDs, requestID)
+	}
+	sort.Slice(requestIDs, func(i, j int) bool { return requestIDs[i] < requestIDs[j] })
+
+	first := stageByRequest[requestIDs[0]][debugStagePressureDecision]
+	if first.PressureSource == nil || *first.PressureSource != pressureSourceLocalFull {
+		t.Fatalf("第一轮 pressure_source=%s, want %q", debugFactValue(first.PressureSource), pressureSourceLocalFull)
+	}
+	if first.BaselineResetReason == nil || *first.BaselineResetReason != baselineResetNoActual {
+		t.Fatalf("第一轮 baseline_reset_reason=%s, want %q", debugFactValue(first.BaselineResetReason), baselineResetNoActual)
+	}
+	if first.CompressDecision == nil || !*first.CompressDecision {
+		t.Fatalf("第一轮 compress_decision=%s, want true", debugFactValue(first.CompressDecision))
+	}
+
+	second := stageByRequest[requestIDs[1]][debugStagePressureDecision]
+	if second.PreviousActualTokens == nil || *second.PreviousActualTokens != 93_252 {
+		t.Fatalf("第二轮 previous_actual_tokens=%s, want 93252（第一轮 exact baseline 未被消费）", debugFactValue(second.PreviousActualTokens))
+	}
+	if second.PreviousMessageCount == nil || *second.PreviousMessageCount != firstForwardedCount {
+		t.Fatalf("第二轮 previous_message_count=%s, want %d（baseline 未绑定第一轮 forwarded 坐标）",
+			debugFactValue(second.PreviousMessageCount), firstForwardedCount)
+	}
+	if second.PressureSource == nil || *second.PressureSource != pressureSourceConservativeHighWater {
+		t.Fatalf("第二轮 pressure_source=%s, want %q", debugFactValue(second.PressureSource), pressureSourceConservativeHighWater)
+	}
+	if second.SelectedPressureTokens == nil || *second.SelectedPressureTokens != 93_252 {
+		t.Fatalf("第二轮 selected_pressure=%s, want 93252（高水位未生效）", debugFactValue(second.SelectedPressureTokens))
+	}
+}
+
+// debugFactValue 渲染 debugFact 里的可空字段，避免失败信息打印成指针地址。
+func debugFactValue[T any](p *T) string {
+	if p == nil {
+		return "nil"
+	}
+	return fmt.Sprintf("%v", *p)
+}
+
+func TestPhase08DebugStagesWithoutCompressionPipeline(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"message","usage":{"input_tokens":2,"cache_read_input_tokens":3}}`))
+	}))
+	defer upstream.Close()
+	cfg := DefaultConfig()
+	cfg.Proxy.Target = upstream.URL
+	cfg.Proxy.Deflation = 1
+	cfg.Debug = DebugConfig{Enabled: true, FullBody: false, DataDir: tempDirRetryCleanup(t)}
+	server := NewServer(cfg)
+
+	body := `{"model":"claude-test","messages":[{"role":"user","content":"direct forward"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set("X-Claude-Code-Session-Id", "phase08-direct-forward")
+	recorder := httptest.NewRecorder()
+	server.HandleMessages(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	facts := readDebugFactFiles(t, cfg.Debug.DataDir, "phase08-direct-forward")
+	stageCounts := make(map[debugStage]int)
+	for _, data := range facts {
+		var fact debugFact
+		if err := json.Unmarshal(data, &fact); err != nil {
+			t.Fatal(err)
+		}
+		stageCounts[fact.Stage]++
+	}
+	for _, stage := range []debugStage{debugStageRawInbound, debugStageForwarded, debugStageResponseUsage} {
+		if stageCounts[stage] != 1 {
+			t.Fatalf("direct path stage %q count=%d, want 1; all=%v", stage, stageCounts[stage], stageCounts)
+		}
+	}
+}
+
+func phase08ScreenshotToolPair(t *testing.T) []Message {
+	t.Helper()
+	blockData, err := os.ReadFile(filepath.Join("testdata", "multimodal", "large-screenshot-tool-result.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var block map[string]any
+	if err := json.Unmarshal(blockData, &block); err != nil {
+		t.Fatal(err)
+	}
+	toolID, _ := block["tool_use_id"].(string)
+	toolUseContent, err := json.Marshal([]any{map[string]any{
+		"type": "tool_use", "id": toolID, "name": "Screenshot", "input": map[string]any{},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolResultContent, err := json.Marshal([]any{block})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return []Message{
+		{Role: "assistant", Content: toolUseContent},
+		{Role: "user", Content: toolResultContent},
+	}
+}
+
+func phase08ScreenshotBase64(t *testing.T) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", "multimodal", "large-screenshot-tool-result.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var block struct {
+		Content []struct {
+			Source struct {
+				Data string `json:"data"`
+			} `json:"source"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(data, &block); err != nil {
+		t.Fatal(err)
+	}
+	for _, content := range block.Content {
+		if content.Source.Data != "" {
+			return content.Source.Data
+		}
+	}
+	t.Fatal("screenshot fixture missing base64")
+	return ""
+}
+
+// mainStateSnapshot 汇总一次请求可能触碰到的全部主线有状态资源。
+// 全部字段均为可比较值类型，便于直接用 == 做前后快照比对。
+type mainStateSnapshot struct {
+	FrozenLen    int
+	Archives     int
+	RequestSeq   int
+	Baseline     pressureBaseline
+	DecayEntries int
+}
+
+func snapshotMainState(t *testing.T, server *Server, sessionID string) mainStateSnapshot {
+	t.Helper()
+
+	server.DecayTracker.mu.RLock()
+	decayEntries := len(server.DecayTracker.stubbedAt)
+	server.DecayTracker.mu.RUnlock()
+
+	return mainStateSnapshot{
+		FrozenLen:    server.Frozen.LengthFor(sessionID),
+		Archives:     archiveCount(t, server.Store),
+		RequestSeq:   server.Sawtooth.GetRequestSeq(sessionID),
+		Baseline:     server.Sawtooth.PressureBaseline(sessionID),
+		DecayEntries: decayEntries,
+	}
+}
+
+// TestHandleMessagesInterleavedAgentStreamsIsolateMainState 复现 CC 2.1.220 的真实并发
+// 形态：main 与 5 个 Task subagent 共用同一个 X-Claude-Code-Session-Id，6 条互不相干的
+// 历史交错到达同一个状态机。
+//
+// 生产 trace（FIX_PLAN.md 1.1）中，代理原有的三条 subagent 识别路径全部失效
+// （billing header 被关闭、agentContext 从不进 body、无 stream:false 旁路查询），
+// 152 个请求全部被判成 main，导致 114/152（75%）请求触发 epoch 变更、common_prefix
+// 归零，主线的 baseline / Frozen / Decay 状态每轮被冲刷。
+//
+// 本测试锁定修复后的不变量：带 X-Claude-Code-Agent-Id 的流量在进入 HistoryEpoch gate
+// 之前透明直通，主线状态不被任何 subagent 请求触碰。
+func TestHandleMessagesInterleavedAgentStreamsIsolateMainState(t *testing.T) {
+	const (
+		sessionID           = "SHARED-SESSION-INTERLEAVED-9A7C2F"
+		subagentSentinel    = "subagent-isolated-history"
+		subagentUsageTokens = 191_000
+		mainUsageTokens     = 4_000
+	)
+	// 取自生产 trace 的真实 agent id（FIX_PLAN.md 1.1 表格）。
+	agentIDs := []string{
+		"ac3d8abb21a98f939",
+		"ae62648d28a17ee1a",
+		"a74453d0a5cd80b06",
+		"a9c7f0dda3165134a",
+		"a1affcdb69ecfa2b5",
+	}
+
+	var forwardedAgentIDs []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("读取上游请求失败: %v", err)
+			return
+		}
+		// 按请求体内容而非 header 区分来源，使 usage 断言不依赖 header 是否透传。
+		usage := mainUsageTokens
+		if bytes.Contains(body, []byte(subagentSentinel)) {
+			usage = subagentUsageTokens
+			forwardedAgentIDs = append(forwardedAgentIDs, r.Header.Get("X-Claude-Code-Agent-Id"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"type":"message","usage":{"input_tokens":%d,"output_tokens":1}}`, usage)
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServer(t, upstream.URL)
+
+	// subagent 在 HistoryEpoch gate 之前就返回，永远不会走到 Archive 召回。
+	// 因此该回调的调用次数本身就是"进入有状态管线的请求数"。
+	type epochObservation struct {
+		Epoch   uint64
+		Changed bool
+	}
+	var mainObservations []epochObservation
+	server.searchAndExpandFn = func(messages []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, meta *requestMeta) RecallOutcome {
+		mainObservations = append(mainObservations, epochObservation{
+			Epoch:   meta.HistoryEpoch,
+			Changed: meta.HistoryEpochChanged,
+		})
+		return RecallOutcome{Messages: messages}
+	}
+
+	// main 流：足够大以触发一次真实 collapse，从而建立 Frozen / Archive / baseline。
+	mainHistory := pipelineMessages(300, 80)
+	appendMainTurn := func(turn int) {
+		mainHistory = append(mainHistory,
+			Message{Role: "user", Content: mustMarshal(fmt.Sprintf("main-stream-turn-%d follow-up question", turn))},
+			Message{Role: "assistant", Content: mustMarshal(fmt.Sprintf("main-stream-answer-%d", turn))},
+		)
+	}
+
+	// 每条 subagent 历史都与 main 完全不相干——若它们进入 epoch gate，
+	// common prefix 必为 0，必然推进 epoch 并冲刷主线状态。
+	subagentHistory := func(agentID string) []Message {
+		return []Message{
+			{Role: "user", Content: mustMarshal(subagentSentinel + " task brief for " + agentID)},
+			{Role: "assistant", Content: mustMarshal(subagentSentinel + " working on " + agentID)},
+		}
+	}
+
+	serveSubagent := func(agentID string) {
+		t.Helper()
+		before := snapshotMainState(t, server, sessionID)
+		servePipelineRequestWith(t, server, sessionID, subagentHistory(agentID), nil, map[string]string{
+			"X-Claude-Code-Agent-Id": agentID,
+		})
+		after := snapshotMainState(t, server, sessionID)
+		if before != after {
+			t.Fatalf("subagent %s 触碰了主线状态:\nbefore=%+v\nafter =%+v", agentID, before, after)
+		}
+	}
+
+	// main#1 —— 建立主线状态。
+	servePipelineRequest(t, server, sessionID, mainHistory)
+	established := snapshotMainState(t, server, sessionID)
+	if established.FrozenLen == 0 || established.Archives == 0 || established.RequestSeq == 0 {
+		t.Fatalf("main 首轮未建立可观测状态，后续隔离断言将失去意义: %+v", established)
+	}
+
+	// 交错到达：每两次 main 之间至少插入一次 subagent。
+	serveSubagent(agentIDs[0])
+	serveSubagent(agentIDs[1])
+
+	appendMainTurn(2)
+	servePipelineRequest(t, server, sessionID, mainHistory)
+
+	serveSubagent(agentIDs[2])
+	serveSubagent(agentIDs[3])
+
+	appendMainTurn(3)
+	servePipelineRequest(t, server, sessionID, mainHistory)
+
+	serveSubagent(agentIDs[4])
+	serveSubagent(agentIDs[0]) // 同一 subagent 二次到达
+
+	appendMainTurn(4)
+	servePipelineRequest(t, server, sessionID, mainHistory)
+
+	// 1. 只有 main 请求进入有状态管线。
+	if len(mainObservations) != 4 {
+		t.Fatalf("进入有状态管线的请求数=%d, want 4（仅 main）", len(mainObservations))
+	}
+
+	// 2. main 的 epoch 只在首次建立时变化一次，此后恒定。
+	if !mainObservations[0].Changed {
+		t.Fatalf("main 首轮未建立 epoch: %+v", mainObservations[0])
+	}
+	for i, observation := range mainObservations[1:] {
+		if observation.Changed {
+			t.Fatalf("main 第 %d 轮 epoch 被重建——subagent 冲刷了主线状态机: %+v", i+2, observation)
+		}
+		if observation.Epoch != mainObservations[0].Epoch {
+			t.Fatalf("main 第 %d 轮 epoch=%d, want 恒定 %d", i+2, observation.Epoch, mainObservations[0].Epoch)
+		}
+	}
+
+	// 3. subagent 响应的 usage 从未写入主线 pressure baseline。
+	if baseline := server.Sawtooth.PressureBaseline(sessionID); baseline.ActualTokens == subagentUsageTokens {
+		t.Fatalf("subagent 响应 usage 污染了主线 pressure baseline: %+v", baseline)
+	}
+
+	// 4. agent-id header 原样转发上游（FIX_PLAN.md 2026-07-28 决定 1：不剥离）。
+	wantAgentIDs := []string{agentIDs[0], agentIDs[1], agentIDs[2], agentIDs[3], agentIDs[4], agentIDs[0]}
+	if len(forwardedAgentIDs) != len(wantAgentIDs) {
+		t.Fatalf("上游收到的 subagent 请求数=%d, want %d", len(forwardedAgentIDs), len(wantAgentIDs))
+	}
+	for i, want := range wantAgentIDs {
+		if forwardedAgentIDs[i] != want {
+			t.Fatalf("第 %d 个 subagent 请求转发的 agent-id=%q, want %q", i+1, forwardedAgentIDs[i], want)
+		}
 	}
 }

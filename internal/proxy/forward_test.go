@@ -123,7 +123,7 @@ func TestDeflationDefaultsOffAndZeroMeansDisabled(t *testing.T) {
 		"越界超限": "proxy:\n  deflation: 2\n",
 		"未指定":  "proxy:\n  target: https://api.anthropic.com\n",
 	} {
-		path := filepath.Join(t.TempDir(), "sawtooth.yaml")
+		path := filepath.Join(tempDirRetryCleanup(t), "sawtooth.yaml")
 		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 			t.Fatalf("%s: 写入配置: %v", name, err)
 		}
@@ -412,7 +412,7 @@ func TestForwardRawOutOfOrderResponsesKeepNewestRequestBaseline(t *testing.T) {
 		persisted = value
 		persistedMu.Unlock()
 	})
-	debugDir := t.TempDir()
+	debugDir := tempDirRetryCleanup(t)
 	s := NewServer(Config{
 		Proxy: ProxyConfig{Target: upstream.URL, Deflation: 1},
 		Debug: DebugConfig{Enabled: true, DataDir: debugDir},
@@ -615,7 +615,7 @@ func TestHandleSSEInterruptedAfterMessageStartDiscardsPendingUsage(t *testing.T)
 	before := trigger.PressureBaseline(sessionID)
 	persistCalls := 0
 	trigger.SetPersistFunc(func(_ string, _ string) { persistCalls++ })
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	s := NewServer(Config{Proxy: ProxyConfig{Deflation: 0.5}, Debug: DebugConfig{Enabled: true, DataDir: dataDir}})
 	s.Sawtooth = trigger
 	meta := newRequestMeta(22, sessionID)
@@ -680,7 +680,7 @@ func TestHandleJSONRejectsUntrustedUsageBaseline(t *testing.T) {
 			before := trigger.PressureBaseline(sessionID)
 			persistCalls := 0
 			trigger.SetPersistFunc(func(_ string, _ string) { persistCalls++ })
-			dataDir := t.TempDir()
+			dataDir := tempDirRetryCleanup(t)
 			s := NewServer(Config{Proxy: ProxyConfig{Deflation: 0.5}, Debug: DebugConfig{Enabled: true, DataDir: dataDir}})
 			s.Sawtooth = trigger
 			meta := newRequestMeta(uint64(30+index), sessionID)
@@ -720,7 +720,7 @@ func TestHandleSSERejectsUntrustedUsageBaseline(t *testing.T) {
 	before := trigger.PressureBaseline(sessionID)
 	persistCalls := 0
 	trigger.SetPersistFunc(func(_ string, _ string) { persistCalls++ })
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	s := NewServer(Config{Proxy: ProxyConfig{Deflation: 0.5}, Debug: DebugConfig{Enabled: true, DataDir: dataDir}})
 	s.Sawtooth = trigger
 	meta := newRequestMeta(40, sessionID)
@@ -884,7 +884,7 @@ func (f *failingDebugFile) Close() error {
 }
 
 func TestWriteDebugFileRedactsCredentialHeaders(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	s := NewServer(Config{Debug: DebugConfig{Enabled: true, FullBody: true, DataDir: dataDir}})
 	meta := s.nextRequestMeta("session")
 	headers := http.Header{
@@ -938,7 +938,7 @@ func TestWriteDebugFileRedactsCredentialHeaders(t *testing.T) {
 func TestWriteDebugFileSessionPathCannotEscapeDebugRoot(t *testing.T) {
 	for _, sessionID := range []string{"../escape", `..\\escape`, `C:\\escape`, `\\\\server\\share\\escape`} {
 		t.Run(sessionID, func(t *testing.T) {
-			dataDir := t.TempDir()
+			dataDir := tempDirRetryCleanup(t)
 			s := NewServer(Config{Debug: DebugConfig{Enabled: true, FullBody: true, DataDir: dataDir}})
 			meta := s.nextRequestMeta(sessionID)
 			s.writeFullBodyDebug(meta, time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC), debugBodyStageForwarded, []byte(`{}`), nil, "model", 0)
@@ -1166,7 +1166,7 @@ func TestMalformedForwardedBodyDoesNotWritePressureBaseline(t *testing.T) {
 }
 
 func TestSafeDebugSessionDirUsesShortStableHash(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	first, ok := safeDebugSessionDir(dataDir, "session-one")
 	if !ok {
 		t.Fatal("合法 session debug 目录校验失败")
@@ -1191,7 +1191,7 @@ func TestSafeDebugSessionDirUsesShortStableHash(t *testing.T) {
 }
 
 func TestWriteDebugFileUsesRequestIDToPreventCollisions(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	s := NewServer(Config{Debug: DebugConfig{Enabled: true, FullBody: true, DataDir: dataDir}})
 	timestamp := time.Date(2026, 7, 11, 12, 0, 0, 123, time.UTC)
 	var wg sync.WaitGroup
@@ -1238,7 +1238,7 @@ func TestDebugFullBodyOptInWritesExactlyThreeStableFiles(t *testing.T) {
 		{name: "explicit opt in", enabled: true, fullBody: true, want: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			dataDir := t.TempDir()
+			dataDir := tempDirRetryCleanup(t)
 			s := NewServer(Config{Debug: DebugConfig{Enabled: tc.enabled, FullBody: tc.fullBody, DataDir: dataDir}})
 			meta := s.nextRequestMeta("full-body-opt-in")
 			for _, stage := range stages {
@@ -1271,7 +1271,7 @@ func TestWriteDebugEntryFileRemovesPartialFileOnFailure(t *testing.T) {
 		{name: "close error", closeErr: errors.New("injected close error")},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			filePath := filepath.Join(t.TempDir(), "entry.json")
+			filePath := filepath.Join(tempDirRetryCleanup(t), "entry.json")
 			err := writeDebugEntryFile(filePath, []byte(`{"complete":true}`), func(name string, flag int, perm os.FileMode) (debugWriteCloser, error) {
 				file, err := os.OpenFile(name, flag, perm)
 				if err != nil {

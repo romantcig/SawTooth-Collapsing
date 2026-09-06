@@ -120,7 +120,7 @@ func TestExtractRecallSignalsPlainPathsHaveNoProvenance(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			messages := []Message{{Role: "user", Content: mustRawJSON(t, tt.text)}}
+			messages := []Message{{Role: "user", Content: mustMarshalJSON(t, tt.text)}}
 			if got := extractRecallSignals(messages); len(got) != 0 {
 				t.Fatalf("普通路径不应生成 Archive 信号: %+v", got)
 			}
@@ -132,8 +132,8 @@ func TestExtractRecallSignalsDeepSearchPreservesExactPathProvenance(t *testing.T
 	path := `C:\work\src\proxy.go`
 	stub := "[tool result archived → deep_search('" + path + "')]"
 	messages := []Message{
-		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "text", Text: stub}})},
-		{Role: "user", Content: mustRawJSON(t, "please inspect "+path)},
+		{Role: "assistant", Content: mustMarshalJSON(t, []ContentBlock{{Type: "text", Text: stub}})},
+		{Role: "user", Content: mustMarshalJSON(t, "please inspect "+path)},
 	}
 
 	got := extractRecallSignals(messages)
@@ -158,7 +158,7 @@ func TestExtractRecallSignalsRecoveryIntentOwnsExactPathProvenance(t *testing.T)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := extractRecallSignals([]Message{{Role: "user", Content: mustRawJSON(t, tt.text)}})
+			got := extractRecallSignals([]Message{{Role: "user", Content: mustMarshalJSON(t, tt.text)}})
 			if len(got) != 1 {
 				t.Fatalf("恢复意图信号数=%d，期望 1: %+v", len(got), got)
 			}
@@ -194,7 +194,7 @@ func TestSearchAndExpandPlainPathZeroSideEffects(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "plain-path-probe.db"))
+			store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "plain-path-probe.db"))
 			if err != nil {
 				t.Fatalf("NewSQLiteStore: %v", err)
 			}
@@ -203,7 +203,7 @@ func TestSearchAndExpandPlainPathZeroSideEffects(t *testing.T) {
 				t.Fatalf("Close probe store: %v", err)
 			}
 
-			messages := []Message{{Role: "user", Content: mustRawJSON(t, tt.text)}}
+			messages := []Message{{Role: "user", Content: mustMarshalJSON(t, tt.text)}}
 			wantMessages := append([]Message(nil), messages...)
 			budget := &Budget{ReExpansion: 4321}
 			beforeBudget := budget.RemainingReExpansion()
@@ -237,7 +237,7 @@ func TestSearchAndExpandNoRecallSummaryForPlainPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTokenCounter: %v", err)
 	}
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "no-summary.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "no-summary.db"))
 	if err != nil {
 		t.Fatalf("NewSQLiteStore: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestSearchAndExpandNoRecallSummaryForPlainPath(t *testing.T) {
 	var logs bytes.Buffer
 	meta := newRequestMeta(82, "no-summary-session")
 	meta.Logger = slog.New(NewLogHandler(&logs, slog.LevelDebug))
-	messages := []Message{{Role: "user", Content: mustRawJSON(t, `Archive search for C:\work\src\proxy.go with Read and Grep`)}}
+	messages := []Message{{Role: "user", Content: mustMarshalJSON(t, `Archive search for C:\work\src\proxy.go with Read and Grep`)}}
 	outcome := searchAndExpandWithMeta(messages, store, 100000, tc, &Budget{ReExpansion: 9999}, meta)
 	if outcome.Attempted {
 		t.Fatalf("普通路径 outcome.Attempted=true: %+v", outcome)
@@ -260,8 +260,8 @@ func TestSearchAndExpandDeepSearchExactPath(t *testing.T) {
 	store, tc, path := seedExactPathRecallStore(t)
 	stub := "[tool result archived → deep_search('" + path + "')]"
 	messages := []Message{
-		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "text", Text: stub}})},
-		{Role: "user", Content: mustRawJSON(t, "please inspect "+path)},
+		{Role: "assistant", Content: mustMarshalJSON(t, []ContentBlock{{Type: "text", Text: stub}})},
+		{Role: "user", Content: mustMarshalJSON(t, "please inspect "+path)},
 	}
 	outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "request-session")
 	if !outcome.Attempted || outcome.Candidates != 1 || outcome.Selected != 1 || outcome.Injected != 1 || outcome.TokenCost <= 0 {
@@ -275,8 +275,8 @@ func TestSearchAndExpandDeepSearchExactPath(t *testing.T) {
 	partial := `internal/proxy/proxy.go`
 	partialStub := "[tool result archived → deep_search('" + partial + "')]"
 	partialMessages := []Message{
-		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "text", Text: partialStub}})},
-		{Role: "user", Content: mustRawJSON(t, "please inspect "+partial)},
+		{Role: "assistant", Content: mustMarshalJSON(t, []ContentBlock{{Type: "text", Text: partialStub}})},
+		{Role: "user", Content: mustMarshalJSON(t, "please inspect "+partial)},
 	}
 	partialOutcome := searchAndExpandForSession(partialMessages, store, 100000, tc, &Budget{ReExpansion: 100000}, "request-session")
 	if !partialOutcome.Attempted || partialOutcome.Candidates != 0 || partialOutcome.Injected != 0 || !reflect.DeepEqual(partialOutcome.Messages, partialMessages) {
@@ -286,7 +286,7 @@ func TestSearchAndExpandDeepSearchExactPath(t *testing.T) {
 
 func TestSearchAndExpandRecoveryIntent(t *testing.T) {
 	store, tc, path := seedExactPathRecallStore(t)
-	messages := []Message{{Role: "user", Content: mustRawJSON(t, "请恢复存档 "+path)}}
+	messages := []Message{{Role: "user", Content: mustMarshalJSON(t, "请恢复存档 "+path)}}
 	outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "request-session")
 	if !outcome.Attempted || outcome.Candidates != 1 || outcome.Selected != 1 || outcome.Injected != 1 || outcome.TokenCost <= 0 {
 		t.Fatalf("明确恢复意图 outcome=%+v", outcome)
@@ -297,7 +297,7 @@ func TestSearchAndExpandRecoveryIntent(t *testing.T) {
 }
 
 func TestSearchAndExpandVisibilityGateBlocksIsolatedArchiveAcrossPaths(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "visibility-matrix.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "visibility-matrix.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +342,7 @@ func TestSearchAndExpandVisibilityGateBlocksIsolatedArchiveAcrossPaths(t *testin
 	}
 
 	t.Run("common prefix recovery remains visible", func(t *testing.T) {
-		messages := []Message{{Role: "user", Content: mustRawJSON(t, "restore archive from "+commonPath)}}
+		messages := []Message{{Role: "user", Content: mustMarshalJSON(t, "restore archive from "+commonPath)}}
 		outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "visibility-session")
 		if outcome.Injected != 1 || outcome.Candidates != 1 {
 			t.Fatalf("common prefix outcome=%+v", outcome)
@@ -353,7 +353,7 @@ func TestSearchAndExpandVisibilityGateBlocksIsolatedArchiveAcrossPaths(t *testin
 	})
 
 	t.Run("mixed recovery is invisible", func(t *testing.T) {
-		messages := []Message{{Role: "user", Content: mustRawJSON(t, "restore archive from "+mixedPath)}}
+		messages := []Message{{Role: "user", Content: mustMarshalJSON(t, "restore archive from "+mixedPath)}}
 		outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "visibility-session")
 		if !outcome.Attempted || outcome.Candidates != 0 || outcome.Selected != 0 || outcome.Injected != 0 {
 			t.Fatalf("mixed archive leaked through recovery: %+v", outcome)
@@ -366,8 +366,8 @@ func TestSearchAndExpandVisibilityGateBlocksIsolatedArchiveAcrossPaths(t *testin
 	t.Run("deep search old branch is invisible", func(t *testing.T) {
 		stub := "[tool result archived → deep_search('" + oldPath + "')]"
 		messages := []Message{
-			{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "text", Text: stub}})},
-			{Role: "user", Content: mustRawJSON(t, "please inspect "+oldPath)},
+			{Role: "assistant", Content: mustMarshalJSON(t, []ContentBlock{{Type: "text", Text: stub}})},
+			{Role: "user", Content: mustMarshalJSON(t, "please inspect "+oldPath)},
 		}
 		outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "visibility-session")
 		if !outcome.Attempted || outcome.Candidates != 0 || outcome.Injected != 0 {
@@ -402,7 +402,7 @@ func seedExactPathRecallStore(t *testing.T) (*SQLiteStore, *TokenCounter, string
 	if err != nil {
 		t.Fatalf("NewTokenCounter: %v", err)
 	}
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "exact-path.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "exact-path.db"))
 	if err != nil {
 		t.Fatalf("NewSQLiteStore: %v", err)
 	}
@@ -439,10 +439,10 @@ func seedRecoverableArchive(t *testing.T, store *SQLiteStore, sessionID, id stri
 func recoveryMarkerMessages(t *testing.T, canonicalID string) []Message {
 	t.Helper()
 	return []Message{
-		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{
+		{Role: "assistant", Content: mustMarshalJSON(t, []ContentBlock{
 			{Type: "text", Text: "历史已折叠 " + formatArchiveRecoveryMarker(canonicalID)},
 		})},
-		{Role: "user", Content: mustRawJSON(t, "请恢复存档")},
+		{Role: "user", Content: mustMarshalJSON(t, "请恢复存档")},
 	}
 }
 
@@ -476,7 +476,7 @@ func TestProductionRecallUsesVisibleLookupsOnly(t *testing.T) {
 }
 
 func TestSearchAndExpandExactRecoveryIDVisibilityGate(t *testing.T) {
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "exact-id.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "exact-id.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,10 +516,10 @@ func TestSearchAndExpandExactRecoveryIDVisibilityGate(t *testing.T) {
 
 	t.Run("没有恢复意图时 marker 不自动召回", func(t *testing.T) {
 		silent := []Message{
-			{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{
+			{Role: "assistant", Content: mustMarshalJSON(t, []ContentBlock{
 				{Type: "text", Text: "历史已折叠 " + formatArchiveRecoveryMarker("canonical-owner")},
 			})},
-			{Role: "user", Content: mustRawJSON(t, "继续实现下一个函数")},
+			{Role: "user", Content: mustMarshalJSON(t, "继续实现下一个函数")},
 		}
 		outcome := searchAndExpandForSession(silent, store, 100000, tc, &Budget{ReExpansion: 100000}, "owner-session")
 		if outcome.Attempted || outcome.Injected != 0 {
@@ -547,7 +547,7 @@ func TestSearchAndExpandKeywordRecallIsSessionScoped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTokenCounter: %v", err)
 	}
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "cross-session.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "cross-session.db"))
 	if err != nil {
 		t.Fatalf("NewSQLiteStore: %v", err)
 	}
@@ -562,7 +562,7 @@ func TestSearchAndExpandKeywordRecallIsSessionScoped(t *testing.T) {
 		t.Fatalf("SaveArchive: %v", err)
 	}
 	messages := []Message{
-		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "text", Text: "deep_search('flimflam warbler parser')"}})},
+		{Role: "assistant", Content: mustMarshalJSON(t, []ContentBlock{{Type: "text", Text: "deep_search('flimflam warbler parser')"}})},
 		{Role: "user", Content: json.RawMessage(`"explain flimflam warbler parser"`)},
 	}
 
@@ -584,7 +584,7 @@ func TestSearchAndExpandTop3Stable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTokenCounter: %v", err)
 	}
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "top3.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "top3.db"))
 	if err != nil {
 		t.Fatalf("NewSQLiteStore: %v", err)
 	}
@@ -671,7 +671,7 @@ func TestSearchAndExpandSameSessionDominance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTokenCounter: %v", err)
 	}
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "dominance.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "dominance.db"))
 	if err != nil {
 		t.Fatalf("NewSQLiteStore: %v", err)
 	}
@@ -706,7 +706,7 @@ func TestSearchAndExpandSameSessionRawHistorySkipsFullExpansion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTokenCounter: %v", err)
 	}
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "raw-history.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "raw-history.db"))
 	if err != nil {
 		t.Fatalf("NewSQLiteStore: %v", err)
 	}
@@ -737,7 +737,7 @@ func TestSearchAndExpandInPlaceReplacesDeepSearchStub(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTokenCounter: %v", err)
 	}
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "in-place.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "in-place.db"))
 	if err != nil {
 		t.Fatalf("NewSQLiteStore: %v", err)
 	}
@@ -749,7 +749,7 @@ func TestSearchAndExpandInPlaceReplacesDeepSearchStub(t *testing.T) {
 
 	stub := "[tool result archived → deep_search('flimflam warbler parser')]"
 	messages := []Message{
-		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "text", Text: stub}})},
+		{Role: "assistant", Content: mustMarshalJSON(t, []ContentBlock{{Type: "text", Text: stub}})},
 		{Role: "user", Content: json.RawMessage(`"explain flimflam warbler parser"`)},
 	}
 	outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "current")
@@ -767,7 +767,7 @@ func TestSearchAndExpandToolPairsAppendToLatestUser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTokenCounter: %v", err)
 	}
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "tool-pairs.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "tool-pairs.db"))
 	if err != nil {
 		t.Fatalf("NewSQLiteStore: %v", err)
 	}
@@ -779,8 +779,8 @@ func TestSearchAndExpandToolPairsAppendToLatestUser(t *testing.T) {
 	}
 
 	messages := []Message{
-		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "tool_use", ID: "tool-1", Name: "Read"}})},
-		{Role: "user", Content: mustRawJSON(t, []ContentBlock{{Type: "tool_result", ToolUseID: "tool-1", Content: "ok"}, {Type: "text", Text: "restore archive from " + path}})},
+		{Role: "assistant", Content: mustMarshalJSON(t, []ContentBlock{{Type: "tool_use", ID: "tool-1", Name: "Read"}})},
+		{Role: "user", Content: mustMarshalJSON(t, []ContentBlock{{Type: "tool_result", ToolUseID: "tool-1", Content: "ok"}, {Type: "text", Text: "restore archive from " + path}})},
 	}
 	outcome := searchAndExpandForSession(messages, store, 100000, tc, &Budget{ReExpansion: 100000}, "current")
 	if len(outcome.Messages) != len(messages) {
@@ -815,15 +815,6 @@ func allMessageTexts(messages []Message) []string {
 		}
 	}
 	return texts
-}
-
-func mustRawJSON(t *testing.T, value any) json.RawMessage {
-	t.Helper()
-	data, err := json.Marshal(value)
-	if err != nil {
-		t.Fatalf("marshal JSON: %v", err)
-	}
-	return data
 }
 
 // (a) 超限时巨型中间段 Files/Timeline 整段省略且各自原位置有一行标注，
@@ -919,7 +910,7 @@ func seedBudgetStore(t *testing.T) (*SQLiteStore, string, []Message, *TokenCount
 		t.Fatalf("NewTokenCounter: %v", err)
 	}
 
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "test.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "test.db"))
 	if err != nil {
 		t.Fatalf("NewSQLiteStore failed: %v", err)
 	}
@@ -1308,7 +1299,7 @@ func seedBudgetCandidates(t *testing.T, count int) (*SQLiteStore, []Message, *To
 	if err != nil {
 		t.Fatalf("NewTokenCounter: %v", err)
 	}
-	store, err := NewSQLiteStore(filepath.Join(t.TempDir(), "test.db"))
+	store, err := NewSQLiteStore(filepath.Join(tempDirRetryCleanup(t), "test.db"))
 	if err != nil {
 		t.Fatalf("NewSQLiteStore failed: %v", err)
 	}
@@ -1338,7 +1329,7 @@ func seedBudgetCandidates(t *testing.T, count int) (*SQLiteStore, []Message, *To
 	}
 
 	messages := []Message{
-		{Role: "assistant", Content: mustRawJSON(t, []ContentBlock{{Type: "text", Text: strings.Join(hints, "\n")}})},
+		{Role: "assistant", Content: mustMarshalJSON(t, []ContentBlock{{Type: "text", Text: strings.Join(hints, "\n")}})},
 		{Role: "user", Content: json.RawMessage(`"recall archive about flimflam warbler parser quokka serializer schema"`)},
 	}
 	return store, messages, tc, summary

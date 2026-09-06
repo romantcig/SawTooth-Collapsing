@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -35,7 +39,7 @@ var allowedDebugFactKeys = map[string]bool{
 }
 
 func TestDebugFactsPressureDecisionAndUsageJoin(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	cfg := DefaultConfig()
 	cfg.Debug = DebugConfig{Enabled: true, DataDir: dataDir}
 	s := NewServer(cfg)
@@ -131,7 +135,7 @@ func TestDebugFactsAuxiliaryUsageDoesNotClaimBaseline(t *testing.T) {
 		{name: "subagent", meta: &requestMeta{ID: 202, RequestSessionID: "subagent-usage", AgentRole: agentRoleSubagent}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			dataDir := t.TempDir()
+			dataDir := tempDirRetryCleanup(t)
 			cfg := DefaultConfig()
 			cfg.Debug = DebugConfig{Enabled: true, DataDir: dataDir}
 			s := NewServer(cfg)
@@ -160,7 +164,7 @@ func TestDebugFactsAuxiliaryUsageDoesNotClaimBaseline(t *testing.T) {
 }
 
 func TestDebugFactsForwardedDoesNotReplacePressure(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	cfg := DefaultConfig()
 	cfg.Debug = DebugConfig{Enabled: true, DataDir: dataDir}
 	s := NewServer(cfg)
@@ -274,7 +278,7 @@ func TestPressureSummarySingleMainOnly(t *testing.T) {
 }
 
 func TestDebugFactsSchemaAndSecretSafety(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	cfg := DefaultConfig()
 	cfg.Debug = DebugConfig{Enabled: true, FullBody: false, DataDir: dataDir}
 	s := NewServer(cfg)
@@ -381,7 +385,7 @@ func TestDebugFactsSchemaAndSecretSafety(t *testing.T) {
 }
 
 func TestDebugFactsConcurrentStagesDoNotOverwrite(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	cfg := DefaultConfig()
 	cfg.Debug = DebugConfig{Enabled: true, DataDir: dataDir}
 	s := NewServer(cfg)
@@ -415,7 +419,7 @@ func TestDebugFactsConcurrentStagesDoNotOverwrite(t *testing.T) {
 }
 
 func TestDebugFactsUsageUsesTotalInputTokens(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	cfg := DefaultConfig()
 	cfg.Debug = DebugConfig{Enabled: true, DataDir: dataDir}
 	s := NewServer(cfg)
@@ -466,7 +470,7 @@ func TestDecodedBase64SizeValidatesInput(t *testing.T) {
 }
 
 func TestDebugFactsInvalidMediaBase64UsesRestrictedError(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	cfg := DefaultConfig()
 	cfg.Debug = DebugConfig{Enabled: true, DataDir: dataDir}
 	s := NewServer(cfg)
@@ -494,7 +498,7 @@ func TestDebugFactsInvalidMediaBase64UsesRestrictedError(t *testing.T) {
 }
 
 func TestDebugFactsUseUnifiedLayoutAndStableStageNames(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	cfg := DefaultConfig()
 	cfg.Debug = DebugConfig{Enabled: true, FullBody: true, DataDir: dataDir}
 	s := NewServer(cfg)
@@ -546,7 +550,7 @@ func TestDebugFullBodyDefaultsOff(t *testing.T) {
 	if cfg.Debug.FullBody {
 		t.Fatal("DefaultConfig debug.full_body 必须为 false")
 	}
-	configPath := filepath.Join(t.TempDir(), "sawtooth.yaml")
+	configPath := filepath.Join(tempDirRetryCleanup(t), "sawtooth.yaml")
 	yamlData := []byte("debug:\n  enabled: true\n  full_body: false\n  data_dir: ./debug\n")
 	if err := os.WriteFile(configPath, yamlData, 0600); err != nil {
 		t.Fatal(err)
@@ -558,53 +562,6 @@ func TestDebugFullBodyDefaultsOff(t *testing.T) {
 	if !loaded.Debug.Enabled || loaded.Debug.FullBody || loaded.Debug.DataDir != "./debug" {
 		t.Fatalf("debug 配置解析错误: %+v", loaded.Debug)
 	}
-}
-
-func setServerDebugConfigForTest(t *testing.T, server *Server, cfg DebugConfig) {
-	t.Helper()
-	layout, err := newDebugLayout(cfg.DataDir, nil)
-	if err != nil {
-		t.Fatalf("初始化测试 DebugLayout: %v", err)
-	}
-	server.Config.Debug = cfg
-	server.debugLayout = layout
-	server.debugRunID = layout.RunID()
-}
-
-func readDebugFactFiles(t *testing.T, dataDir, sessionID string) [][]byte {
-	t.Helper()
-	dir, ok := safeDebugSessionDir(dataDir, sessionID)
-	if !ok {
-		t.Fatal("debug dir invalid")
-	}
-	factNames := map[string]bool{
-		"raw_meta.json":       true,
-		"forwarded_meta.json": true,
-		"pressure.json":       true,
-		"usage.json":          true,
-	}
-	var paths []string
-	if err := filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if !info.IsDir() && factNames[info.Name()] {
-			paths = append(paths, path)
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	sort.Strings(paths)
-	files := make([][]byte, 0, len(paths))
-	for _, path := range paths {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		files = append(files, data)
-	}
-	return files
 }
 
 // ── Plan 08 Task 1：普通日志只保留唯一最终结果 ──
@@ -738,7 +695,7 @@ func TestPressureDecisionFactRemains(t *testing.T) {
 	logs := captureOrdinaryLogs(t)
 	upstream := jsonOutcomeUpstream(t)
 	server, sink := newOutcomePipelineServer(t, upstream.URL)
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, DataDir: dataDir})
 
 	const sessionID = "pressure-fact-remains"
@@ -768,7 +725,7 @@ func TestResponseUsageFactRemains(t *testing.T) {
 	logs := captureOrdinaryLogs(t)
 	upstream := jsonOutcomeUpstream(t)
 	server, sink := newOutcomePipelineServer(t, upstream.URL)
-	dataDir := t.TempDir()
+	dataDir := tempDirRetryCleanup(t)
 	setServerDebugConfigForTest(t, server, DebugConfig{Enabled: true, DataDir: dataDir})
 
 	const sessionID = "usage-fact-remains"
@@ -792,19 +749,195 @@ func TestResponseUsageFactRemains(t *testing.T) {
 	assertNoSupersededOrdinarySummary(t, logs.String())
 }
 
-func debugFactsByStage(t *testing.T, dataDir, sessionID string) map[debugStage]map[string]any {
-	t.Helper()
-	result := make(map[debugStage]map[string]any)
-	for _, data := range readDebugFactFiles(t, dataDir, sessionID) {
-		var fact map[string]any
-		if err := json.Unmarshal(data, &fact); err != nil {
-			t.Fatalf("解析 facts: %v: %s", err, data)
-		}
-		stage, _ := fact["stage"].(string)
-		if _, exists := result[debugStage(stage)]; exists {
-			t.Fatalf("stage %q 重复: %v", stage, result)
-		}
-		result[debugStage(stage)] = fact
+func TestDebugRunIDIsFixedPerServerAndSeparatesRestarts(t *testing.T) {
+	dataDir := tempDirRetryCleanup(t)
+	first := NewServer(Config{Debug: DebugConfig{DataDir: dataDir}})
+	second := NewServer(Config{Debug: DebugConfig{DataDir: dataDir}})
+	hexPattern := regexp.MustCompile(`^[0-9a-f]{16}$`)
+	if !hexPattern.MatchString(first.debugRunID) {
+		t.Fatalf("first run ID=%q，不是 16 位小写 hex", first.debugRunID)
 	}
-	return result
+	if !hexPattern.MatchString(second.debugRunID) {
+		t.Fatalf("second run ID=%q，不是 16 位小写 hex", second.debugRunID)
+	}
+	if first.debugRunID == second.debugRunID {
+		t.Fatalf("两个 Server 复用了 run ID: %q", first.debugRunID)
+	}
+
+	firstMeta := first.nextRequestMeta("same-session")
+	secondMeta := first.nextRequestMeta("same-session")
+	if firstMeta.RunID != first.debugRunID || secondMeta.RunID != first.debugRunID {
+		t.Fatalf("同一 Server 请求未固定 run ID: first=%q second=%q server=%q", firstMeta.RunID, secondMeta.RunID, first.debugRunID)
+	}
+	if firstMeta.SessionHash != stableSessionHash("same-session") || secondMeta.SessionHash != firstMeta.SessionHash {
+		t.Fatalf("request meta 未固定稳定 session hash: first=%q second=%q", firstMeta.SessionHash, secondMeta.SessionHash)
+	}
 }
+
+func TestDebugRequestPathUsesStrictHierarchyAndStageEnum(t *testing.T) {
+	dataDir := tempDirRetryCleanup(t)
+	server := NewServer(Config{Debug: DebugConfig{DataDir: dataDir}})
+	meta := server.nextRequestMeta("session-path-secret")
+	path, err := server.debugLayout.RequestPath(meta, debugArtifactRawBody)
+	if err != nil {
+		t.Fatalf("合法 debug path: %v", err)
+	}
+	want := filepath.Join(dataDir, "debug", meta.SessionHash, meta.RunID, strconv.FormatUint(meta.ID, 10), "raw.json")
+	want, _ = filepath.Abs(want)
+	if path != want {
+		t.Fatalf("debug path=%q，want %q", path, want)
+	}
+
+	for _, stage := range []debugArtifactStage{"../escape", `raw/escape`, `raw\\escape`, "unknown"} {
+		if _, err := server.debugLayout.RequestPath(meta, stage); err == nil {
+			t.Fatalf("非法 stage %q 未失败关闭", stage)
+		}
+	}
+	badMeta := newRequestMeta(meta.ID, meta.RequestSessionID)
+	badMeta.RunID = meta.RunID
+	badMeta.SessionHash = "../../escape"
+	if _, err := server.debugLayout.RequestPath(badMeta, debugArtifactRawBody); err == nil {
+		t.Fatal("非法 session hash 未失败关闭")
+	}
+}
+
+func TestDebugRunIDSeparatesSameRequestAcrossServers(t *testing.T) {
+	dataDir := tempDirRetryCleanup(t)
+	first := NewServer(Config{Debug: DebugConfig{DataDir: dataDir}})
+	second := NewServer(Config{Debug: DebugConfig{DataDir: dataDir}})
+	firstMeta := first.nextRequestMeta("restart-session")
+	secondMeta := second.nextRequestMeta("restart-session")
+	firstPath, err := first.debugLayout.RequestPath(firstMeta, debugArtifactPressure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPath, err := second.debugLayout.RequestPath(secondMeta, debugArtifactPressure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstMeta.ID != secondMeta.ID || firstPath == secondPath {
+		t.Fatalf("重启隔离失败: request=%d/%d path=%q/%q", firstMeta.ID, secondMeta.ID, firstPath, secondPath)
+	}
+}
+
+func TestDebugSessionMetadataCreatedOnceAndValidated(t *testing.T) {
+	dataDir := tempDirRetryCleanup(t)
+	server := NewServer(Config{Debug: DebugConfig{DataDir: dataDir}})
+	const sessionID = "session-metadata-secret"
+
+	const requests = 24
+	var wg sync.WaitGroup
+	errs := make(chan error, requests)
+	for index := 0; index < requests; index++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			meta := server.nextRequestMeta(sessionID)
+			errs <- server.debugLayout.Write(meta, debugArtifactPressure, []byte(`{"ok":true}`))
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("并发 debug 写入失败: %v", err)
+		}
+	}
+
+	sessionDir := filepath.Join(dataDir, "debug", stableSessionHash(sessionID))
+	entries, err := os.ReadDir(sessionDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadataCount := 0
+	for _, entry := range entries {
+		if entry.Name() == "session.json" {
+			metadataCount++
+		}
+	}
+	if metadataCount != 1 {
+		t.Fatalf("session metadata 数量=%d，want 1: %+v", metadataCount, entries)
+	}
+	metadataPath := filepath.Join(sessionDir, "session.json")
+	original, err := os.ReadFile(metadataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := server.nextRequestMeta(sessionID)
+	if err := server.debugLayout.EnsureSessionMetadata(meta); err != nil {
+		t.Fatalf("相同 session metadata 验证失败: %v", err)
+	}
+	after, _ := os.ReadFile(metadataPath)
+	if !bytes.Equal(after, original) {
+		t.Fatal("重复 metadata 验证改写了旧字节")
+	}
+}
+
+func TestDebugDuplicateStageFailsWithoutOverwrite(t *testing.T) {
+	server := NewServer(Config{Debug: DebugConfig{DataDir: tempDirRetryCleanup(t)}})
+	meta := server.nextRequestMeta("duplicate-stage")
+	if err := server.debugLayout.Write(meta, debugArtifactUsage, []byte("first")); err != nil {
+		t.Fatalf("首次写入: %v", err)
+	}
+	path, err := server.debugLayout.RequestPath(meta, debugArtifactUsage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.debugLayout.Write(meta, debugArtifactUsage, []byte("second")); err == nil {
+		t.Fatal("重复 stage 写入未报错")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "first" {
+		t.Fatalf("重复写入覆盖旧证据: %q", data)
+	}
+}
+
+func TestDebugLayoutUsesExclusive0600Writer(t *testing.T) {
+	server := NewServer(Config{Debug: DebugConfig{DataDir: tempDirRetryCleanup(t)}})
+	var flags []int
+	var perms []os.FileMode
+	server.debugLayout.openFile = func(name string, flag int, perm os.FileMode) (debugWriteCloser, error) {
+		flags = append(flags, flag)
+		perms = append(perms, perm)
+		return os.OpenFile(name, flag, perm)
+	}
+	meta := server.nextRequestMeta("permission-contract")
+	if err := server.debugLayout.Write(meta, debugArtifactPressure, []byte("{}")); err != nil {
+		t.Fatalf("写入 debug stage: %v", err)
+	}
+	if len(flags) != 2 || len(perms) != 2 {
+		t.Fatalf("metadata/stage opener 调用数=%d/%d，want 2", len(flags), len(perms))
+	}
+	for index := range flags {
+		if flags[index]&(os.O_CREATE|os.O_EXCL|os.O_WRONLY) != (os.O_CREATE | os.O_EXCL | os.O_WRONLY) {
+			t.Fatalf("第 %d 次 opener flags=%#x，缺少 O_CREATE|O_EXCL|O_WRONLY", index, flags[index])
+		}
+		if perms[index] != 0600 {
+			t.Fatalf("第 %d 次 opener perm=%#o，want 0600", index, perms[index])
+		}
+	}
+}
+
+func TestDebugLayoutRandomFailureIsFailClosed(t *testing.T) {
+	if _, err := newDebugLayout(tempDirRetryCleanup(t), failingDebugRandom{}); err == nil {
+		t.Fatal("随机源失败时仍创建 DebugLayout")
+	}
+	server, err := newServerWithDebugRandom(Config{Debug: DebugConfig{DataDir: tempDirRetryCleanup(t)}}, failingDebugRandom{})
+	if err == nil {
+		t.Fatal("随机源失败时 NewServer 测试入口未返回错误")
+	}
+	if server.debugLayout != nil || server.debugRunID != "" {
+		t.Fatalf("随机源失败后保留可预测 layout: layout=%v run=%q", server.debugLayout, server.debugRunID)
+	}
+}
+
+type failingDebugRandom struct{}
+
+func (failingDebugRandom) Read([]byte) (int, error) {
+	return 0, errors.New("random unavailable")
+}
+
+var _ io.Reader = failingDebugRandom{}

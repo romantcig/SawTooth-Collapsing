@@ -1424,3 +1424,299 @@ func TestFrozenAndSawtoothResultBearingPersistence(t *testing.T) {
 		t.Fatalf("兼容 void callback 伪造了 saved: receipt=%+v disk=%q", receipt, legacyProbe.diskState())
 	}
 }
+
+func TestFrozenFullRawPrefixRejectsEarlyEditWithStableBoundary(t *testing.T) {
+	raw := []Message{
+		{Role: "user", Content: mustMarshal("early-original")},
+		{Role: "assistant", Content: mustMarshal("middle-original")},
+		{Role: "user", Content: mustMarshal("boundary")},
+		{Role: "assistant", Content: mustMarshal("tail")},
+	}
+	frozen := NewFrozenStubs()
+	frozen.StoreWithLogger(nil, "full-prefix", []Message{{Role: "assistant", Content: mustMarshal("stubbed")}}, 3, raw[2], 10, 100, raw)
+
+	changed := deepCopyMessages(raw)
+	changed[0].Content = mustMarshal("early-edited")
+	if got := frozen.Get("full-prefix", changed); got != nil {
+		t.Fatal("cutoff 前早期消息变化且 boundary 不变时不应命中 Frozen")
+	}
+}
+
+func TestFrozenFullRawPrefixAcceptsKnownWireEquivalent(t *testing.T) {
+	raw := []Message{
+		{Role: "user", Content: mustMarshal("hello")},
+		{Role: "assistant", Content: json.RawMessage(`[{"type":"text","text":"answer","cache_control":{"type":"ephemeral"}}]`)},
+		{Role: "user", Content: mustMarshal("boundary")},
+	}
+	frozen := NewFrozenStubs()
+	frozen.Store("wire-equivalent", []Message{{Role: "assistant", Content: mustMarshal("stubbed")}}, 3, raw[2], 10, 100, raw)
+
+	equivalent := deepCopyMessages(raw)
+	equivalent[1].Content = json.RawMessage(`"answer"`)
+	if got := frozen.Get("wire-equivalent", equivalent); got == nil {
+		t.Fatal("纯字符串与单 text block 等价形态不应使 Frozen 失效")
+	}
+}
+
+func TestFrozenFullRawPrefixRejectsBusinessPayloadChanges(t *testing.T) {
+	raw := []Message{
+		{Role: "user", Content: json.RawMessage(`[{"type":"tool_use","id":"tool-1","name":"read","input":{"path":"a"}}]`)},
+		{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"tool-1","content":"same"}]`)},
+		{Role: "assistant", Content: mustMarshal("boundary")},
+	}
+	frozen := NewFrozenStubs()
+	frozen.Store("business-payload", []Message{{Role: "assistant", Content: mustMarshal("stubbed")}}, 3, raw[2], 10, 100, raw)
+
+	cases := []struct {
+		name   string
+		mutate func([]Message)
+	}{
+		{name: "tool input", mutate: func(messages []Message) {
+			messages[0].Content = json.RawMessage(`[{"type":"tool_use","id":"tool-1","name":"read","input":{"path":"b"}}]`)
+		}},
+		{name: "tool result", mutate: func(messages []Message) {
+			messages[1].Content = json.RawMessage(`[{"type":"tool_result","tool_use_id":"tool-1","content":"changed"}]`)
+		}},
+		{name: "unknown field", mutate: func(messages []Message) {
+			messages[0].Content = json.RawMessage(`[{"type":"tool_use","id":"tool-1","name":"read","input":{"path":"a"},"future_semantic":true}]`)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			current := deepCopyMessages(raw)
+			tc.mutate(current)
+			if got := frozen.Get("business-payload", current); got != nil {
+				t.Fatal("业务 payload 变化后 Frozen 仍命中")
+			}
+		})
+	}
+}
+
+func TestFrozenLegacyPersistedStateWithoutRawPrefixHashFailsClosed(t *testing.T) {
+	raw := frozenTestMessages(3)
+	prefix := deepCopyMessages(raw[:1])
+	prefixJSON, err := json.Marshal(prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := json.Marshal(frozenPersisted{
+		Messages: prefix, Cutoff: 2,
+		BoundaryHash: stableBoundaryHash(raw[1]),
+		PrefixHash:   sha256hex(prefixJSON), Tokens: 10, RawTokens: 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleted := 0
+	frozen := NewFrozenStubs()
+	frozen.SetLoadFunc(func(string) (string, bool) { return string(persisted), true })
+	frozen.SetDeleteFunc(func(string) { deleted++ })
+	if got := frozen.Get("legacy-prefix", raw); got != nil {
+		t.Fatal("缺少完整 raw prefix hash 的旧状态不得命中")
+	}
+	if deleted != 1 {
+		t.Fatalf("旧 schema 失效后删除次数=%d，want 1", deleted)
+	}
+}
+
+func TestFrozenThinkingSignatureChangeMissesButDoesNotNeedBoundaryGuess(t *testing.T) {
+	raw := []Message{
+		{Role: "assistant", Content: json.RawMessage(`[{"type":"thinking","thinking":"one","signature":"sig-1"}]`)},
+		{Role: "user", Content: mustMarshal("boundary")},
+	}
+	frozen := NewFrozenStubs()
+	frozen.Store("thinking-signature", []Message{{Role: "assistant", Content: mustMarshal("stubbed")}}, 2, raw[1], 10, 100, raw)
+	changed := deepCopyMessages(raw)
+	changed[0].Content = json.RawMessage(`[{"type":"thinking","thinking":"two","signature":"sig-2"}]`)
+	if got := frozen.Get("thinking-signature", changed); got != nil {
+		t.Fatal("thinking/signature 变化后 Frozen 不应仅凭 boundary 命中")
+	}
+}
+
+func TestFrozenFullRawPrefixPersistsAndRestores(t *testing.T) {
+	raw := frozenTestMessages(4)
+	persisted := make(map[string]string)
+	source := NewFrozenStubs()
+	source.SetPersistFunc(func(key, value string) { persisted[key] = value })
+	source.Store("persisted-full", raw[:1], 3, raw[2], 10, 100, raw)
+
+	var state frozenPersisted
+	if err := json.Unmarshal([]byte(persisted["frozen:persisted-full"]), &state); err != nil {
+		t.Fatalf("解析 Frozen 持久状态: %v", err)
+	}
+	if state.RawPrefixMode != frozenRawPrefixModeFull || !validPressureFingerprint(state.RawPrefixHash) {
+		t.Fatalf("持久化 raw prefix proof 不完整: mode=%q hash=%q", state.RawPrefixMode, state.RawPrefixHash)
+	}
+
+	restored := NewFrozenStubs()
+	restored.SetLoadFunc(func(key string) (string, bool) {
+		value, ok := persisted[key]
+		return value, ok
+	})
+	if got := restored.Get("persisted-full", raw); got == nil {
+		t.Fatal("完整 raw prefix proof 冷启动后未命中")
+	}
+}
+
+func TestTriggerEvaluation(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name             string
+		selectedPressure int
+		lastRequestAgo   time.Duration
+		wantReason       TriggerReason
+		wantActualKnown  bool
+	}{
+		{
+			name:             "emergency 优先于 token 与 pause",
+			selectedPressure: 11_001,
+			lastRequestAgo:   5 * time.Minute,
+			wantReason:       TriggerEmergency,
+			wantActualKnown:  true,
+		},
+		{
+			name:             "tokens 优先于 pause",
+			selectedPressure: 1_001,
+			lastRequestAgo:   5 * time.Minute,
+			wantReason:       TriggerTokens,
+			wantActualKnown:  true,
+		},
+		{
+			name:             "pause 使用本次等待快照",
+			selectedPressure: 501,
+			lastRequestAgo:   5 * time.Minute,
+			wantReason:       TriggerPause,
+			wantActualKnown:  true,
+		},
+		{
+			name:             "minimum 相等时不触发 pause",
+			selectedPressure: 500,
+			lastRequestAgo:   5 * time.Minute,
+			wantReason:       TriggerNone,
+			wantActualKnown:  true,
+		},
+		{
+			name:             "没有历史时间时 actual wait unavailable",
+			selectedPressure: 501,
+			wantReason:       TriggerNone,
+			wantActualKnown:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trigger := NewSawtoothTrigger(CacheGapForTTL("ephemeral"), 1_000, 500)
+			if tt.lastRequestAgo > 0 {
+				trigger.mu.Lock()
+				trigger.lastRequestTime["thread"] = now.Add(-tt.lastRequestAgo)
+				trigger.mu.Unlock()
+			}
+
+			evaluation := trigger.Evaluate("thread", tt.selectedPressure, now)
+			if evaluation.Reason != tt.wantReason {
+				t.Fatalf("Evaluate reason=%q, want %q", evaluation.Reason, tt.wantReason)
+			}
+			if evaluation.RequiredWait != 4*time.Minute {
+				t.Fatalf("RequiredWait=%s, want 4m", evaluation.RequiredWait)
+			}
+			if evaluation.ActualWaitKnown != tt.wantActualKnown {
+				t.Fatalf("ActualWaitKnown=%v, want %v", evaluation.ActualWaitKnown, tt.wantActualKnown)
+			}
+			if tt.wantActualKnown {
+				if evaluation.ActualWait != tt.lastRequestAgo {
+					t.Fatalf("ActualWait=%s, want %s", evaluation.ActualWait, tt.lastRequestAgo)
+				}
+			} else if evaluation.ActualWait != 0 {
+				t.Fatalf("unknown ActualWait=%s, want zero", evaluation.ActualWait)
+			}
+			if evaluation.SelectedPressure != tt.selectedPressure {
+				t.Fatalf("SelectedPressure=%d, want %d", evaluation.SelectedPressure, tt.selectedPressure)
+			}
+			if evaluation.EmergencyThreshold != 11_000 || evaluation.TokenThreshold != 1_000 || evaluation.TokenMinimum != 500 {
+				t.Fatalf("threshold snapshot=%+v", evaluation)
+			}
+			if got := trigger.ShouldTrigger("thread", tt.selectedPressure); got != tt.wantReason {
+				t.Fatalf("ShouldTrigger=%q, want %q", got, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestTriggerEvaluationStrictPriority(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name             string
+		selectedPressure int
+		lastRequestAgo   time.Duration
+		wantReason       TriggerReason
+	}{
+		{name: "超过 emergency", selectedPressure: 11_001, lastRequestAgo: 5 * time.Minute, wantReason: TriggerEmergency},
+		{name: "等于 emergency 后落到 tokens", selectedPressure: 11_000, lastRequestAgo: 5 * time.Minute, wantReason: TriggerTokens},
+		{name: "超过 tokens", selectedPressure: 1_001, lastRequestAgo: 5 * time.Minute, wantReason: TriggerTokens},
+		{name: "等于 tokens 后落到 pause", selectedPressure: 1_000, lastRequestAgo: 5 * time.Minute, wantReason: TriggerPause},
+		{name: "等于 minimum", selectedPressure: 500, lastRequestAgo: 5 * time.Minute, wantReason: TriggerNone},
+		{name: "等于 required wait", selectedPressure: 501, lastRequestAgo: 4 * time.Minute, wantReason: TriggerNone},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			trigger := NewSawtoothTrigger(4*time.Minute, 1_000, 500)
+			trigger.mu.Lock()
+			trigger.lastRequestTime["thread"] = now.Add(-tt.lastRequestAgo)
+			trigger.mu.Unlock()
+
+			if got := trigger.Evaluate("thread", tt.selectedPressure, now).Reason; got != tt.wantReason {
+				t.Fatalf("reason=%q, want %q", got, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestTriggerEvaluationCurrentAndNextTTL(t *testing.T) {
+	now := time.Now()
+	trigger := NewSawtoothTrigger(CacheGapForTTL("ephemeral"), 1_000, 500)
+	trigger.mu.Lock()
+	trigger.lastRequestTime["thread"] = now.Add(-5 * time.Minute)
+	trigger.mu.Unlock()
+
+	current := trigger.Evaluate("thread", 501, now)
+	trigger.SetPauseThreshold(CacheGapForTTL("1h"))
+	next := trigger.Evaluate("thread", 501, now)
+
+	if current.Reason != TriggerPause || current.RequiredWait != 4*time.Minute || current.ActualWait != 5*time.Minute || !current.ActualWaitKnown {
+		t.Fatalf("current evaluation=%+v", current)
+	}
+	if next.Reason != TriggerNone || next.RequiredWait != 61*time.Minute || next.ActualWait != 5*time.Minute || !next.ActualWaitKnown {
+		t.Fatalf("next evaluation=%+v", next)
+	}
+	if current.RequiredWait != 4*time.Minute {
+		t.Fatalf("TTL 更新污染已完成 evaluation: %+v", current)
+	}
+
+	trigger.mu.Lock()
+	trigger.lastRequestTime["thread"] = now.Add(-62 * time.Minute)
+	trigger.mu.Unlock()
+	oneHour := trigger.Evaluate("thread", 501, now)
+	if oneHour.Reason != TriggerPause || oneHour.RequiredWait != 61*time.Minute || oneHour.ActualWait != 62*time.Minute {
+		t.Fatalf("1h evaluation=%+v", oneHour)
+	}
+}
+
+func TestCacheGapForTTL(t *testing.T) {
+	tests := []struct {
+		cacheTTL string
+		want     time.Duration
+	}{
+		{cacheTTL: "ephemeral", want: 4 * time.Minute},
+		{cacheTTL: "1h", want: 61 * time.Minute},
+		{cacheTTL: "", want: 4 * time.Minute},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.cacheTTL, func(t *testing.T) {
+			if got := CacheGapForTTL(tt.cacheTTL); got != tt.want {
+				t.Fatalf("CacheGapForTTL(%q)=%s, want %s", tt.cacheTTL, got, tt.want)
+			}
+		})
+	}
+}

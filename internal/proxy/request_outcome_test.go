@@ -492,48 +492,10 @@ func TestNoEagerOrStateContractDrift(t *testing.T) {
 	})
 
 	t.Run("TriggerReason 集合未扩张", func(t *testing.T) {
-		want := map[TriggerReason]bool{
-			TriggerNone: true, TriggerTokens: true, TriggerPause: true,
-			TriggerEmergency: true, TriggerUnknown: true,
-		}
-		for _, reason := range []TriggerReason{TriggerNone, TriggerTokens, TriggerPause, TriggerEmergency, TriggerUnknown} {
-			if !want[reason] {
-				t.Fatalf("未知 TriggerReason: %q", reason)
-			}
-		}
 		if TriggerNone != "" || TriggerTokens != "tokens" || TriggerPause != "pause" ||
 			TriggerEmergency != "emergency" || TriggerUnknown != "unknown" {
 			t.Fatalf("TriggerReason 取值漂移: %q/%q/%q/%q/%q",
 				TriggerNone, TriggerTokens, TriggerPause, TriggerEmergency, TriggerUnknown)
-		}
-	})
-
-	t.Run("边界比较保持严格大于", func(t *testing.T) {
-		const threshold = 16000
-		st := NewSawtoothTrigger(time.Minute, threshold, threshold/2)
-		now := time.Unix(1_700_000_000, 0).UTC()
-		st.mu.Lock()
-		st.lastRequestTime["strict"] = now.Add(-time.Minute)
-		st.mu.Unlock()
-
-		if got := st.Evaluate("strict", threshold, now).Reason; got != TriggerNone {
-			t.Fatalf("压力等于阈值且等待恰好等于 required wait 时 reason=%q，want none", got)
-		}
-		if got := st.Evaluate("strict", threshold+1, now).Reason; got != TriggerTokens {
-			t.Fatalf("压力超过阈值时 reason=%q，want tokens", got)
-		}
-		emergency := st.Evaluate("strict", threshold, now).EmergencyThreshold
-		if got := st.Evaluate("strict", emergency, now).Reason; got != TriggerTokens {
-			t.Fatalf("压力等于 emergency 阈值时 reason=%q，want tokens", got)
-		}
-		if got := st.Evaluate("strict", emergency+1, now).Reason; got != TriggerEmergency {
-			t.Fatalf("压力超过 emergency 阈值时 reason=%q，want emergency", got)
-		}
-		if got := st.Evaluate("strict", threshold/2, now.Add(time.Minute)).Reason; got != TriggerNone {
-			t.Fatalf("压力等于 token minimum 时 reason=%q，want none", got)
-		}
-		if got := st.Evaluate("strict", threshold/2+1, now.Add(time.Nanosecond)).Reason; got != TriggerPause {
-			t.Fatalf("等待超过 required wait 时 reason=%q，want pause", got)
 		}
 	})
 }

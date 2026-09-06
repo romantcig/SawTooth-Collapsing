@@ -26,9 +26,16 @@ const tempDirCleanupAttempts = 10
 func tempDirRetryCleanup(t *testing.T) string {
 	t.Helper()
 
-	// 子测试名以 / 分隔，而 os.MkdirTemp 的 pattern 一旦含路径分隔符会直接报错；
-	// 换成下划线后，残留目录仍能靠名字定位到是哪个测试留下的。
-	name := strings.ReplaceAll(t.Name(), "/", "_")
+	// 子测试名可能携带路径分隔符与 Windows 文件名非法字符（如路径逃逸测试的
+	// "..\\escape"、"C:\escape" 子测试名），而 os.MkdirTemp 的 pattern 一旦含
+	// 路径分隔符会直接报错；统一下划线化后，残留目录仍能靠名字定位到是哪个测试留下的。
+	name := strings.Map(func(r rune) rune {
+		switch r {
+		case '/', '\\', ':', '"', '<', '>', '|', '?', '*':
+			return '_'
+		}
+		return r
+	}, t.Name())
 	dir, err := os.MkdirTemp("", "sawtooth-"+name+"-")
 	if err != nil {
 		// 创建不出临时目录是真实故障，必须判红。

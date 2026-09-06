@@ -6,32 +6,6 @@ import (
 	"testing"
 )
 
-// countBlockType 解析消息 Content 并统计指定 Type 的 block 数量。
-func countBlockType(t *testing.T, msg Message, blockType string) int {
-	t.Helper()
-	blocks, _ := parseContent(msg.Content)
-	n := 0
-	for _, b := range blocks {
-		if b.Type == blockType {
-			n++
-		}
-	}
-	return n
-}
-
-// allText 解析消息 Content 并拼接所有 text block 的文本。
-func allText(t *testing.T, msg Message) string {
-	t.Helper()
-	blocks, _ := parseContent(msg.Content)
-	var sb strings.Builder
-	for _, b := range blocks {
-		if b.Type == "text" {
-			sb.WriteString(b.Text)
-		}
-	}
-	return sb.String()
-}
-
 func TestStripReminders(t *testing.T) {
 	// 用例 1：旧消息含非 SessionStart 的 system-reminder → 被移除。
 	t.Run("移除非SessionStart的system-reminder", func(t *testing.T) {
