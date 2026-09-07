@@ -13,6 +13,10 @@ type requestMeta struct {
 	AgentRole               agentRole
 	AgentReason             agentClassificationReason
 	PressureDecision        pressureDecision
+	// PressureEntryCoordinates 是入口 raw 坐标（HandleMessages 在任何改写前
+	// 捕获）。响应侧 applyPressureBaselineUsage 用它写 baseline，不使用会被
+	// 折叠改写的 wire 坐标。
+	PressureEntryCoordinates pressureEntryCoordinates
 	BaselineUpdateKind      pressureBaselineUpdateKind
 	BaselineGeneration      uint64
 	HistoryEpoch            uint64

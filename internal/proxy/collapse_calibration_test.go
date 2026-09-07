@@ -359,7 +359,7 @@ func TestCalibratedSourcesSkipRatio(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTokenCounter: %v", err)
 	}
-	decision := buildPressureDecision(messages, nil, nil, baseline, tc, 1000)
+	decision := buildPressureDecisionWithEntry(messages, nil, nil, baseline, tc, 1000)
 	if decision.Source != pressureSourceActualPlusDelta {
 		t.Fatalf("fixture 应落 actual_plus_delta: %s", decision.Source)
 	}
@@ -458,4 +458,76 @@ func messagesWithTotalTokens(t *testing.T, tc *TokenCounter, target int) []Messa
 		messages = append(messages, message)
 	}
 	return messages
+}
+
+// ── baseline 坐标契约（折叠 → raw 回放跨请求回归）──
+
+// 死循环回归：折叠轮之后 baseline 必须记入口 raw 坐标，第二轮 CC 回放全量
+// raw + 追加时 actual_plus_delta 主路径必须生效。此前 actual 被绑到折叠后
+// wire 坐标（4a6e27d），第二轮 raw 回放与 wire 坐标永远失配（messages_changed），
+// 判定每轮回落 local_full × 校准系数并再次触发折叠——反复折叠死循环。
+func TestPressureBaselineSurvivesCollapseRewrite(t *testing.T) {
+	const (
+		sessionID = "baseline-survives-collapse"
+		threshold = 60000
+	)
+	var forwardedMessageCounts []int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var payload struct {
+			Messages []Message `json:"messages"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		forwardedMessageCounts = append(forwardedMessageCounts, len(payload.Messages))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"type":"message","usage":{"input_tokens":2400,"output_tokens":1}}`)
+	}))
+	defer upstream.Close()
+
+	server := newPipelineTestServerWithThreshold(t, upstream.URL, threshold)
+	var secondDecision pressureDecision
+	server.searchAndExpandFn = func(current []Message, _ *SQLiteStore, _ int, _ *TokenCounter, _ *Budget, meta *requestMeta) RecallOutcome {
+		secondDecision = meta.PressureDecision
+		return RecallOutcome{Messages: current}
+	}
+
+	// 第一轮：超过阈值的完整 history 触发折叠。
+	first := messagesWithTotalTokens(t, server.TokenCounter, threshold+5000)
+	servePipelineRequest(t, server, sessionID, first)
+	if got := archiveCount(t, server.Store); got != 1 {
+		t.Fatalf("折叠归档数=%d, want 1", got)
+	}
+	key := soleCalibrationKey(t, server.Sawtooth)
+	baseline := server.Sawtooth.PressureBaseline(key)
+	if baseline.MessageCount != len(first) {
+		t.Fatalf("baseline 消息数=%d, want raw 坐标 %d（不随折叠缩短）", baseline.MessageCount, len(first))
+	}
+	if baseline.MessagesPrefixFingerprint != fingerprintMessagesPrefix(first, len(first)) {
+		t.Fatalf("baseline 前缀指纹不是入口 raw 坐标: %s", baseline.MessagesPrefixFingerprint)
+	}
+	if len(forwardedMessageCounts) != 1 || forwardedMessageCounts[0] >= len(first) {
+		t.Fatalf("第一轮 wire 应为折叠后消息集: forwarded=%v raw=%d", forwardedMessageCounts, len(first))
+	}
+
+	// 第二轮：CC 回放全量 raw + 追加两条新消息。
+	second := append(append([]Message(nil), first...), pipelineMessages(2, 6)...)
+	servePipelineRequest(t, server, sessionID, second)
+	if secondDecision.Source != pressureSourceActualPlusDelta {
+		t.Fatalf("第二轮判定 source=%s reset=%s, want actual_plus_delta（raw 坐标下主路径必须生效）",
+			secondDecision.Source, secondDecision.ResetReason)
+	}
+	wantDelta := server.TokenCounter.CountMessagesTokens(second[len(first):])
+	if secondDecision.NewMessageDelta != wantDelta {
+		t.Fatalf("第二轮 delta=%d, want %d（只算 raw 新增尾部）", secondDecision.NewMessageDelta, wantDelta)
+	}
+	if secondDecision.SelectedPressure != secondDecision.PreviousActual+wantDelta {
+		t.Fatalf("SelectedPressure=%d, want %d+%d", secondDecision.SelectedPressure, secondDecision.PreviousActual, wantDelta)
+	}
+	if got := archiveCount(t, server.Store); got != 1 {
+		t.Fatalf("折叠后真实 usage 远低于阈值，不得再次折叠: archive=%d", got)
+	}
 }

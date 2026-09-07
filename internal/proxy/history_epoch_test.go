@@ -329,6 +329,13 @@ func TestForwardedCoordinatesUsePositionSensitiveHistoryFingerprint(t *testing.T
 		MessageCount:              len(base),
 		MessagesPrefixFingerprint: fingerprintMessagesPrefix(base, len(base)),
 	}
+	// 入口 raw = base；wire 的 tool_use.input.cache_control 被改写。Changed
+	// 对比 entry 与 wire，只有指纹算法对该业务字段敏感时才会置位——恒真化
+	// 等于放弃这条判别力。
+	meta.PressureEntryCoordinates = pressureEntryCoordinates{
+		MessageCount:              len(base),
+		MessagesPrefixFingerprint: fingerprintMessagesPrefix(base, len(base)),
+	}
 	changed := historyMessagesFromJSON(t, `[{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"configure","input":{"cache_control":"disabled"}}]}]`)
 	body, err := json.Marshal(map[string]any{"messages": changed})
 	if err != nil {

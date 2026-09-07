@@ -520,11 +520,17 @@ type pressureDecision struct {
 	MessageCount                int
 	SystemFingerprint           string
 	ToolsFingerprint            string
+	// MessageCount/SystemFingerprint/ToolsFingerprint/MessagesPrefixFingerprint
+	// 是 baseline 读写契约使用的入口 raw 坐标（见 pressureEntryCoordinates）：
+	// system/tools 不被折叠改写，口径与 wire 一致；messages 坐标固定为入口
+	// raw 快照，绝不随转发 wire 改写。
 	MessagesPrefixFingerprint   string
 	ForwardedCoordinatesChanged bool
-	// ForwardedCoordinatesBound 表示响应 usage 写回前，最终 wire body 的
-	// system/tools/messages 坐标已经成功解析并绑定到本次 decision。
-	// false 且 ForwardedCoordinatesChanged=true 时，禁止把 actual 写回 baseline。
+	// ForwardedCoordinatesChanged 表示转发 wire 的坐标与入口 raw 坐标不一致
+	// （折叠/压缩等改写在本请求发生过），只作诊断，不参与 baseline 门禁。
+	// ForwardedCoordinatesBound 表示转发 wire body 已成功解析、system/tools/
+	// messages 的 wire 坐标已读取、ForwardedLocalEstimate 已同点补算——响应
+	// usage 与哪个消息集配对由此证明。false 时不把 actual 写回 baseline。
 	ForwardedCoordinatesBound bool
 	// ForwardedLocalEstimate 是转发 wire 的本地全量估算（messages + system +
 	// tools），由 markForwardedPressureCoordinates 与坐标绑定同点补算，供响应侧
@@ -608,14 +614,28 @@ func canonicalMessageContent(raw json.RawMessage) any {
 	return normalizeHistoryContent(content, "", false)
 }
 
+// pressureEntryCoordinates 是请求入口（StripReminders 之后、任何改写之前）
+// 的 raw 消息坐标。baseline 读写契约固定使用它：CC 每轮回放全量 raw 历史、
+// 前缀单调追加，坐标系跨请求稳定；折叠/压缩只改转发 wire，不改 raw。
+// 此前 actual 曾被绑到 forwarded wire 坐标（4a6e27d），折叠轮之后 raw 回放
+// 与 wire 坐标必然失配（messages_changed），actual_plus_delta 主路径被锁死，
+// 判定永久回落 local_full——反复折叠死循环的根源。
+type pressureEntryCoordinates struct {
+	MessageCount              int
+	MessagesPrefixFingerprint string
+}
+
 // buildPressureDecision 在 local_full 与 actual_plus_delta 中只选择一次。
-// production 调用对 system/tools 各规范化一次，同时保存 full estimate 作为误差证据。
-func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessage, baseline pressureBaseline, tc *TokenCounter, threshold int) pressureDecision {
+// pressureMessages 是本轮判定的候选 wire 形状（frozen prefix + tail 或
+// raw 全量），local_full 对它估算；entryMessages/entry 是入口 raw 快照，
+// baseline 指纹校验、缩短检测与 delta 均按 raw 坐标进行。调用方必须保证
+// entry.MessageCount == len(entryMessages)。
+func buildPressureDecision(pressureMessages []Message, systemRaw, toolsRaw json.RawMessage, baseline pressureBaseline, tc *TokenCounter, threshold int, entry pressureEntryCoordinates, entryMessages []Message) pressureDecision {
 	system := inspectTopLevelJSON(systemRaw, tc)
 	tools := inspectTopLevelJSON(toolsRaw, tc)
 	messagesTokens := 0
 	if tc != nil {
-		messagesTokens = tc.CountMessagesTokens(messages)
+		messagesTokens = tc.CountMessagesTokens(pressureMessages)
 	}
 	fullEstimate := saturatingAdd(saturatingAdd(messagesTokens, system.tokens), tools.tokens)
 	decision := pressureDecision{
@@ -630,10 +650,10 @@ func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessa
 		Source:                    pressureSourceLocalFull,
 		ResetReason:               baselineResetNoActual,
 		Threshold:                 threshold,
-		MessageCount:              len(messages),
+		MessageCount:              entry.MessageCount,
 		SystemFingerprint:         system.fingerprint,
 		ToolsFingerprint:          tools.fingerprint,
-		MessagesPrefixFingerprint: fingerprintMessagesPrefix(messages, len(messages)),
+		MessagesPrefixFingerprint: entry.MessagesPrefixFingerprint,
 	}
 	if baseline.ResetReason == baselineResetStateLoadFailed {
 		// 状态读取失败不是"这个 thread 没有 actual"：fail closed 到 local_full，
@@ -657,7 +677,7 @@ func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessa
 		// 旧版 SQLite 只有 total usage 与消息数，没有后续新增的坐标指纹。
 		// 它不能参与精确 delta，但当历史高水位已经越过阈值且消息未缩短时，
 		// 允许保守触发一次，避免真实 cache/thinking usage 被不精确 local_full 吞掉。
-		if baseline.ActualTokens > threshold && baseline.MessageCount >= 0 && baseline.MessageCount <= len(messages) {
+		if baseline.ActualTokens > threshold && baseline.MessageCount >= 0 && baseline.MessageCount <= entry.MessageCount {
 			if baseline.ActualTokens > decision.SelectedPressure {
 				decision.SelectedPressure = baseline.ActualTokens
 			}
@@ -668,7 +688,7 @@ func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessa
 	}
 	decision.SystemFingerprintChanged = baseline.SystemFingerprint != system.fingerprint
 	decision.ToolsFingerprintChanged = baseline.ToolsFingerprint != tools.fingerprint
-	if baseline.MessageCount > len(messages) {
+	if baseline.MessageCount > entry.MessageCount {
 		decision.ResetReason = baselineResetMessageShrink
 		return decision
 	}
@@ -680,7 +700,7 @@ func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessa
 		decision.ResetReason = baselineResetToolsChanged
 		return decision
 	}
-	if fingerprintMessagesPrefix(messages, baseline.MessageCount) != baseline.MessagesPrefixFingerprint {
+	if fingerprintMessagesPrefix(entryMessages, baseline.MessageCount) != baseline.MessagesPrefixFingerprint {
 		decision.ResetReason = baselineResetMessagesChanged
 		// 撤回、编辑或 Claude Code 的等价 wire 规范化会让严格前缀不再适合
 		// 计算精确 delta，但只要消息未缩短且 system/tools 未变，上一轮真实
@@ -693,7 +713,7 @@ func buildPressureDecision(messages []Message, systemRaw, toolsRaw json.RawMessa
 	}
 	delta := 0
 	if tc != nil {
-		delta = tc.CountMessagesTokens(messages[baseline.MessageCount:])
+		delta = tc.CountMessagesTokens(entryMessages[baseline.MessageCount:])
 	}
 	decision.NewMessageDelta = delta
 	actualPlusDelta := saturatingAdd(baseline.ActualTokens, delta)
@@ -889,6 +909,14 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		if rawHistory == nil {
 			rawHistory = append([]Message(nil), historyMessages...)
 		}
+		// baseline 契约坐标：入口 raw 快照，在任何改写（frozen 拼接、折叠、
+		// 压缩）之前捕获。CC 每轮回放全量 raw 历史，raw 前缀单调追加，坐标系
+		// 跨请求稳定；折叠只改 wire，不改 raw。
+		entryCoords := pressureEntryCoordinates{
+			MessageCount:              len(historyMessages),
+			MessagesPrefixFingerprint: fingerprintMessagesPrefix(historyMessages, len(historyMessages)),
+		}
+		meta.PressureEntryCoordinates = entryCoords
 		stateKey := sessionID
 		historyReuseSafe := true
 		if s.HistoryEpoch != nil {
@@ -1049,7 +1077,7 @@ func (s *Server) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		var triggerEvaluation TriggerEvaluation
 		selectPressure := func(candidate []Message) pressureDecision {
 			pressureMessages := finalizeMessages(candidate)
-			selected := buildPressureDecision(pressureMessages, bodyMap["system"], bodyMap["tools"], baseline, s.TokenCounter, threshold)
+			selected := buildPressureDecision(pressureMessages, bodyMap["system"], bodyMap["tools"], baseline, s.TokenCounter, threshold, entryCoords, rawHistory)
 			if selected.Source == pressureSourceLocalFull && s.Sawtooth != nil {
 				// local_full 是本地估算直比 threshold；实测 cl100k 系统性低估
 				// 1.5~1.6 倍，不乘校准系数会在断流期（baseline 无法刷新）持续

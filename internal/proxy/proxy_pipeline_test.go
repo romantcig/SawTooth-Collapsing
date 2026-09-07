@@ -19,6 +19,17 @@ import (
 	"time"
 )
 
+// buildPressureDecisionWithEntry 是单函数测试的退化包装：入口 raw 与候选
+// 同源（折叠改写只发生在生产管线的跨请求分叉里）。跨请求行为由
+// TestPressureBaselineSurvivesCollapseRewrite 覆盖。
+func buildPressureDecisionWithEntry(pressureMessages []Message, systemRaw, toolsRaw json.RawMessage, baseline pressureBaseline, tc *TokenCounter, threshold int) pressureDecision {
+	entry := pressureEntryCoordinates{
+		MessageCount:              len(pressureMessages),
+		MessagesPrefixFingerprint: fingerprintMessagesPrefix(pressureMessages, len(pressureMessages)),
+	}
+	return buildPressureDecision(pressureMessages, systemRaw, toolsRaw, baseline, tc, threshold, entry, pressureMessages)
+}
+
 func TestPressureDecisionLocalFullIncludesTopLevelComponents(t *testing.T) {
 	tokenCounter, err := NewTokenCounter()
 	if err != nil {
@@ -31,7 +42,7 @@ func TestPressureDecisionLocalFullIncludesTopLevelComponents(t *testing.T) {
 	system := json.RawMessage(`{"b":"two","a":"one"}`)
 	tools := json.RawMessage(`[{"name":"search","input_schema":{"type":"object"}}]`)
 
-	decision := buildPressureDecision(messages, system, tools, pressureBaseline{}, tokenCounter, 1000)
+	decision := buildPressureDecisionWithEntry(messages, system, tools, pressureBaseline{}, tokenCounter, 1000)
 	wantMessages := tokenCounter.CountMessagesTokens(messages)
 	wantSystem := measureTopLevelTokens(system, tokenCounter)
 	wantTools := measureTopLevelTokens(tools, tokenCounter)
@@ -109,7 +120,7 @@ func TestPressureDecisionUsesActualPlusDelta(t *testing.T) {
 		ResetReason:               baselineResetNone,
 	}
 
-	decision := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 16000)
+	decision := buildPressureDecisionWithEntry(messages, system, tools, baseline, tokenCounter, 16000)
 	wantDelta := tokenCounter.CountMessagesTokens(messages[2:])
 	wantSelected := saturatingAdd(baseline.ActualTokens, wantDelta)
 	if decision.NewMessageDelta != wantDelta || decision.SelectedPressure != wantSelected {
@@ -138,7 +149,7 @@ func TestPressureDecisionUsesLegacyHighWaterAboveThreshold(t *testing.T) {
 		Available:    false,
 		ResetReason:  baselineResetNoActual,
 	}
-	decision := buildPressureDecision(messages, nil, nil, baseline, tokenCounter, 150_000)
+	decision := buildPressureDecisionWithEntry(messages, nil, nil, baseline, tokenCounter, 150_000)
 	if decision.FullLocalEstimate >= 150_000 {
 		t.Fatalf("fixture local_full=%d，必须低于阈值", decision.FullLocalEstimate)
 	}
@@ -146,7 +157,7 @@ func TestPressureDecisionUsesLegacyHighWaterAboveThreshold(t *testing.T) {
 		t.Fatalf("legacy high-water decision=%+v", decision)
 	}
 
-	shrunk := buildPressureDecision(messages[:31], nil, nil, baseline, tokenCounter, 150_000)
+	shrunk := buildPressureDecisionWithEntry(messages[:31], nil, nil, baseline, tokenCounter, 150_000)
 	if shrunk.Source != pressureSourceLocalFull || shrunk.SelectedPressure != shrunk.FullLocalEstimate {
 		t.Fatalf("消息缩短后仍使用未验证 legacy high-water: %+v", shrunk)
 	}
@@ -170,20 +181,20 @@ func TestPressureDecisionIgnoresLegacyConservativeBaseline(t *testing.T) {
 		Available:                 true,
 		ResetReason:               baselineResetNone,
 	}
-	decision := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 16_000)
+	decision := buildPressureDecisionWithEntry(messages, system, tools, baseline, tokenCounter, 16_000)
 	if decision.Source != pressureSourceLocalFull || decision.ResetReason != baselineResetLegacyUnverified || decision.SelectedPressure != decision.FullLocalEstimate {
 		t.Fatalf("旧 conservative baseline 未回退到 local_full: %+v", decision)
 	}
 
 	baseline.ActualTokens = 190_000
-	high := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 150_000)
+	high := buildPressureDecisionWithEntry(messages, system, tools, baseline, tokenCounter, 150_000)
 	if high.Source != pressureSourceLocalFull || high.ResetReason != baselineResetLegacyUnverified || high.SelectedPressure != high.FullLocalEstimate {
 		t.Fatalf("高 conservative baseline 仍抬高 pressure: %+v", high)
 	}
 	baseline.SystemFingerprint = ""
 	baseline.ToolsFingerprint = ""
 	baseline.MessagesPrefixFingerprint = ""
-	invalidCoordinates := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 150_000)
+	invalidCoordinates := buildPressureDecisionWithEntry(messages, system, tools, baseline, tokenCounter, 150_000)
 	if invalidCoordinates.Source != pressureSourceLocalFull || invalidCoordinates.ResetReason != baselineResetLegacyUnverified || invalidCoordinates.SelectedPressure != invalidCoordinates.FullLocalEstimate {
 		t.Fatalf("缺少坐标的旧 conservative baseline 仍进入 legacy high-water: %+v", invalidCoordinates)
 	}
@@ -211,7 +222,7 @@ func TestPressureDecisionMessageEditKeepsObservedHighWater(t *testing.T) {
 		Available:    true,
 	}
 
-	decision := buildPressureDecision(edited, system, tools, baseline, tokenCounter, 150_000)
+	decision := buildPressureDecisionWithEntry(edited, system, tools, baseline, tokenCounter, 150_000)
 	if decision.ResetReason != baselineResetMessagesChanged || decision.Source != pressureSourceConservativeHighWater || decision.SelectedPressure != baseline.ActualTokens {
 		t.Fatalf("消息编辑后未保留 observed high-water: %+v", decision)
 	}
@@ -219,7 +230,7 @@ func TestPressureDecisionMessageEditKeepsObservedHighWater(t *testing.T) {
 		t.Fatalf("high-water 未抬高低估的 local_full: %+v", decision)
 	}
 
-	shrunk := buildPressureDecision(edited[:2], system, tools, baseline, tokenCounter, 150_000)
+	shrunk := buildPressureDecisionWithEntry(edited[:2], system, tools, baseline, tokenCounter, 150_000)
 	if shrunk.Source != pressureSourceLocalFull || shrunk.ResetReason != baselineResetMessageShrink || shrunk.SelectedPressure != shrunk.FullLocalEstimate {
 		t.Fatalf("消息缩短后仍保留旧 high-water: %+v", shrunk)
 	}
@@ -241,7 +252,7 @@ func TestPressureDecisionResetsOnMessageShrink(t *testing.T) {
 		MessagesPrefixFingerprint: strings.Repeat("a", 64),
 		Available:                 true,
 	}
-	decision := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 16000)
+	decision := buildPressureDecisionWithEntry(messages, system, tools, baseline, tokenCounter, 16000)
 	if decision.Source != pressureSourceLocalFull || decision.ResetReason != baselineResetMessageShrink || decision.SelectedPressure != decision.FullLocalEstimate {
 		t.Fatalf("message shrink decision=%+v", decision)
 	}
@@ -263,7 +274,7 @@ func TestPressureDecisionResetsOnSystemChange(t *testing.T) {
 		MessagesPrefixFingerprint: fingerprintMessagesPrefix(messages, 2),
 		Available:                 true,
 	}
-	decision := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 16000)
+	decision := buildPressureDecisionWithEntry(messages, system, tools, baseline, tokenCounter, 16000)
 	if decision.Source != pressureSourceLocalFull || decision.ResetReason != baselineResetSystemChanged || decision.SelectedPressure != decision.FullLocalEstimate {
 		t.Fatalf("system change decision=%+v", decision)
 	}
@@ -288,7 +299,7 @@ func TestPressureDecisionResetsOnToolsChange(t *testing.T) {
 		MessagesPrefixFingerprint: fingerprintMessagesPrefix(messages, 2),
 		Available:                 true,
 	}
-	decision := buildPressureDecision(messages, system, tools, baseline, tokenCounter, 16000)
+	decision := buildPressureDecisionWithEntry(messages, system, tools, baseline, tokenCounter, 16000)
 	if decision.Source != pressureSourceLocalFull || decision.ResetReason != baselineResetToolsChanged || decision.SelectedPressure != decision.FullLocalEstimate {
 		t.Fatalf("tools change decision=%+v", decision)
 	}
@@ -303,7 +314,7 @@ func TestPressureDecisionThresholdBehavior(t *testing.T) {
 		t.Fatalf("NewTokenCounter: %v", err)
 	}
 	messages := pipelineMessages(4, 20)
-	decision := buildPressureDecision(messages, nil, nil, pressureBaseline{}, tokenCounter, 0)
+	decision := buildPressureDecisionWithEntry(messages, nil, nil, pressureBaseline{}, tokenCounter, 0)
 	if decision.SelectedPressure < 2 {
 		t.Fatalf("fixture pressure 太小: %d", decision.SelectedPressure)
 	}
@@ -1227,8 +1238,8 @@ func TestHandleMessagesCollapsedActualDoesNotCalibrateRawHistory(t *testing.T) {
 	}
 
 	servePipelineRequest(t, server, sessionID, raw)
-	if baseline := server.Sawtooth.PressureBaseline(sessionID); !baseline.Available || baseline.Conservative || baseline.ActualTokens != 100 || baseline.MessageCount != len(forwarded[0]) || baseline.MessagesPrefixFingerprint != fingerprintMessagesPrefix(forwarded[0], len(forwarded[0])) {
-		t.Fatalf("压缩响应未按最终 forwarded 坐标写入 exact baseline: %+v", baseline)
+	if baseline := server.Sawtooth.PressureBaseline(sessionID); !baseline.Available || baseline.Conservative || baseline.ActualTokens != 100 || baseline.MessageCount != len(raw) || baseline.MessagesPrefixFingerprint != fingerprintMessagesPrefix(raw, len(raw)) {
+		t.Fatalf("压缩响应未按入口 raw 坐标写入 exact baseline: %+v", baseline)
 	}
 
 	nextRaw := append(deepCopyMessages(raw), pipelineMessages(1, 20)...)
@@ -1435,7 +1446,7 @@ func TestPressureDecisionRejectsEditedBaselinePrefix(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.messages[0].Content = mustMarshal(strings.Repeat("edited historical pressure ", 2000))
-			decision := buildPressureDecision(tc.messages, nil, nil, baseline, tokenCounter, 100_000)
+			decision := buildPressureDecisionWithEntry(tc.messages, nil, nil, baseline, tokenCounter, 100_000)
 			if decision.Source != pressureSourceLocalFull || decision.ResetReason != baselineResetMessagesChanged {
 				t.Fatalf("edited prefix decision=%+v", decision)
 			}
@@ -3187,11 +3198,15 @@ func TestPhase08CombinedLifecycle(t *testing.T) {
 	if err := json.Unmarshal([]byte(persisted), &state); err != nil {
 		t.Fatalf("parse persisted Sawtooth state: %v raw=%q", err, persisted)
 	}
-	if state.Tokens != 93_252 || state.MsgCount != len(forwarded[1]) || state.Conservative || state.SystemFingerprint == "" || state.ToolsFingerprint == "" || state.MessagesPrefixFingerprint != fingerprintMessagesPrefix(forwarded[1], len(forwarded[1])) {
-		t.Fatalf("forwarded 坐标未绑定 exact pressure baseline: %+v", state)
+	// baseline 契约坐标 = 入口 raw 快照（DetachPersistentUserContext +
+	// StripReminders 之后、任何改写之前），不随折叠改写为 wire 坐标。
+	secondEntry, _ := DetachPersistentUserContext(secondRaw)
+	secondEntry = StripReminders(secondEntry)
+	if state.Tokens != 93_252 || state.MsgCount != len(secondEntry) || state.Conservative || state.SystemFingerprint == "" || state.ToolsFingerprint == "" || state.MessagesPrefixFingerprint != fingerprintMessagesPrefix(secondEntry, len(secondEntry)) {
+		t.Fatalf("baseline 未按入口 raw 坐标写入: %+v", state)
 	}
-	if baseline := server.Sawtooth.PressureBaseline("phase08-combined"); !baseline.Available || baseline.Conservative || baseline.ActualTokens != 93_252 || baseline.MessageCount != len(forwarded[1]) || baseline.MessagesPrefixFingerprint != fingerprintMessagesPrefix(forwarded[1], len(forwarded[1])) {
-		t.Fatalf("forwarded 坐标绑定后的 exact baseline 不可用: %+v", baseline)
+	if baseline := server.Sawtooth.PressureBaseline("phase08-combined"); !baseline.Available || baseline.Conservative || baseline.ActualTokens != 93_252 || baseline.MessageCount != len(secondEntry) || baseline.MessagesPrefixFingerprint != fingerprintMessagesPrefix(secondEntry, len(secondEntry)) {
+		t.Fatalf("raw 坐标下的 exact baseline 不可用: %+v", baseline)
 	}
 
 	facts := readDebugFactFiles(t, debugDir, "phase08-combined")
@@ -3215,7 +3230,9 @@ func TestPhase08CombinedLifecycle(t *testing.T) {
 	if len(stageByRequest) != 2 {
 		t.Fatalf("facts request IDs=%d, want 2", len(stageByRequest))
 	}
-	assertPhase08PressureTransition(t, stageByRequest, len(forwarded[0]))
+	firstEntry, _ := DetachPersistentUserContext(firstRaw)
+	firstEntry = StripReminders(firstEntry)
+	assertPhase08PressureTransition(t, stageByRequest, len(firstEntry))
 	for requestID, stages := range stageByRequest {
 		for _, stage := range []debugStage{debugStageRawInbound, debugStagePressureDecision, debugStageForwarded, debugStageResponseUsage} {
 			if _, ok := stages[stage]; !ok {
@@ -3250,7 +3267,7 @@ func TestPhase08CombinedLifecycle(t *testing.T) {
 // **消费了第一轮写下的 exact baseline**（previous_actual / previous_message_count
 // 与第一轮 forwarded 坐标一致）。旧的 Archive 行数断言恰恰漏掉的就是这一段。
 // 「不重复 collapse」的正面护栏在 TestPressureActualPlusDeltaLifecycle。
-func assertPhase08PressureTransition(t *testing.T, stageByRequest map[uint64]map[debugStage]debugFact, firstForwardedCount int) {
+func assertPhase08PressureTransition(t *testing.T, stageByRequest map[uint64]map[debugStage]debugFact, firstRawCount int) {
 	t.Helper()
 	requestIDs := make([]uint64, 0, len(stageByRequest))
 	for requestID := range stageByRequest {
@@ -3273,15 +3290,15 @@ func assertPhase08PressureTransition(t *testing.T, stageByRequest map[uint64]map
 	if second.PreviousActualTokens == nil || *second.PreviousActualTokens != 93_252 {
 		t.Fatalf("第二轮 previous_actual_tokens=%s, want 93252（第一轮 exact baseline 未被消费）", debugFactValue(second.PreviousActualTokens))
 	}
-	if second.PreviousMessageCount == nil || *second.PreviousMessageCount != firstForwardedCount {
-		t.Fatalf("第二轮 previous_message_count=%s, want %d（baseline 未绑定第一轮 forwarded 坐标）",
-			debugFactValue(second.PreviousMessageCount), firstForwardedCount)
+	if second.PreviousMessageCount == nil || *second.PreviousMessageCount != firstRawCount {
+		t.Fatalf("第二轮 previous_message_count=%s, want %d（baseline 绑定入口 raw 坐标）",
+			debugFactValue(second.PreviousMessageCount), firstRawCount)
 	}
-	if second.PressureSource == nil || *second.PressureSource != pressureSourceConservativeHighWater {
-		t.Fatalf("第二轮 pressure_source=%s, want %q", debugFactValue(second.PressureSource), pressureSourceConservativeHighWater)
+	if second.PressureSource == nil || *second.PressureSource != pressureSourceActualPlusDelta {
+		t.Fatalf("第二轮 pressure_source=%s, want %q（raw 坐标下主路径必须生效）", debugFactValue(second.PressureSource), pressureSourceActualPlusDelta)
 	}
-	if second.SelectedPressureTokens == nil || *second.SelectedPressureTokens != 93_252 {
-		t.Fatalf("第二轮 selected_pressure=%s, want 93252（高水位未生效）", debugFactValue(second.SelectedPressureTokens))
+	if second.SelectedPressureTokens == nil || *second.SelectedPressureTokens <= 93_252 {
+		t.Fatalf("第二轮 selected_pressure=%s, want actual+delta（高于高水位）", debugFactValue(second.SelectedPressureTokens))
 	}
 }
 

@@ -456,8 +456,10 @@ func (f *FrozenStubs) GetWithLoadResult(logger *slog.Logger, threadID string, cu
 	f.mu.RUnlock()
 
 	// 验证 1：持久化元数据与当前消息边界必须可安全切片。
+	// 有状态却未命中的各验证分支升 Info：这是排查"frozen 只存不命中"
+	// 反复折叠的关键信号，not_found（从未存过）才是常态噪音。
 	if cutoff <= 0 || cutoff > len(currentMessages) || bHash == "" || !validPressureFingerprint(rawHash) || (rawMode != frozenRawPrefixModeFull && rawMode != frozenRawPrefixModeLegacy) || tokens < 0 || rawTokens < 0 {
-		logger.Debug("frozen prefix 未命中", "reason", "metadata_invalid")
+		logger.Info("frozen prefix 未命中", "reason", "metadata_invalid", "cutoff", cutoff, "raw_prefix_mode", rawMode, "message_count", len(currentMessages))
 		f.InvalidateWithLogger(logger, stateKey)
 		return nil, StateLoadFailure{}
 	}
@@ -465,7 +467,7 @@ func (f *FrozenStubs) GetWithLoadResult(logger *slog.Logger, threadID string, cu
 	// 验证 2：prefix hash 不匹配（内存被意外修改）
 	frozenJSON, _ := json.Marshal(msgs)
 	if sha256hex(frozenJSON) != pHash {
-		logger.Debug("frozen prefix 未命中", "reason", "stored_prefix_changed")
+		logger.Info("frozen prefix 未命中", "reason", "stored_prefix_changed", "cutoff", cutoff, "frozen_messages", len(msgs))
 		f.InvalidateWithLogger(logger, stateKey)
 		return nil, StateLoadFailure{}
 	}
@@ -474,12 +476,12 @@ func (f *FrozenStubs) GetWithLoadResult(logger *slog.Logger, threadID string, cu
 	// 单条 boundary 相同不足以证明 cutoff 前的早期消息仍连续。
 	if rawMode == frozenRawPrefixModeFull {
 		if currentHash := reuseSafetyPrefixHash(currentMessages, cutoff); currentHash == "" || currentHash != rawHash {
-			logger.Debug("frozen prefix 未命中", "reason", "raw_prefix_changed")
+			logger.Info("frozen prefix 未命中", "reason", "raw_prefix_changed", "cutoff", cutoff, "message_count", len(currentMessages))
 			f.InvalidateWithLogger(logger, stateKey)
 			return nil, StateLoadFailure{}
 		}
 	} else if legacyRawPrefixHash(cutoff, currentMessages[cutoff-1]) != rawHash {
-		logger.Debug("frozen prefix 未命中", "reason", "boundary_changed")
+		logger.Info("frozen prefix 未命中", "reason", "boundary_changed", "cutoff", cutoff, "raw_prefix_mode", rawMode)
 		f.InvalidateWithLogger(logger, stateKey)
 		return nil, StateLoadFailure{}
 	}
@@ -489,7 +491,7 @@ func (f *FrozenStubs) GetWithLoadResult(logger *slog.Logger, threadID string, cu
 	if cutoff > 0 && cutoff <= len(currentMessages) {
 		currentBHash := stableBoundaryHash(currentMessages[cutoff-1])
 		if currentBHash != bHash {
-			logger.Debug("frozen prefix 未命中", "reason", "boundary_changed")
+			logger.Info("frozen prefix 未命中", "reason", "boundary_changed", "cutoff", cutoff, "raw_prefix_mode", rawMode)
 			f.InvalidateWithLogger(logger, stateKey)
 			return nil, StateLoadFailure{}
 		}
@@ -498,7 +500,7 @@ func (f *FrozenStubs) GetWithLoadResult(logger *slog.Logger, threadID string, cu
 	// 深拷贝——防止下游（cache_control inject 等）原地修改 frozen 数据
 	copied := deepCopyMessages(msgs)
 	if copied == nil {
-		logger.Debug("frozen prefix 未命中", "reason", "copy_failed")
+		logger.Info("frozen prefix 未命中", "reason", "copy_failed", "cutoff", cutoff, "frozen_messages", len(msgs))
 		f.InvalidateWithLogger(logger, stateKey)
 		return nil, StateLoadFailure{}
 	}
@@ -964,9 +966,10 @@ const (
 	// calibrationSampleWindow 是每个 stateKey 保留的 (actual, estimate) 比值数。
 	calibrationSampleWindow = 8
 	// calibrationMinRatio / calibrationMaxRatio 钳制滚动中位数的漂移范围。
-	// 下界处于过渡期放宽值：加权字符口径的全局偏差预计显著低于旧词表口径
-	// 中位 1.588，不放宽会被下界钉死；样本稳定落在开区间内后再收回原值。
-	calibrationMinRatio = 1.10
+	// 下限必须允许显著 <1：加权字符估算器对文本密集 wire 可能系统性高估
+	// （折叠后 wire 实测 0.5~0.7），只允许放大（旧下限 1.10）会把高估永久
+	// 钉死，令 local_full 兜底轮每轮误报。
+	calibrationMinRatio = 0.50
 	calibrationMaxRatio = 1.80
 )
 
@@ -1314,7 +1317,8 @@ func (st *SawtoothTrigger) RecordCalibrationSample(stateKey string, actual, esti
 }
 
 // CalibrationRatio 返回该 stateKey 的滚动校准系数（锁内只读）。
-// 冷启动/样本不足返回常数 1.50；否则取窗口内中位数并 clamp 到 [1.35, 1.80]。
+// 冷启动/样本不足返回常数 1.50；否则取窗口内中位数并 clamp 到
+// [calibrationMinRatio, calibrationMaxRatio]。
 func (st *SawtoothTrigger) CalibrationRatio(stateKey string) float64 {
 	if st == nil {
 		return defaultCalibrationRatio

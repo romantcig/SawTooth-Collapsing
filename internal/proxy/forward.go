@@ -624,8 +624,9 @@ func upstreamFailureState(decision upstreamFailureDecision, committed bool, fall
 
 // markForwardedPressureCoordinates 将 pressure baseline 的坐标绑定到真正发送给上游的
 // system/tools/messages。压缩、桩化、Archive 注入或 orphan repair 改写消息时，
-// ForwardedCoordinatesChanged 仍记录这一事实，但 actual 现在绑定到改写后的真实坐标，
-// 而不是被 max(actual, selected) 人为抬成 conservative floor。
+// ForwardedCoordinatesChanged 记录这一事实供诊断；baseline 契约坐标固定为
+// 入口 raw 快照（meta.PressureEntryCoordinates），绝不随 wire 改写——否则折叠
+// 轮之后 CC 的 raw 回放会与 wire 坐标永远失配，actual_plus_delta 主路径被锁死。
 // 同点补算转发 wire 的本地全量估算（messages + system + tools，口径与
 // buildPressureDecision 的 FullLocalEstimate 一致），供响应侧与 actual 配对写入
 // 校准样本；此处只暂存，绝不单独写样本。
@@ -665,20 +666,15 @@ func markForwardedPressureCoordinates(meta *requestMeta, body []byte, tc *TokenC
 	messagesPrefixFingerprint := fingerprintMessagesPrefix(messages, len(messages))
 	decision := &meta.PressureDecision
 	coordinatesChanged :=
-		decision.MessageCount != len(messages) ||
+		meta.PressureEntryCoordinates.MessageCount != len(messages) ||
 			decision.SystemFingerprint != systemFingerprint ||
 			decision.ToolsFingerprint != toolsFingerprint ||
-			decision.MessagesPrefixFingerprint != messagesPrefixFingerprint
-	// 保留整个请求生命周期内“曾经发生过改写”的事实；即使某个调用方
+			meta.PressureEntryCoordinates.MessagesPrefixFingerprint != messagesPrefixFingerprint
+	// 保留整个请求生命周期内"曾经发生过改写"的事实；即使某个调用方
 	// 意外重复绑定同一份 body，也不能把首次变化抹掉。
 	decision.ForwardedCoordinatesChanged = decision.ForwardedCoordinatesChanged || coordinatesChanged
-	// 从这一刻起，decision 的坐标就是最终 wire 坐标；响应 actual 可安全
-	// 以 exact baseline 形式写回。原始与 forwarded 是否不同仍由上面的
-	// Changed 字段保留给诊断和回归测试。
-	decision.MessageCount = len(messages)
-	decision.SystemFingerprint = systemFingerprint
-	decision.ToolsFingerprint = toolsFingerprint
-	decision.MessagesPrefixFingerprint = messagesPrefixFingerprint
+	// decision 的坐标保持入口 raw 口径不变；本函数只证明 wire body 已解析、
+	// usage 与 wire 估算可安全配对（Bound），并留下改写诊断（Changed）。
 	decision.ForwardedCoordinatesBound = true
 	if tc != nil {
 		decision.ForwardedLocalEstimate = saturatingAdd(
@@ -723,7 +719,9 @@ func (s *Server) applyPressureBaselineUsage(meta *requestMeta, actual int) bool 
 		meta.BaselineUpdateKind = pressureBaselineUpdateNone
 		return false
 	}
-	updated := s.Sawtooth.UpdatePressureBaselineForRequest(stateKey, meta.BaselineGeneration, actual, decision.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint, decision.MessagesPrefixFingerprint)
+	updated := s.Sawtooth.UpdatePressureBaselineForRequest(stateKey, meta.BaselineGeneration, actual,
+		meta.PressureEntryCoordinates.MessageCount, decision.SystemFingerprint, decision.ToolsFingerprint,
+		meta.PressureEntryCoordinates.MessagesPrefixFingerprint)
 	if updated {
 		meta.BaselineUpdateKind = pressureBaselineUpdateExact
 	}

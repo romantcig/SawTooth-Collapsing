@@ -237,7 +237,17 @@ func TestHandleSSEStripsDeltaWhileBaselineKeepsTruth(t *testing.T) {
 	tools := json.RawMessage(`[{"name":"delta_tool","input_schema":{"type":"object"}}]`)
 	forwarded := pipelineMessages(29, 6)
 	meta := newRequestMeta(3, "sse-delta-strip")
-	meta.PressureDecision = pressureDecision{Available: true}
+	meta.PressureDecision = pressureDecision{
+		Available:         true,
+		SystemFingerprint: fingerprintTopLevelJSON(system),
+		ToolsFingerprint:  fingerprintTopLevelJSON(tools),
+	}
+	// 本场景入口 raw == wire（无改写），baseline 契约坐标与 wire 同值，
+	// 避免写出 MsgCount=0 的退化 baseline。
+	meta.PressureEntryCoordinates = pressureEntryCoordinates{
+		MessageCount:              len(forwarded),
+		MessagesPrefixFingerprint: fingerprintMessagesPrefix(forwarded, len(forwarded)),
+	}
 	markForwardedPressureCoordinates(meta, forwardedPressureBody(t, system, tools, forwarded), nil)
 
 	resp := &http.Response{
@@ -299,7 +309,16 @@ func TestHandleSSEPressureBaseline(t *testing.T) {
 	tools := json.RawMessage(`[{"name":"sse_tool","input_schema":{"type":"object"}}]`)
 	forwarded := pipelineMessages(37, 6)
 	meta := newRequestMeta(1, "sse-cache")
-	meta.PressureDecision = pressureDecision{Available: true}
+	meta.PressureDecision = pressureDecision{
+		Available:         true,
+		SystemFingerprint: fingerprintTopLevelJSON(system),
+		ToolsFingerprint:  fingerprintTopLevelJSON(tools),
+	}
+	// 本场景入口 raw == wire（无改写），baseline 契约坐标与 wire 同值。
+	meta.PressureEntryCoordinates = pressureEntryCoordinates{
+		MessageCount:              len(forwarded),
+		MessagesPrefixFingerprint: fingerprintMessagesPrefix(forwarded, len(forwarded)),
+	}
 	markForwardedPressureCoordinates(meta, forwardedPressureBody(t, system, tools, forwarded), nil)
 	if !meta.PressureDecision.ForwardedCoordinatesBound {
 		t.Fatalf("forwarded 坐标未绑定: %+v", meta.PressureDecision)
@@ -339,7 +358,16 @@ func TestHandleJSONPressureBaseline(t *testing.T) {
 	tools := json.RawMessage(`[{"name":"json_tool","input_schema":{"type":"object"}}]`)
 	forwarded := pipelineMessages(41, 6)
 	meta := newRequestMeta(2, "json-cache")
-	meta.PressureDecision = pressureDecision{Available: true}
+	meta.PressureDecision = pressureDecision{
+		Available:         true,
+		SystemFingerprint: fingerprintTopLevelJSON(system),
+		ToolsFingerprint:  fingerprintTopLevelJSON(tools),
+	}
+	// 本场景入口 raw == wire（无改写），baseline 契约坐标与 wire 同值。
+	meta.PressureEntryCoordinates = pressureEntryCoordinates{
+		MessageCount:              len(forwarded),
+		MessagesPrefixFingerprint: fingerprintMessagesPrefix(forwarded, len(forwarded)),
+	}
 	markForwardedPressureCoordinates(meta, forwardedPressureBody(t, system, tools, forwarded), nil)
 	if !meta.PressureDecision.ForwardedCoordinatesBound {
 		t.Fatalf("forwarded 坐标未绑定: %+v", meta.PressureDecision)
@@ -431,6 +459,10 @@ func TestForwardRawOutOfOrderResponsesKeepNewestRequestBaseline(t *testing.T) {
 		meta.PressureDecision = pressureDecision{
 			Available: true, MessageCount: len(messages),
 			SystemFingerprint: fingerprint, ToolsFingerprint: fingerprint,
+			MessagesPrefixFingerprint: fingerprintMessagesPrefix(messages, len(messages)),
+		}
+		meta.PressureEntryCoordinates = pressureEntryCoordinates{
+			MessageCount:              len(messages),
 			MessagesPrefixFingerprint: fingerprintMessagesPrefix(messages, len(messages)),
 		}
 		return req, meta
@@ -1046,13 +1078,18 @@ func TestUnchangedForwardedBodyBindsExactPressureBaseline(t *testing.T) {
 	forwarded := pipelineMessages(9, 4)
 	meta := newRequestMeta(4, "unchanged-forwarded-baseline")
 	meta.BaselineGeneration = trigger.BeginPressureRequest(meta.RequestSessionID)
-	// decision 的坐标与最终 wire body 完全一致——本轮没有压缩、桩化或注入。
+	// decision 的坐标与最终 wire body 完全一致——本轮没有压缩、桩化或注入，
+	// 入口 raw 坐标 == wire 坐标，baseline 契约两者同值。
 	meta.PressureDecision = pressureDecision{
 		Available:                 true,
 		MessageCount:              len(forwarded),
 		SelectedPressure:          12_000,
 		SystemFingerprint:         fingerprintTopLevelJSON(system),
 		ToolsFingerprint:          fingerprintTopLevelJSON(tools),
+		MessagesPrefixFingerprint: fingerprintMessagesPrefix(forwarded, len(forwarded)),
+	}
+	meta.PressureEntryCoordinates = pressureEntryCoordinates{
+		MessageCount:              len(forwarded),
 		MessagesPrefixFingerprint: fingerprintMessagesPrefix(forwarded, len(forwarded)),
 	}
 
@@ -1095,6 +1132,11 @@ func TestForwardedRewriteBindsExactPressureBaseline(t *testing.T) {
 		ToolsFingerprint:          fingerprintTopLevelJSON(tools),
 		MessagesPrefixFingerprint: fingerprintMessagesPrefix(original, len(original)),
 	}
+	// baseline 契约坐标 = 入口 raw 快照；折叠改写只影响 wire，绝不改写它。
+	meta.PressureEntryCoordinates = pressureEntryCoordinates{
+		MessageCount:              len(original),
+		MessagesPrefixFingerprint: fingerprintMessagesPrefix(original, len(original)),
+	}
 
 	body, err := json.Marshal(map[string]any{
 		"system":   system,
@@ -1108,9 +1150,8 @@ func TestForwardedRewriteBindsExactPressureBaseline(t *testing.T) {
 	if !meta.PressureDecision.ForwardedCoordinatesChanged || !meta.PressureDecision.ForwardedCoordinatesBound {
 		t.Fatalf("forwarded 坐标变化未被绑定: %+v", meta.PressureDecision)
 	}
-	wantMessagesFingerprint := fingerprintMessagesPrefix(forwarded, len(forwarded))
-	if meta.PressureDecision.MessageCount != len(forwarded) || meta.PressureDecision.MessagesPrefixFingerprint != wantMessagesFingerprint {
-		t.Fatalf("decision 未重绑定最终 forwarded 坐标: %+v", meta.PressureDecision)
+	if meta.PressureDecision.MessageCount != len(original) || meta.PressureDecision.MessagesPrefixFingerprint != fingerprintMessagesPrefix(original, len(original)) {
+		t.Fatalf("decision 必须保持入口 raw 坐标，不得随 wire 改写: %+v", meta.PressureDecision)
 	}
 
 	if updated := s.applyPressureBaselineUsage(meta, 27_743); !updated {
@@ -1123,13 +1164,13 @@ func TestForwardedRewriteBindsExactPressureBaseline(t *testing.T) {
 	if err := json.Unmarshal([]byte(persisted), &state); err != nil {
 		t.Fatalf("解析 exact baseline: %v raw=%q", err, persisted)
 	}
-	if state.Tokens != 27_743 || state.Conservative || state.MsgCount != len(forwarded) ||
+	if state.Tokens != 27_743 || state.Conservative || state.MsgCount != len(original) ||
 		state.SystemFingerprint != fingerprintTopLevelJSON(system) || state.ToolsFingerprint != fingerprintTopLevelJSON(tools) ||
-		state.MessagesPrefixFingerprint != wantMessagesFingerprint {
+		state.MessagesPrefixFingerprint != fingerprintMessagesPrefix(original, len(original)) {
 		t.Fatalf("持久化 exact baseline=%+v", state)
 	}
 	baseline := trigger.PressureBaseline(meta.RequestSessionID)
-	if !baseline.Available || baseline.Conservative || baseline.ActualTokens != 27_743 || baseline.MessageCount != len(forwarded) || baseline.MessagesPrefixFingerprint != wantMessagesFingerprint {
+	if !baseline.Available || baseline.Conservative || baseline.ActualTokens != 27_743 || baseline.MessageCount != len(original) || baseline.MessagesPrefixFingerprint != fingerprintMessagesPrefix(original, len(original)) {
 		t.Fatalf("内存 exact baseline=%+v", baseline)
 	}
 }

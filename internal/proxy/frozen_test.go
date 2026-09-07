@@ -1276,7 +1276,7 @@ func TestSawtoothLoadFailureUsesLocalFull(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	decision := buildPressureDecision(frozenTestMessages(2), nil, nil, baseline, tokenCounter, 100_000)
+	decision := buildPressureDecisionWithEntry(frozenTestMessages(2), nil, nil, baseline, tokenCounter, 100_000)
 	if decision.Source != pressureSourceLocalFull {
 		t.Fatalf("读取失败时 pressure source=%q, want local_full", decision.Source)
 	}
