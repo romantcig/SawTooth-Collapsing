@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -198,18 +199,21 @@ func buildArchiveBlock(messages []Message, cutoffIdx int, tc *TokenCounter, sess
 	for i, msg := range messages {
 		blocks, _ := parseContent(msg.Content)
 		allTimeline = append(allTimeline, extractTimeline(blocks, i, msg.Role)...)
-		allCommits = append(allCommits, extractGitCommits(blocks)...)
 		allTools = append(allTools, extractToolEvents(blocks)...)
 		for _, f := range extractFileList(blocks) {
 			allFiles[f] = true
 		}
-		allGotchas = append(allGotchas, extractGotchas(blocks)...)
 		if msg.Role == "assistant" {
 			if conc := extractConclusion(blocks); conc != "" {
 				conclusionText = conc
 			}
 		}
 	}
+
+	// Commits 与 Gotchas 需要跨消息配对（tool_use 与 tool_result 分属
+	// assistant/user 两条消息），因此以整个 messages 为输入提取。
+	allCommits = extractGitCommits(messages)
+	allGotchas = extractGotchas(messages)
 
 	// 连续同类事件先折叠再进 formatArchiveBlockText 的 120 条预算，被省略的
 	// 事件数随之下降。YesMem 是先截断再折叠，顺序相反，本项目不对齐它。
@@ -329,8 +333,10 @@ func extractTimeline(blocks []ContentBlock, msgIdx int, role string) []string {
 	// 用户消息作为时间线条目（对话的方向信号）
 	// 以 "[" 开头的是 CC 每轮注入的 system-reminder / task-notification 之类合成文本，
 	// 不是方向信号，跳过（对齐 YesMem collapse.go:277-279）。
+	// <system-reminder> 标签形态（CC 源码 K2e 的剥离正则）不带 "["，须先剥离再判断；
+	// 剥离后剩余文本才是用户真实输入，reminder 本身是当轮播报、过期即失效。
 	if role == "user" {
-		text := extractTextFromBlocks(blocks)
+		text := stripSystemReminderText(extractTextFromBlocks(blocks))
 		if text != "" && !strings.HasPrefix(text, "[") {
 			summary := truncateRunes(text, 120)
 			events = append(events, fmt.Sprintf("- [%d] U: %s", msgIdx, summary))
@@ -354,6 +360,16 @@ func extractTimeline(blocks []ContentBlock, msgIdx int, role string) []string {
 		}
 	}
 	return events
+}
+
+// systemReminderRe 匹配 CC 注入的 <system-reminder>…</system-reminder> 合成文本。
+// 标签形态依据 CC 源码的剥离正则（整段非贪婪匹配）。
+var systemReminderRe = regexp.MustCompile(`<system-reminder>[\s\S]*?</system-reminder>`)
+
+// stripSystemReminderText 剥离 system-reminder 标签段并去除首尾空白。
+// reminder 是当轮状态播报而非用户方向信号，剥离后剩余文本才进时间线。
+func stripSystemReminderText(text string) string {
+	return strings.TrimSpace(systemReminderRe.ReplaceAllString(text, ""))
 }
 
 // extractTextFromBlocks 从 content blocks 中提取所有文本内容。
@@ -476,30 +492,65 @@ func classifyEvent(event string) string {
 	return strings.ToLower(remainder)
 }
 
-// extractGitCommits 从 content blocks 提取 git commit 信息。
-func extractGitCommits(blocks []ContentBlock) []string {
+// commitHashRe 从 git commit 的 tool_result 输出（首行形如 "[main 15f3db1] msg"）
+// 提取短哈希。行首方括号 + 分支名 + 空格 + hex 的限定避免误配正文中的哈希字样。
+var commitHashRe = regexp.MustCompile(`(?m)^\[[^\]\s]+ ([0-9a-f]{7,40})\]`)
+
+// extractGitCommits 扫描全部消息，将 Bash git commit 的 tool_use 与其
+// tool_result 跨消息配对，产出 "<hash> <message>" 条目（哈希缺失时仅 message）。
+// 配对思路对齐 YesMem collapse.go:656 extractGitCommits。
+func extractGitCommits(messages []Message) []string {
 	var commits []string
-	for _, b := range blocks {
-		if b.Type != "tool_use" || b.Name != "Bash" {
-			continue
-		}
-		cmd, _ := b.Input["command"].(string)
-		if !strings.Contains(cmd, "git commit") {
-			continue
-		}
-		msg := extractCommitMessage(cmd)
-		if msg != "" {
-			commits = append(commits, msg)
+	for i, msg := range messages {
+		blocks, _ := parseContent(msg.Content)
+		for _, b := range blocks {
+			if b.Type != "tool_use" || b.Name != "Bash" || b.ID == "" {
+				continue
+			}
+			cmd, _ := b.Input["command"].(string)
+			if !strings.Contains(cmd, "git commit") {
+				continue
+			}
+			entry := extractCommitMessage(cmd)
+			if entry == "" {
+				continue
+			}
+			if hash := findCommitHash(messages[i+1:], b.ID); hash != "" {
+				entry = hash + " " + entry
+			}
+			commits = append(commits, entry)
 		}
 	}
 	return commits
 }
 
+// findCommitHash 在后续消息中查找 tool_use_id 匹配的 tool_result，
+// 从其输出文本提取 commit 短哈希；首个匹配的 result 即终止。
+func findCommitHash(messages []Message, toolUseID string) string {
+	if toolUseID == "" {
+		return ""
+	}
+	for _, msg := range messages {
+		blocks, _ := parseContent(msg.Content)
+		for _, b := range blocks {
+			if b.Type != "tool_result" || b.ToolUseID != toolUseID {
+				continue
+			}
+			if m := commitHashRe.FindStringSubmatch(toolResultText(b.Content)); len(m) > 1 {
+				return m[1]
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
 // extractCommitMessage 从 git commit 命令中提取 commit message。
 func extractCommitMessage(cmd string) string {
-	// -m "message" 格式
+	// findFlagValue 返回 "-m" 之后（空格处）的下标，只再跳过这一个空格；
+	// 多跳一个字符会把开头引号吃掉，导致下面的引号剥离分支永不生效。
 	if idx := findFlagValue(cmd, "-m"); idx >= 0 {
-		rest := strings.TrimSpace(cmd[idx+2:])
+		rest := strings.TrimSpace(cmd[idx+1:])
 		if len(rest) > 1 && rest[0] == '"' {
 			if end := strings.IndexByte(rest[1:], '"'); end >= 0 {
 				return rest[1 : end+1]
@@ -568,17 +619,58 @@ func extractFileList(blocks []ContentBlock) []string {
 	return files
 }
 
-// extractGotchas 从 content blocks 提取真实的工具执行错误。
-// 只认 tool_result 且 IsError——文本关键词（error / fail）匹配会把 CC 的工具
-// 提示文本当成经验教训永久写进归档，实测第一条 gotcha 就是这类噪音。
-func extractGotchas(blocks []ContentBlock) []string {
+// maxArchiveGotchaLines 限制 Gotchas 段条数，防止连续失败重试撑爆归档摘要。
+const maxArchiveGotchaLines = 20
+
+// extractGotchas 从全部消息提取真实的工具执行错误：tool_result 且 IsError，
+// 附上配对 tool_use 的工具名与错误首行。只认 IsError——文本关键词
+// （error/fail）匹配会把 CC 的工具提示文本当成经验教训永久写进归档。
+func extractGotchas(messages []Message) []string {
+	names := make(map[string]string)
+	for _, msg := range messages {
+		blocks, _ := parseContent(msg.Content)
+		for _, b := range blocks {
+			if b.Type == "tool_use" && b.ID != "" && b.Name != "" {
+				names[b.ID] = b.Name
+			}
+		}
+	}
+
 	var gotchas []string
-	for _, b := range blocks {
-		if b.Type == "tool_result" && b.IsError {
-			gotchas = append(gotchas, "[tool error]")
+	for _, msg := range messages {
+		blocks, _ := parseContent(msg.Content)
+		for _, b := range blocks {
+			if b.Type != "tool_result" || !b.IsError {
+				continue
+			}
+			name := names[b.ToolUseID]
+			if name == "" {
+				name = "tool"
+			}
+			line := firstNonEmptyLine(toolResultText(b.Content), 120)
+			entry := name
+			if line != "" {
+				entry = name + ": " + line
+			}
+			gotchas = append(gotchas, entry)
+			if len(gotchas) >= maxArchiveGotchaLines {
+				return gotchas
+			}
 		}
 	}
 	return gotchas
+}
+
+// firstNonEmptyLine 返回文本第一个非空行，截断到 maxRunes。
+func firstNonEmptyLine(text string, maxRunes int) string {
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		return truncateRunes(line, maxRunes)
+	}
+	return ""
 }
 
 // extractConclusion 从 content blocks 提取最后 1-2 句作为结论摘要。

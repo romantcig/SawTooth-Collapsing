@@ -771,26 +771,89 @@ func TestBuildArchiveBlockTimelineCollapsesRepeatedEvents(t *testing.T) {
 	}
 }
 
-// W3-3：Gotchas 只收录 tool_result 且 IsError 的条目。
+// W3-3：Gotchas 只收录 tool_result 且 IsError 的条目，并附工具名与错误首行。
 func TestExtractGotchasOnlyToolResultErrors(t *testing.T) {
 	// CC 的工具提示文本含 "fail" 字样，是提示而非经验教训，不得写进归档。
-	noise := []ContentBlock{{
+	noiseMsg := Message{Role: "user", Content: mustMarshalBlocks([]ContentBlock{{
 		Type: "text",
 		Text: "Calling this tool without the required parameter will fail with InputValidationError.",
-	}}
-	if got := extractGotchas(noise); len(got) != 0 {
+	}})}
+	if got := extractGotchas([]Message{noiseMsg}); len(got) != 0 {
 		t.Fatalf("文本关键词仍被当成 gotcha: %v", got)
 	}
 
-	toolError := []ContentBlock{{Type: "tool_result", ToolUseID: "t1", IsError: true}}
-	got := extractGotchas(toolError)
-	if len(got) != 1 || got[0] != "[tool error]" {
-		t.Fatalf("tool_result 错误未被收录: %v", got)
+	// 无配对 tool_use 时退化为 "tool"，有配对时带工具名与错误首行。
+	loneError := Message{Role: "user", Content: mustMarshalBlocks([]ContentBlock{{
+		Type: "tool_result", ToolUseID: "t1", IsError: true,
+	}})}
+	got := extractGotchas([]Message{loneError})
+	if len(got) != 1 || got[0] != "tool" {
+		t.Fatalf("孤立错误条目 = %v, want [tool]", got)
 	}
 
-	mixed := append(append([]ContentBlock{}, noise...), toolError...)
-	if got := extractGotchas(mixed); len(got) != 1 {
-		t.Fatalf("混合输入的 gotcha 数 = %d, want 1: %v", len(got), got)
+	paired := []Message{
+		{Role: "assistant", Content: mustMarshalBlocks([]ContentBlock{{
+			Type: "tool_use", ID: "t1", Name: "Bash",
+			Input: map[string]any{"command": "go test ./..."},
+		}})},
+		{Role: "user", Content: mustMarshalBlocks([]ContentBlock{{
+			Type: "tool_result", ToolUseID: "t1", IsError: true,
+			Content: "\nFAIL example.com/pkg\n\nstack trace continues",
+		}})},
+	}
+	got = extractGotchas(paired)
+	if len(got) != 1 || got[0] != "Bash: FAIL example.com/pkg" {
+		t.Fatalf("配对错误条目 = %v, want [Bash: FAIL example.com/pkg]", got)
+	}
+}
+
+// Commits 段跨消息配对：tool_use 与 tool_result 通过 id 关联，提取短哈希。
+func TestExtractGitCommitsWithHash(t *testing.T) {
+	withHash := []Message{
+		{Role: "assistant", Content: mustMarshalBlocks([]ContentBlock{{
+			Type: "tool_use", ID: "c1", Name: "Bash",
+			Input: map[string]any{"command": `git commit -m "fix: boundary hash"`},
+		}})},
+		{Role: "user", Content: mustMarshalBlocks([]ContentBlock{{
+			Type: "tool_result", ToolUseID: "c1",
+			Content: "[main abc1234def] fix: boundary hash\n 2 files changed",
+		}})},
+	}
+	got := extractGitCommits(withHash)
+	if len(got) != 1 || got[0] != "abc1234def fix: boundary hash" {
+		t.Fatalf("commit 条目 = %v, want [abc1234def fix: boundary hash]", got)
+	}
+
+	noResult := withHash[:1]
+	got = extractGitCommits(noResult)
+	if len(got) != 1 || got[0] != "fix: boundary hash" {
+		t.Fatalf("无 result 时 commit 条目 = %v, want [fix: boundary hash]", got)
+	}
+}
+
+// 时间线必须剥离 <system-reminder> 标签段：reminder 是当轮播报，
+// 不是用户方向信号（CC 源码 K2e 剥离正则对应的标签形态）。
+func TestExtractTimelineStripsSystemReminder(t *testing.T) {
+	reminderOnly := []ContentBlock{{
+		Type: "text",
+		Text: "<system-reminder>Background task completed</system-reminder>",
+	}}
+	if got := extractTimeline(reminderOnly, 3, "user"); len(got) != 0 {
+		t.Fatalf("reminder 独占消息未被过滤: %v", got)
+	}
+
+	mixed := []ContentBlock{{
+		Type: "text",
+		Text: "<system-reminder>Background task completed</system-reminder>\n请修复崩溃问题",
+	}}
+	got := extractTimeline(mixed, 3, "user")
+	if len(got) != 1 || !strings.Contains(got[0], "请修复崩溃问题") || strings.Contains(got[0], "Background task") {
+		t.Fatalf("混合消息应只保留用户文本: %v", got)
+	}
+
+	interrupted := []ContentBlock{{Type: "text", Text: "[Request interrupted by user]"}}
+	if got := extractTimeline(interrupted, 3, "user"); len(got) != 0 {
+		t.Fatalf("中断消息未被过滤: %v", got)
 	}
 }
 
