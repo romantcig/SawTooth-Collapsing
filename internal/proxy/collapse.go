@@ -547,6 +547,13 @@ func findCommitHash(messages []Message, toolUseID string) string {
 
 // extractCommitMessage 从 git commit 命令中提取 commit message。
 func extractCommitMessage(cmd string) string {
+	// heredoc 格式（git commit -m "$(cat <<'EOF' … EOF)"）必须先于 -m 引号分支
+	// 判断，否则引号分支会把 $(…) 替换表达式整体当 message 返回。
+	// 对齐 YesMem extractGitCommitMessage 的优先顺序，简化处理为占位。
+	if strings.Contains(cmd, "<<") {
+		return "commit (heredoc format)"
+	}
+
 	// findFlagValue 返回 "-m" 之后（空格处）的下标，只再跳过这一个空格；
 	// 多跳一个字符会把开头引号吃掉，导致下面的引号剥离分支永不生效。
 	if idx := findFlagValue(cmd, "-m"); idx >= 0 {
@@ -562,11 +569,6 @@ func extractCommitMessage(cmd string) string {
 			}
 		}
 		return truncateRunes(rest, 200)
-	}
-
-	// heredoc 格式（简化处理）
-	if strings.Contains(cmd, "<<") {
-		return "commit (heredoc format)"
 	}
 
 	return ""
@@ -637,6 +639,7 @@ func extractGotchas(messages []Message) []string {
 	}
 
 	var gotchas []string
+	omitted := 0
 	for _, msg := range messages {
 		blocks, _ := parseContent(msg.Content)
 		for _, b := range blocks {
@@ -652,11 +655,15 @@ func extractGotchas(messages []Message) []string {
 			if line != "" {
 				entry = name + ": " + line
 			}
-			gotchas = append(gotchas, entry)
 			if len(gotchas) >= maxArchiveGotchaLines {
-				return gotchas
+				omitted++
+				continue
 			}
+			gotchas = append(gotchas, entry)
 		}
+	}
+	if omitted > 0 {
+		gotchas = append(gotchas, fmt.Sprintf("[...%d more errors omitted...]", omitted))
 	}
 	return gotchas
 }

@@ -831,6 +831,53 @@ func TestExtractGitCommitsWithHash(t *testing.T) {
 	}
 }
 
+// extractCommitMessage 边界锁定：引号剥离、无引号、单引号、heredoc、
+// 无空格 -m。该函数曾因偏移 bug 吃掉首字符且无直接单测，先例在此。
+func TestExtractCommitMessageBoundaries(t *testing.T) {
+	cases := []struct {
+		name string
+		cmd  string
+		want string
+	}{
+		{"双引号剥离", `git commit -m "fix: boundary hash"`, "fix: boundary hash"},
+		{"无引号原样保留", `git commit -m fix boundary`, "fix boundary"},
+		{"单引号剥离", `git commit -m 'fix: single'`, "fix: single"},
+		{"heredoc 简化占位", "git commit -m \"$(cat <<'EOF'\nfix: heredoc\nEOF\n)\"", "commit (heredoc format)"},
+		{"无空格 -m 不提取", `git commit -m"nospace"`, ""},
+	}
+	for _, tc := range cases {
+		if got := extractCommitMessage(tc.cmd); got != tc.want {
+			t.Errorf("%s: extractCommitMessage(%q) = %q, want %q", tc.name, tc.cmd, got, tc.want)
+		}
+	}
+}
+
+// Gotchas 超出 maxArchiveGotchaLines 后必须补省略标注，模型不得误以为错误已穷尽。
+func TestExtractGotchasOmissionMarker(t *testing.T) {
+	total := maxArchiveGotchaLines + 5
+	var msgs []Message
+	for i := 0; i < total; i++ {
+		msgs = append(msgs,
+			Message{Role: "assistant", Content: mustMarshalBlocks([]ContentBlock{{
+				Type: "tool_use", ID: fmt.Sprintf("e%d", i), Name: "Bash",
+				Input: map[string]any{"command": "fail"},
+			}})},
+			Message{Role: "user", Content: mustMarshalBlocks([]ContentBlock{{
+				Type: "tool_result", ToolUseID: fmt.Sprintf("e%d", i), IsError: true,
+				Content: fmt.Sprintf("error %d", i),
+			}})},
+		)
+	}
+	got := extractGotchas(msgs)
+	if len(got) != maxArchiveGotchaLines+1 {
+		t.Fatalf("gotcha 条数 = %d, want %d（20 条 + 1 省略行）", len(got), maxArchiveGotchaLines+1)
+	}
+	want := fmt.Sprintf("[...%d more errors omitted...]", total-maxArchiveGotchaLines)
+	if got[len(got)-1] != want {
+		t.Fatalf("省略标注 = %q, want %q", got[len(got)-1], want)
+	}
+}
+
 // 时间线必须剥离 <system-reminder> 标签段：reminder 是当轮播报，
 // 不是用户方向信号（CC 源码 K2e 剥离正则对应的标签形态）。
 func TestExtractTimelineStripsSystemReminder(t *testing.T) {
