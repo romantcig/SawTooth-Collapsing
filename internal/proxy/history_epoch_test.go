@@ -322,28 +322,13 @@ func TestHistoryEpochConcurrentBeginsStayMonotonic(t *testing.T) {
 }
 
 func TestForwardedCoordinatesUsePositionSensitiveHistoryFingerprint(t *testing.T) {
+	// baseline 契约用 fingerprintMessagesPrefix 锚定"判定看到的前缀"；
+	// tool_use.input.cache_control 这类块内业务字段变化必须反映在指纹里，
+	// 否则改写后的前缀会被误认成原前缀。
 	base := historyMessagesFromJSON(t, `[{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"configure","input":{"cache_control":"enabled"}}]}]`)
-	meta := newRequestMeta(901, "forwarded-fingerprint")
-	meta.PressureDecision = pressureDecision{
-		Available:                 true,
-		MessageCount:              len(base),
-		MessagesPrefixFingerprint: fingerprintMessagesPrefix(base, len(base)),
-	}
-	// 入口 raw = base；wire 的 tool_use.input.cache_control 被改写。Changed
-	// 对比 entry 与 wire，只有指纹算法对该业务字段敏感时才会置位——恒真化
-	// 等于放弃这条判别力。
-	meta.PressureEntryCoordinates = pressureEntryCoordinates{
-		MessageCount:              len(base),
-		MessagesPrefixFingerprint: fingerprintMessagesPrefix(base, len(base)),
-	}
 	changed := historyMessagesFromJSON(t, `[{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"configure","input":{"cache_control":"disabled"}}]}]`)
-	body, err := json.Marshal(map[string]any{"messages": changed})
-	if err != nil {
-		t.Fatal(err)
-	}
-	markForwardedPressureCoordinates(meta, body, nil)
-	if !meta.PressureDecision.ForwardedCoordinatesChanged {
-		t.Fatal("tool_use.input.cache_control 业务变化未使 forwarded 坐标失效")
+	if fingerprintMessagesPrefix(base, len(base)) == fingerprintMessagesPrefix(changed, len(changed)) {
+		t.Fatal("指纹对 tool_use.input.cache_control 业务变化不敏感")
 	}
 }
 

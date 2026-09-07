@@ -758,6 +758,30 @@ func TestStableBoundaryHashPreservesUnprovenNullAndUnknownFields(t *testing.T) {
 	}
 }
 
+func TestStableBoundaryHashSurvivesCCShellRewrite(t *testing.T) {
+	// CC 当轮给最后一条 user 消息包壳挂 cache_control，退位后按内部原样
+	// 直出纯文本（CC 2.1.258 T5o）。内容一致时两种 wire 形态必须同哈希，
+	// 否则 frozen boundary 每轮失配一次、反复重折叠。
+	shelled := Message{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"同一份正文","cache_control":{"type":"ephemeral"}}]`)}
+	bare := Message{Role: "user", Content: json.RawMessage(`"同一份正文"`)}
+	if stableBoundaryHash(shelled) != stableBoundaryHash(bare) {
+		t.Fatal("CC 退位消息的壳差异导致 boundary 哈希失配")
+	}
+
+	// 折叠只对恰好 type+text 两键的单 text 块生效，未知字段有语义不得吞掉
+	withUnknownField := Message{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"x","future_semantic":"v"}]`)}
+	folded := Message{Role: "user", Content: json.RawMessage(`"x"`)}
+	if stableBoundaryHash(withUnknownField) == stableBoundaryHash(folded) {
+		t.Fatal("带未知字段的单 text 块被错误折叠")
+	}
+
+	multiBlock := Message{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"a"},{"type":"text","text":"b"}]`)}
+	concatenated := Message{Role: "user", Content: json.RawMessage(`"ab"`)}
+	if stableBoundaryHash(multiBlock) == stableBoundaryHash(concatenated) {
+		t.Fatal("多 text 块消息被错误折叠为拼接文本")
+	}
+}
+
 func TestFrozenBoundaryHashIncludesMessageUnknownFieldStates(t *testing.T) {
 	decode := func(raw string) Message {
 		t.Helper()

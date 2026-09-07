@@ -623,9 +623,8 @@ func upstreamFailureState(decision upstreamFailureDecision, committed bool, fall
 }
 
 // markForwardedPressureCoordinates 将 pressure baseline 的坐标绑定到真正发送给上游的
-// system/tools/messages。压缩、桩化、Archive 注入或 orphan repair 改写消息时，
-// ForwardedCoordinatesChanged 记录这一事实供诊断；baseline 契约坐标固定为
-// 入口 raw 快照（meta.PressureEntryCoordinates），绝不随 wire 改写——否则折叠
+// system/tools/messages。baseline 契约坐标固定为入口 raw 快照
+// （meta.PressureEntryCoordinates），绝不随 wire 改写——否则折叠
 // 轮之后 CC 的 raw 回放会与 wire 坐标永远失配，actual_plus_delta 主路径被锁死。
 // 同点补算转发 wire 的本地全量估算（messages + system + tools，口径与
 // buildPressureDecision 的 FullLocalEstimate 一致），供响应侧与 actual 配对写入
@@ -638,43 +637,28 @@ func markForwardedPressureCoordinates(meta *requestMeta, body []byte, tc *TokenC
 	var payload map[string]json.RawMessage
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	if err := decoder.Decode(&payload); err != nil {
-		meta.PressureDecision.ForwardedCoordinatesChanged = true
 		meta.PressureDecision.ForwardedCoordinatesBound = false
 		return
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		meta.PressureDecision.ForwardedCoordinatesChanged = true
 		meta.PressureDecision.ForwardedCoordinatesBound = false
 		return
 	}
 
 	messagesRaw, ok := payload["messages"]
 	if !ok || bytes.Equal(bytes.TrimSpace(messagesRaw), []byte("null")) || len(bytes.TrimSpace(messagesRaw)) == 0 || bytes.TrimSpace(messagesRaw)[0] != '[' {
-		meta.PressureDecision.ForwardedCoordinatesChanged = true
 		meta.PressureDecision.ForwardedCoordinatesBound = false
 		return
 	}
 	var messages []Message
 	if err := json.Unmarshal(messagesRaw, &messages); err != nil {
-		meta.PressureDecision.ForwardedCoordinatesChanged = true
 		meta.PressureDecision.ForwardedCoordinatesBound = false
 		return
 	}
 
-	systemFingerprint := fingerprintTopLevelJSON(payload["system"])
-	toolsFingerprint := fingerprintTopLevelJSON(payload["tools"])
-	messagesPrefixFingerprint := fingerprintMessagesPrefix(messages, len(messages))
-	decision := &meta.PressureDecision
-	coordinatesChanged :=
-		meta.PressureEntryCoordinates.MessageCount != len(messages) ||
-			decision.SystemFingerprint != systemFingerprint ||
-			decision.ToolsFingerprint != toolsFingerprint ||
-			meta.PressureEntryCoordinates.MessagesPrefixFingerprint != messagesPrefixFingerprint
-	// 保留整个请求生命周期内"曾经发生过改写"的事实；即使某个调用方
-	// 意外重复绑定同一份 body，也不能把首次变化抹掉。
-	decision.ForwardedCoordinatesChanged = decision.ForwardedCoordinatesChanged || coordinatesChanged
 	// decision 的坐标保持入口 raw 口径不变；本函数只证明 wire body 已解析、
-	// usage 与 wire 估算可安全配对（Bound），并留下改写诊断（Changed）。
+	// usage 与 wire 估算可安全配对（Bound）。
+	decision := &meta.PressureDecision
 	decision.ForwardedCoordinatesBound = true
 	if tc != nil {
 		decision.ForwardedLocalEstimate = saturatingAdd(
@@ -714,8 +698,7 @@ func (s *Server) applyPressureBaselineUsage(meta *requestMeta, actual int) bool 
 	if !decision.ForwardedCoordinatesBound {
 		// 坐标未经 markForwardedPressureCoordinates 绑定过——可能是 body 不可解析，
 		// 也可能是调用方根本没走绑定。两种情况都无法证明 actual 对应哪份消息坐标，
-		// 绝不能沿用旧坐标或退回 conservative floor。ForwardedCoordinatesChanged
-		// 只保留作诊断字段，不参与门禁。
+		// 绝不能沿用旧坐标或退回 conservative floor。
 		meta.BaselineUpdateKind = pressureBaselineUpdateNone
 		return false
 	}

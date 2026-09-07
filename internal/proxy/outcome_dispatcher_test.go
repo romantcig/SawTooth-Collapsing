@@ -492,7 +492,11 @@ func TestSessionQueueFullEnteredOnceAndAcceptedDoesNotRecover(t *testing.T) {
 	}
 
 	close(releaseProcess)
-	waitForDispatcher(t, func() bool { return !tracker.IsDegraded(HealthScopeSessionQueueFull) })
+	// 状态翻转在 tracker 锁内完成，恢复日志行在解锁后才写终端；等待必须锚在
+	// 日志行上（日志出现蕴含状态已翻转），只等状态会在两个同步点之间放行。
+	waitForDispatcher(t, func() bool {
+		return countTerminalText(terminal.lines(), "详细记录已恢复保存") >= 1
+	})
 	if got := countTerminalText(terminal.lines(), "详细记录已恢复保存"); got != 1 {
 		t.Fatalf("queue recovered 提示=%d，want 1: %v", got, terminal.lines())
 	}

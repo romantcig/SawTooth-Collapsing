@@ -524,10 +524,7 @@ type pressureDecision struct {
 	// 是 baseline 读写契约使用的入口 raw 坐标（见 pressureEntryCoordinates）：
 	// system/tools 不被折叠改写，口径与 wire 一致；messages 坐标固定为入口
 	// raw 快照，绝不随转发 wire 改写。
-	MessagesPrefixFingerprint   string
-	ForwardedCoordinatesChanged bool
-	// ForwardedCoordinatesChanged 表示转发 wire 的坐标与入口 raw 坐标不一致
-	// （折叠/压缩等改写在本请求发生过），只作诊断，不参与 baseline 门禁。
+	MessagesPrefixFingerprint string
 	// ForwardedCoordinatesBound 表示转发 wire body 已成功解析、system/tools/
 	// messages 的 wire 坐标已读取、ForwardedLocalEstimate 已同点补算——响应
 	// usage 与哪个消息集配对由此证明。false 时不把 actual 写回 baseline。

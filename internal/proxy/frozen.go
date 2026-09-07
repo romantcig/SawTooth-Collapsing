@@ -857,9 +857,11 @@ func canonicalMessageForHash(msg Message, normalizeContent func(any) any) (map[s
 	return canonical, nil
 }
 
-// normalizeBoundaryContent 只消除两类已确证的非语义差异：text/thinking/tool_result
+// normalizeBoundaryContent 只消除已确证的非语义差异：text/thinking/tool_result
 // 块本身不使用 input，但 ContentBlock.Input 缺少 omitempty 会把省略字段重编码为
-// input:null；已知 Anthropic content block 的直接 cache_control 是缓存元数据，
+// input:null；已知 Anthropic content block 的直接 cache_control 是缓存元数据；
+// CC 给当轮最后一条 user 消息包壳挂 cache_control，该消息退位后按内部原样直出
+// 为纯文本字符串（CC 2.1.258 T5o），单 text 块数组折叠回纯文本消除这一壳差异，
 // 与 normalizeHistoryContent 的 reuse 规范化同源。未知 block 类型的 cache_control、
 // 未知字段、数组 null 和 tool_use 的 input 均保持原样，避免把未来协议中的显式
 // null 与 absent 混同。
@@ -881,6 +883,13 @@ func normalizeBoundaryContent(content any) any {
 			switch typeName {
 			case "text", "thinking", "tool_result":
 				delete(object, "input")
+			}
+		}
+	}
+	if len(blocks) == 1 {
+		if block, ok := blocks[0].(map[string]any); ok && len(block) == 2 && block["type"] == "text" {
+			if text, ok := block["text"].(string); ok {
+				return text
 			}
 		}
 	}

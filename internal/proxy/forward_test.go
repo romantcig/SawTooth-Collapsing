@@ -1042,7 +1042,7 @@ func TestResponseHandlersRejectUnboundForwardedCoordinates(t *testing.T) {
 				ToolsFingerprint:          fingerprintTopLevelJSON(nil),
 				MessagesPrefixFingerprint: fingerprintMessagesPrefix(forwarded, len(forwarded)),
 			}
-			if meta.PressureDecision.ForwardedCoordinatesChanged || meta.PressureDecision.ForwardedCoordinatesBound {
+			if meta.PressureDecision.ForwardedCoordinatesBound {
 				t.Fatalf("前置条件错误，坐标字段应为零值: %+v", meta.PressureDecision)
 			}
 
@@ -1066,7 +1066,7 @@ func TestResponseHandlersRejectUnboundForwardedCoordinates(t *testing.T) {
 }
 
 // TestUnchangedForwardedBodyBindsExactPressureBaseline 覆盖"body 未被改写但已绑定"：
-// ForwardedCoordinatesChanged 保持 false，写回仍必须成立——门禁只看 Bound。
+// 写回仍必须成立——门禁只看 Bound。
 func TestUnchangedForwardedBodyBindsExactPressureBaseline(t *testing.T) {
 	trigger := NewSawtoothTrigger(time.Hour, 150_000, 75_000)
 	var persisted string
@@ -1094,8 +1094,8 @@ func TestUnchangedForwardedBodyBindsExactPressureBaseline(t *testing.T) {
 	}
 
 	markForwardedPressureCoordinates(meta, forwardedPressureBody(t, system, tools, forwarded), nil)
-	if meta.PressureDecision.ForwardedCoordinatesChanged || !meta.PressureDecision.ForwardedCoordinatesBound {
-		t.Fatalf("未改写的 body 应为 changed=false bound=true: %+v", meta.PressureDecision)
+	if !meta.PressureDecision.ForwardedCoordinatesBound {
+		t.Fatalf("未改写的 body 应为 bound=true: %+v", meta.PressureDecision)
 	}
 	if updated := s.applyPressureBaselineUsage(meta, 31_500); !updated {
 		t.Fatal("未改写但已绑定的 actual 未被接受为 exact baseline")
@@ -1147,8 +1147,8 @@ func TestForwardedRewriteBindsExactPressureBaseline(t *testing.T) {
 		t.Fatal(err)
 	}
 	markForwardedPressureCoordinates(meta, body, nil)
-	if !meta.PressureDecision.ForwardedCoordinatesChanged || !meta.PressureDecision.ForwardedCoordinatesBound {
-		t.Fatalf("forwarded 坐标变化未被绑定: %+v", meta.PressureDecision)
+	if !meta.PressureDecision.ForwardedCoordinatesBound {
+		t.Fatalf("forwarded 坐标未被绑定: %+v", meta.PressureDecision)
 	}
 	if meta.PressureDecision.MessageCount != len(original) || meta.PressureDecision.MessagesPrefixFingerprint != fingerprintMessagesPrefix(original, len(original)) {
 		t.Fatalf("decision 必须保持入口 raw 坐标，不得随 wire 改写: %+v", meta.PressureDecision)
@@ -1192,7 +1192,7 @@ func TestMalformedForwardedBodyDoesNotWritePressureBaseline(t *testing.T) {
 	}
 
 	markForwardedPressureCoordinates(meta, []byte(`{"messages":`), nil)
-	if !meta.PressureDecision.ForwardedCoordinatesChanged || meta.PressureDecision.ForwardedCoordinatesBound {
+	if meta.PressureDecision.ForwardedCoordinatesBound {
 		t.Fatalf("malformed body incorrectly bound: %+v", meta.PressureDecision)
 	}
 	if updated := s.applyPressureBaselineUsage(meta, 27_743); updated {
